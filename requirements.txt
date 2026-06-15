@@ -28,6 +28,7 @@ ta>=0.11.0
 
 # Market data
 polygon-api-client>=1.13
+yfinance>=0.2.40        # Free fallback for basic quotes
 
 # Dev tools
 pytest>=8.0

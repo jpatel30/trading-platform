@@ -20,6 +20,12 @@ from app.db.session import get_session
 from app.broker.webull_connector import WebullConnector
 from app.broker.base import BrokerNotConnectedError
 from app.utils.current_user import get_current_user_id
+from app.market_data.polygon_client import (
+    get_previous_close,
+    get_bulk_previous_close,
+    get_bars,
+    get_ticker_details,
+)
 from sqlalchemy import text
 
 mcp = FastMCP("Personal Trading Intelligence Platform")
@@ -67,6 +73,56 @@ def get_orders() -> list[dict]:
     except BrokerNotConnectedError:
         return {"error": "Webull is not connected for this user. Run app/broker/store_webull_credentials.py first."}
     return wb.get_orders()
+
+
+@mcp.tool()
+def get_quote(ticker: str) -> dict | None:
+    """
+    Get the previous trading day's OHLCV quote for a ticker (Polygon.io).
+    Returns {ticker, open, high, low, close, volume, vwap, timestamp, source}.
+    """
+    return get_previous_close(ticker.upper())
+
+
+@mcp.tool()
+def get_quotes(tickers: list[str]) -> dict[str, dict]:
+    """
+    Get previous day's quotes for multiple tickers at once (Polygon.io, cached).
+    Returns {ticker: {open, high, low, close, volume, ...}}
+    """
+    return get_bulk_previous_close([t.upper() for t in tickers])
+
+
+@mcp.tool()
+def get_price_history(
+    ticker: str,
+    days: int = 200,
+    timespan: str = "day",
+) -> list[dict]:
+    """
+    Get historical OHLCV bars for a ticker (Polygon.io).
+
+    Args:
+        ticker:   e.g. 'NVDA'
+        days:     how many calendar days back to fetch (default 200)
+        timespan: 'minute' | 'hour' | 'day' | 'week' | 'month'
+
+    Returns list of {timestamp, open, high, low, close, volume, vwap},
+    sorted oldest to newest — ready for technical analysis.
+    """
+    from datetime import datetime, timedelta
+    from_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    to_date = datetime.now().strftime("%Y-%m-%d")
+    return get_bars(ticker.upper(), 1, timespan, from_date, to_date)
+
+
+@mcp.tool()
+def get_ticker_info(ticker: str) -> dict | None:
+    """
+    Get fundamental details for a ticker (Polygon.io).
+    Returns {ticker, name, market_cap, primary_exchange, type, description, sic_description}.
+    """
+    return get_ticker_details(ticker.upper())
 
 
 if __name__ == "__main__":

@@ -35,6 +35,9 @@ class Settings(BaseSettings):
     # Polygon
     polygon_api_key: str = ""
 
+    # Alpha Vantage (options chains, P/C ratio, news sentiment, earnings calendar, macro)
+    alpha_vantage_api_key: str = ""
+
     # MCP Server
     mcp_server_host: str = "0.0.0.0"
     mcp_server_port: int = 8765

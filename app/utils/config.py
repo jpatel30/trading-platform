@@ -35,8 +35,11 @@ class Settings(BaseSettings):
     # Polygon
     polygon_api_key: str = ""
 
-    # Alpha Vantage (options chains, P/C ratio, news sentiment, earnings calendar, macro)
+    # Alpha Vantage
     alpha_vantage_api_key: str = ""
+
+    # Unusual Whales API
+    unusual_whales_token: str = ""
 
     # MCP Server
     mcp_server_host: str = "0.0.0.0"

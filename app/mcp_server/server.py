@@ -32,7 +32,6 @@ from app.market_data.polygon_client import (
 )
 from app.technical_analysis.engine import get_technical_profile
 from app.utils.current_user import get_current_user_id
-
 mcp = FastMCP("Personal Trading Intelligence Platform")
 
 
@@ -355,6 +354,221 @@ def get_congress_trades(ticker: str | None = None) -> list[dict]:
     """
     from app.options_flow.unusual_whales import get_congress_trades as _get_congress
     return _get_congress(ticker=ticker)
+
+
+# ============================================================
+# STRATEGY ENGINE (Component C7) — THE CORE TRADE RECOMMENDER
+# ============================================================
+
+@mcp.tool()
+def get_strategy_recommendation(
+    ticker: str,
+    budget: float = 2000.0,
+    max_loss: float | None = None,
+    profit_target: float | None = None,
+    min_dte: int = 4,
+    max_dte: int = 365,
+) -> dict:
+    """
+    THE PRIMARY TOOL — scans ALL available expiries (4 DTE → 365 DTE) and returns
+    the optimal trade recommendation that best fits your constraints.
+
+    Example output:
+        "NVDA DEBIT_PUT_SPREAD — BEARISH
+         BUY $205P / SELL $195P — Jun 27 (10 DTE)
+         8 contracts @ $1.85 debit = $1,480 total
+         Target: +$2,368 (+160%) | Stop: -$592 (-40%)
+         R/R: 4.0 | Confidence: 68/100
+         Alternatives: Jul 10 (23 DTE), Jul 18 (31 DTE)"
+
+    Args:
+        ticker:         stock ticker e.g. 'NVDA', 'SPY', 'AMD'
+        budget:         max capital to invest in dollars (default $2,000)
+        max_loss:       max acceptable loss in $ (default: budget × 40%)
+        profit_target:  minimum profit you want in $ (filters out expiries that can't hit this)
+        min_dte:        minimum days to expiry (default: 4 = this week)
+        max_dte:        maximum days to expiry (default: 365, set 911+ for LEAPS)
+
+    Returns best recommendation + 2 alternatives scored by R/R × confidence.
+
+    ⚠️ Educational analysis only. Not financial advice. Always apply
+    Rule 3 regime check and Rule 4 pre-trade checklist before executing.
+    """
+    from datetime import datetime, timedelta
+    from app.options_flow.unusual_whales import get_signal_package
+    from app.options_flow.signals import score_signal_package
+    from app.strategy.engine import build_recommendation
+
+    ticker = ticker.upper()
+
+    # Step 1: Technical Analysis
+    from_date = (datetime.now() - timedelta(days=300)).strftime("%Y-%m-%d")
+    to_date   = datetime.now().strftime("%Y-%m-%d")
+    bars      = get_bars(ticker, 1, "day", from_date, to_date)
+    ta_profile = get_technical_profile(ticker, bars)
+
+    # Step 2: Options Flow Signal
+    pkg         = get_signal_package(ticker)
+    flow_signal = score_signal_package(pkg)
+
+    # Step 3: Scan all expiries and find best trade
+    return build_recommendation(
+        ticker        = ticker,
+        ta_profile    = ta_profile,
+        flow_signal   = flow_signal,
+        budget        = budget,
+        max_loss      = max_loss,
+        profit_target = profit_target,
+        min_dte       = min_dte,
+        max_dte       = max_dte,
+    )
+
+
+
+# ============================================================
+# WATCHLIST TOOLS (Component C5 — Discovery)
+# ============================================================
+
+@mcp.tool()
+def get_watchlist() -> list[dict]:
+    """
+    Get all tickers in your watchlist.
+    Returns [{ticker, notes, sector, added_at}]
+    """
+    from app.db.queries.watchlist import get_watchlist as _get_wl
+    user_id = get_current_user_id()
+    return _get_wl(user_id)
+
+
+@mcp.tool()
+def add_to_watchlist(ticker: str, notes: str = "", sector: str = "") -> dict:
+    """
+    Add a ticker to your watchlist.
+
+    Args:
+        ticker: stock ticker e.g. 'NVDA'
+        notes:  optional notes e.g. 'watching for breakout above 220'
+        sector: optional sector e.g. 'Semiconductors'
+    """
+    from app.db.queries.watchlist import add_to_watchlist as _add
+    user_id = get_current_user_id()
+    added   = _add(user_id, ticker.upper(), notes, sector)
+    return {"ticker": ticker.upper(), "added": added,
+            "message": f"{'Added' if added else 'Already in'} watchlist"}
+
+
+@mcp.tool()
+def remove_from_watchlist(ticker: str) -> dict:
+    """Remove a ticker from your watchlist."""
+    from app.db.queries.watchlist import remove_from_watchlist as _remove
+    user_id = get_current_user_id()
+    removed = _remove(user_id, ticker.upper())
+    return {"ticker": ticker.upper(), "removed": removed}
+
+
+@mcp.tool()
+def get_scan_universe(
+    extra_tickers: list[str] | None = None,
+    min_market_cap: float = 0,
+    sectors: list[str] | None = None,
+    min_price: float = 0,
+) -> list[str]:
+    """
+    Get the full list of tickers to scan today.
+
+    Returns watchlist + current positions + filtered universe.
+    Use this before running bulk analysis across multiple tickers.
+
+    Args:
+        extra_tickers:   additional tickers to always include
+        min_market_cap:  filter by minimum market cap (e.g. 10000000000 = $10B)
+        sectors:         filter by sector (e.g. ['Technology', 'Semiconductors'])
+        min_price:       filter by minimum stock price
+    """
+    from app.scanner.universe import get_scan_universe_mcp
+    return get_scan_universe_mcp(
+        extra_tickers  = extra_tickers,
+        min_market_cap = min_market_cap,
+        sectors        = sectors,
+        min_price      = min_price,
+    )
+
+
+@mcp.tool()
+def scan_tickers(
+    tickers: list[str] | None = None,
+    budget: float = 2000.0,
+    max_loss: float | None = None,
+    top_n: int = 5,
+) -> list[dict]:
+    """
+    Run full analysis across multiple tickers and return the top setups.
+
+    If tickers is None, uses your watchlist + positions automatically.
+    Runs TA + options flow signal on each ticker and ranks by confidence × R/R.
+
+    Args:
+        tickers:  list of tickers to scan (None = use watchlist + positions)
+        budget:   budget per trade (default $2,000)
+        max_loss: max loss per trade (default budget × 40%)
+        top_n:    number of top setups to return (default 5)
+
+    Returns ranked list of trade setups ready for get_strategy_recommendation.
+    """
+    from datetime import datetime, timedelta
+    from app.scanner.universe import get_scan_universe
+    from app.options_flow.unusual_whales import get_signal_package
+    from app.options_flow.signals import score_signal_package
+
+    user_id = get_current_user_id()
+
+    # Get universe
+    if tickers:
+        universe = [t.upper() for t in tickers]
+    else:
+        universe = get_scan_universe(user_id=user_id, max_tickers=30)
+
+    results = []
+    for ticker in universe:
+        try:
+            # Quick TA
+            from_date  = (datetime.now() - timedelta(days=300)).strftime("%Y-%m-%d")
+            to_date    = datetime.now().strftime("%Y-%m-%d")
+            bars       = get_bars(ticker, 1, "day", from_date, to_date)
+            ta         = get_technical_profile(ticker, bars)
+
+            # Flow signal
+            pkg  = get_signal_package(ticker)
+            flow = score_signal_package(pkg)
+
+            # Quick score
+            ta_score   = ta.get("strength_score", 50)
+            flow_conf  = flow.get("confidence", 50)
+            combined   = round((ta_score * 0.4 + flow_conf * 0.6), 1)
+            direction  = flow.get("direction", "NEUTRAL")
+            blocked    = flow.get("trade_blocked", False)
+
+            if not blocked and combined >= 45:
+                results.append({
+                    "ticker":      ticker,
+                    "direction":   direction,
+                    "confidence":  combined,
+                    "ta_signal":   ta.get("signal"),
+                    "ta_score":    ta_score,
+                    "flow_signal": flow.get("signal"),
+                    "flow_conf":   flow_conf,
+                    "summary":     ta.get("summary"),
+                    "flow_summary":flow.get("summary"),
+                    "earnings_risk": flow.get("earnings_risk", {}).get("risk"),
+                    "days_to_earnings": flow.get("earnings_risk", {}).get("days_to_earnings"),
+                })
+        except Exception as e:
+            print(f"[Scanner] {ticker} failed: {e}")
+            continue
+
+    # Rank by confidence
+    results.sort(key=lambda x: x["confidence"], reverse=True)
+    return results[:top_n]
 
 
 if __name__ == "__main__":

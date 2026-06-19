@@ -120,21 +120,35 @@ def get_flow_alerts(
     return result
 
 
-def get_option_contracts(ticker: str, limit: int = 100) -> list[dict]:
+def get_option_contracts(ticker: str, expiry: str | None = None, limit: int = 100) -> list[dict]:
     """
-    All active option contracts for a ticker.
-    Fields: option_symbol, volume, sweep_volume, implied_volatility,
-            open_interest, total_premium, ask_volume, bid_volume,
-            avg_price, nbbo_ask, nbbo_bid, floor_volume, multi_leg_volume
+    Active option contracts for a ticker, optionally filtered by expiry date.
 
-    High sweep_volume relative to volume = institutional sweep activity.
+    Args:
+        ticker: e.g. 'NVDA'
+        expiry: 'YYYY-MM-DD' to filter to specific expiry (REQUIRED for accurate pricing)
+                Without expiry, UW returns today's 500 most active contracts
+                which on high-volume days (FOMC, earnings) are all 0DTE.
+        limit:  max contracts to return
+
+    Fields: option_symbol, nbbo_bid, nbbo_ask, last_price, implied_volatility,
+            volume, open_interest, sweep_volume, avg_price, total_premium
+
+    Pricing note:
+        Use nbbo_bid and nbbo_ask directly — these match broker prices.
+        Mid = (nbbo_bid + nbbo_ask) / 2 for fair value estimate.
+        Use implied_volatility with py_vollib for greeks calculation.
     """
-    key = f"contracts:{ticker}"
+    key = f"contracts:{ticker}:{expiry}"
     cached = _cache_get(key)
     if cached:
         return cached
 
-    data = _get(f"/api/stock/{ticker.upper()}/option-contracts")
+    params = {}
+    if expiry:
+        params["expiry"] = expiry
+
+    data = _get(f"/api/stock/{ticker.upper()}/option-contracts", params=params)
     result = data[:limit] if isinstance(data, list) else []
     _cache_set(key, result, "contracts")
     return result
@@ -539,28 +553,38 @@ def get_insider_ticker_flow(ticker: str) -> list[dict]:
 # COMPREHENSIVE SIGNAL PACKAGE
 # ─────────────────────────────────────────────────────────────────────────────
 
-def get_signal_package(ticker: str) -> dict:
+def get_signal_package(ticker: str, target_expiry: str | None = None) -> dict:
     """
     Fetch ALL relevant signals for one ticker in a single call.
 
-    Combines: options flow, dark pool, GEX, market tide, expiry breakdown,
-    options contracts, earnings history, insider flow, news, congress trades.
-
-    This is the primary input to the Strategy Engine (Component C7).
-    Returns raw data — use signals.py to compute the scored summary.
+    Args:
+        ticker:         stock ticker e.g. 'NVDA'
+        target_expiry:  'YYYY-MM-DD' — the expiry date for the trade being considered.
+                        If None, auto-selects the nearest Friday 3 weeks out.
+                        IMPORTANT: always pass the actual target expiry so option
+                        contracts are fetched for that cycle, not today's 0DTE.
     """
     ticker = ticker.upper()
+
+    # Auto-select target expiry if not provided (3 weeks out)
+    if not target_expiry:
+        from datetime import datetime, timedelta
+        today = datetime.now()
+        days_until_friday = (4 - today.weekday()) % 7 or 7
+        target_expiry = (today + timedelta(days=days_until_friday + 14)).strftime("%Y-%m-%d")
+
     return {
         "ticker": ticker,
+        "target_expiry": target_expiry,
         "flow_alerts": get_flow_alerts(ticker=ticker, limit=20),
         "dark_pool": get_dark_pool_ticker(ticker, limit=20),
         "gex": get_greek_exposure(ticker),
         "gex_by_strike": get_gex_by_strike(ticker),
-        "option_contracts": get_option_contracts(ticker, limit=50),
+        "option_contracts": get_option_contracts(ticker, expiry=target_expiry, limit=500),
         "expiry_breakdown": get_expiry_breakdown(ticker),
         "earnings_history": get_ticker_earnings_history(ticker),
         "insider_flow": get_insider_ticker_flow(ticker),
         "news": get_news_headlines(ticker=ticker, limit=10),
         "congress_trades": get_congress_trades(ticker=ticker, limit=5),
-        "market_tide": get_market_tide(),   # global market signal
+        "market_tide": get_market_tide(),
     }

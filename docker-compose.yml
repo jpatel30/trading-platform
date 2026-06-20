@@ -26,16 +26,6 @@ services:
     volumes:
       - chromadb_data:/chroma/chroma
 
-  ollama:
-    image: ollama/ollama:latest
-    container_name: trading_ollama
-    restart: unless-stopped
-    ports:
-      - "11434:11434"
-    volumes:
-      - ollama_data:/root/.ollama
-
 volumes:
   postgres_data:
   chromadb_data:
-  ollama_data:

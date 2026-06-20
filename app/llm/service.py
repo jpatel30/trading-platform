@@ -42,7 +42,7 @@ def _call_ollama(prompt: str, system: str = "", max_tokens: int = 500) -> str:
         r = requests.post(
             f"{settings.ollama_host}/api/generate",
             json=payload,
-            timeout=60
+            timeout=300
         )
         r.raise_for_status()
         return r.json().get("response", "").strip()

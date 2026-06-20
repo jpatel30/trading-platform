@@ -599,5 +599,567 @@ def scan_watchlist(
     from app.scanner.quick_scan import run_full_scan
     return run_full_scan(budget=budget, max_loss=max_loss, top_quick=top_n)
 
+"""
+W5: Sell Signals + Portfolio P&L (Phase 1 Completion).
+
+Two-tier exit analysis:
+    Tier 1 (instant): Rule-based signals — catches obvious exits
+        - Rule 1A: 80% of max profit reached → TAKE PROFIT
+        - Rule 1B: 40% loss of cost → STOP LOSS
+        - Technical reversal: TA signal flips against position
+        - Earnings risk: earnings within 7 days
+        - Time decay: options < 7 DTE
+
+    Tier 2 (LLM-enhanced): For each actionable signal, LLM evaluates with context:
+        - Position details + P&L
+        - TA signal + momentum
+        - UW options flow (is smart money still bullish?)
+        - Sector performance (are peers moving same way?)
+        - Earnings proximity + historical reaction sizes
+        - RAG context (once C8 is built): news, filings, macro
+        LLM returns: nuanced recommendation (partial exit? roll? hold?),
+                     reasoning, and confidence level
+
+This matters because:
+    Rule-based: "SNDK +287% → SELL"
+    LLM-enhanced: "Take 60% profit on SNDK — storage sector momentum
+                   persists (WDC +171% confirms), keep 40% with trailing
+                   stop. Earnings in 18 days adds risk — plan full exit by then."
+"""
+from datetime import datetime, timedelta
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Sell Signal Rules
+# ─────────────────────────────────────────────────────────────────────────────
+
+TAKE_PROFIT_PCT = 0.80    # Rule 1A: exit at 80% max profit (options) or 20% stock gain
+STOP_LOSS_PCT   = -0.40   # Rule 1B: exit at 40% loss
+EARNINGS_BUFFER = 7       # days — exit before earnings to avoid IV crush
+MIN_DTE         = 7       # exit options with < 7 DTE remaining
+WEAK_VS_SPY     = -0.05   # flag if stock underperforms SPY by 5%+ today
+
+
+def _get_ta_signal(ticker: str) -> str:
+    """Get quick TA signal for a ticker. Returns BUY / SELL / NEUTRAL."""
+    try:
+        from datetime import datetime, timedelta
+        from app.market_data.polygon_client import get_bars
+        from app.technical_analysis.engine import get_technical_profile
+
+        from_date = (datetime.now() - timedelta(days=200)).strftime("%Y-%m-%d")
+        to_date   = datetime.now().strftime("%Y-%m-%d")
+        bars      = get_bars(ticker, 1, "day", from_date, to_date)
+        ta        = get_technical_profile(ticker, bars)
+        return ta.get("signal", "NEUTRAL")
+    except Exception:
+        return "NEUTRAL"
+
+
+def _get_earnings_days(ticker: str) -> int | None:
+    """Return days to next earnings or None if unknown."""
+    try:
+        from app.options_flow.unusual_whales import get_ticker_earnings_history
+        history = get_ticker_earnings_history(ticker)
+        if not history:
+            return None
+        # Find the next upcoming earnings
+        today = datetime.now().date()
+        for e in history:
+            date_str = e.get("report_date") or e.get("earnings_date") or ""
+            if not date_str:
+                continue
+            try:
+                earn_date = datetime.strptime(date_str[:10], "%Y-%m-%d").date()
+                if earn_date >= today:
+                    return (earn_date - today).days
+            except Exception:
+                pass
+        return None
+    except Exception:
+        return None
+
+
+def _parse_option_dte(symbol: str) -> int | None:
+    """Extract DTE from option symbol like NVDA260710C00205000."""
+    try:
+        import re
+        m = re.search(r"(\d{6})[CP]", symbol)
+        if m:
+            exp = datetime.strptime("20" + m.group(1), "%Y%m%d")
+            return (exp - datetime.now()).days
+    except Exception:
+        pass
+    return None
+
+
+def evaluate_sell_signals(positions: list[dict]) -> list[dict]:
+    """
+    Evaluate every open position for exit signals.
+
+    Args:
+        positions: list from WebullConnector.get_positions()
+
+    Returns:
+        list of {symbol, action, urgency, reason, pnl_pct, signals}
+        action: SELL / WATCH / HOLD
+        urgency: HIGH / MEDIUM / LOW
+    """
+    results = []
+
+    for pos in positions:
+        symbol   = pos.get("symbol", "")
+        qty      = float(pos.get("qty", 0))
+        cost     = float(pos.get("total_cost", 0))
+        value    = float(pos.get("market_value", 0))
+        pnl      = float(pos.get("unrealized_profit_loss", 0))
+        pnl_rate = float(pos.get("unrealized_profit_loss_rate", 0))  # decimal e.g. -0.17
+        inst_type = pos.get("instrument_type", "STOCK")
+
+        if qty == 0 or cost == 0:
+            continue
+
+        signals = []
+        action  = "HOLD"
+        urgency = "LOW"
+
+        # ── Rule 1B: Stop Loss (-40% loss) ───────────────────────────────────
+        if pnl_rate <= STOP_LOSS_PCT:
+            signals.append(f"STOP LOSS: {pnl_rate*100:.1f}% loss (rule: exit at -40%)")
+            action  = "SELL"
+            urgency = "HIGH"
+
+        # ── Rule 1A: Take Profit (stock +20%, or option +80%) ────────────────
+        profit_threshold = TAKE_PROFIT_PCT if inst_type == "OPTION" else 0.20
+        if pnl_rate >= profit_threshold:
+            signals.append(f"TAKE PROFIT: +{pnl_rate*100:.1f}% gain (rule: exit at +{profit_threshold*100:.0f}%)")
+            if action != "SELL":
+                action  = "SELL"
+                urgency = "HIGH"
+
+        # ── Options-specific: DTE check ───────────────────────────────────────
+        if inst_type == "OPTION":
+            dte = _parse_option_dte(symbol)
+            if dte is not None and dte <= MIN_DTE:
+                signals.append(f"DTE WARNING: {dte} days remaining — theta decay accelerating")
+                if action == "HOLD":
+                    action  = "SELL"
+                    urgency = "HIGH"
+
+        # ── Earnings risk (both stocks and options) ───────────────────────────
+        earn_days = _get_earnings_days(symbol.split()[0])  # handle "NVDA 260710C" format
+        if earn_days is not None and earn_days <= EARNINGS_BUFFER:
+            signals.append(f"EARNINGS IN {earn_days}d — exit before IV crush/gap risk")
+            if action == "HOLD":
+                action  = "WATCH"
+                urgency = "MEDIUM"
+            elif action == "SELL" and urgency == "LOW":
+                urgency = "MEDIUM"
+
+        # ── TA reversal signal ────────────────────────────────────────────────
+        ticker = symbol.split()[0]
+        if len(ticker) <= 6:  # skip complex option symbols
+            ta_signal = _get_ta_signal(ticker)
+            # If we're holding a LONG position but TA says SELL
+            if ta_signal == "SELL" and pnl_rate > -0.10:  # only flag if not already stopped
+                signals.append(f"TA REVERSAL: {ticker} showing SELL signal")
+                if action == "HOLD":
+                    action  = "WATCH"
+                    urgency = "MEDIUM"
+
+        # ── Significant loss watch ────────────────────────────────────────────
+        if -0.40 < pnl_rate <= -0.25 and action == "HOLD":
+            signals.append(f"LOSS WATCH: {pnl_rate*100:.1f}% — approaching stop loss threshold")
+            action  = "WATCH"
+            urgency = "MEDIUM"
+
+        results.append({
+            "symbol":          symbol,
+            "instrument_type": inst_type,
+            "action":          action,
+            "urgency":         urgency,
+            "pnl":             round(pnl, 2),
+            "pnl_pct":         round(pnl_rate * 100, 2),
+            "cost":            round(cost, 2),
+            "market_value":    round(value, 2),
+            "qty":             qty,
+            "signals":         signals,
+            "earnings_days":   earn_days,
+        })
+
+    # Sort: HIGH urgency first, then by worst P&L
+    results.sort(key=lambda x: (
+        {"HIGH": 0, "MEDIUM": 1, "LOW": 2}.get(x["urgency"], 3),
+        x["pnl_pct"]
+    ))
+
+    return results
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Portfolio P&L
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_portfolio_pnl_summary(
+    positions: list[dict],
+    balances: dict | None = None,
+) -> dict:
+    """
+    Calculate full portfolio P&L snapshot.
+
+    Args:
+        positions: from WebullConnector.get_positions()
+        balances:  from WebullConnector.get_balances() (optional, for buying power)
+
+    Returns:
+        Complete portfolio summary with per-position breakdown
+    """
+    if not positions:
+        return {"error": "No positions found"}
+
+    total_cost   = 0.0
+    total_value  = 0.0
+    total_pnl    = 0.0
+    stock_value  = 0.0
+    option_value = 0.0
+
+    breakdown = []
+    for pos in positions:
+        cost     = float(pos.get("total_cost", 0))
+        value    = float(pos.get("market_value", 0))
+        pnl      = float(pos.get("unrealized_profit_loss", 0))
+        pnl_rate = float(pos.get("unrealized_profit_loss_rate", 0))
+        inst_type = pos.get("instrument_type", "STOCK")
+
+        total_cost  += cost
+        total_value += value
+        total_pnl   += pnl
+
+        if inst_type == "OPTION":
+            option_value += value
+        else:
+            stock_value += value
+
+        breakdown.append({
+            "symbol":       pos.get("symbol"),
+            "type":         inst_type,
+            "qty":          float(pos.get("qty", 0)),
+            "cost":         round(cost, 2),
+            "value":        round(value, 2),
+            "pnl":          round(pnl, 2),
+            "pnl_pct":      round(pnl_rate * 100, 2),
+            "weight":       round(value / max(total_value, 1) * 100, 1),
+            "unit_cost":    float(pos.get("unit_cost", 0)),
+            "last_price":   float(pos.get("last_price", 0)),
+        })
+
+    # Sort by P&L
+    breakdown.sort(key=lambda x: x["pnl"], reverse=True)
+
+    # Recalculate weights with final total
+    for b in breakdown:
+        b["weight"] = round(b["value"] / max(total_value, 1) * 100, 1)
+
+    total_pnl_pct = (total_pnl / total_cost * 100) if total_cost > 0 else 0
+
+    # Best/worst
+    winners = [b for b in breakdown if b["pnl"] > 0]
+    losers  = [b for b in breakdown if b["pnl"] < 0]
+
+    # Buying power from balances
+    buying_power  = None
+    cash          = None
+    account_value = None
+    if balances:
+        buying_power  = balances.get("buying_power") or balances.get("cash_available_for_trade")
+        cash          = balances.get("cash_balance") or balances.get("net_cash")
+        account_value = balances.get("total_account_value") or balances.get("net_liquidation")
+
+    return {
+        # Totals
+        "total_cost":       round(total_cost, 2),
+        "total_value":      round(total_value, 2),
+        "total_pnl":        round(total_pnl, 2),
+        "total_pnl_pct":    round(total_pnl_pct, 2),
+        "position_count":   len(positions),
+        "stock_value":      round(stock_value, 2),
+        "option_value":     round(option_value, 2),
+
+        # Account
+        "buying_power":     buying_power,
+        "cash":             cash,
+        "account_value":    account_value,
+
+        # Performance
+        "winners":          len(winners),
+        "losers":           len(losers),
+        "win_rate":         round(len(winners) / max(len(positions), 1) * 100, 1),
+        "best_performer":   breakdown[0]["symbol"] if breakdown else None,
+        "worst_performer":  breakdown[-1]["symbol"] if breakdown else None,
+        "biggest_gain":     round(max((b["pnl"] for b in breakdown), default=0), 2),
+        "biggest_loss":     round(min((b["pnl"] for b in breakdown), default=0), 2),
+
+        # Detail
+        "positions": breakdown,
+
+        "as_of": datetime.now().strftime("%Y-%m-%d %H:%M ET"),
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LLM-Enhanced Sell Analysis
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_position_context(signal: dict, all_positions: list[dict]) -> str:
+    """
+    Build rich context string for LLM analysis of one position.
+    Includes sector peers, flow data, and TA signal.
+    """
+    sym      = signal["symbol"].split()[0]
+    pnl_pct  = signal["pnl_pct"]
+    cost     = signal["cost"]
+    value    = signal["market_value"]
+    inst     = signal["instrument_type"]
+
+    lines = [
+        f"POSITION: {sym} ({inst})",
+        f"  Entry cost: ${cost:,.2f} | Current value: ${value:,.2f}",
+        f"  Unrealized P&L: ${signal['pnl']:,.2f} ({pnl_pct:+.1f}%)",
+        f"  Qty: {signal['qty']}",
+        f"  Rule signals fired: {', '.join(signal['signals']) or 'none'}",
+    ]
+
+    if signal.get("earnings_days") is not None:
+        lines.append(f"  Earnings in {signal['earnings_days']} days")
+
+    # Add TA signal
+    try:
+        ta = _get_ta_signal(sym)
+        lines.append(f"  TA signal: {ta}")
+    except Exception:
+        pass
+
+    # Add UW flow summary
+    try:
+        from app.options_flow.unusual_whales import get_flow_alerts, get_dark_pool_ticker
+        alerts = get_flow_alerts(ticker=sym, limit=5)
+        if alerts:
+            bull = sum(1 for a in alerts if a.get("sentiment") in ("BULLISH","CALL"))
+            bear = sum(1 for a in alerts if a.get("sentiment") in ("BEARISH","PUT"))
+            lines.append(f"  Options flow (last 5): {bull} bullish / {bear} bearish")
+
+        dp = get_dark_pool_ticker(sym, limit=5)
+        if dp:
+            dp_buy  = sum(1 for d in dp if d.get("side") in ("BUY","A"))
+            dp_sell = sum(1 for d in dp if d.get("side") in ("SELL","B"))
+            lines.append(f"  Dark pool (last 5): {dp_buy} buy / {dp_sell} sell")
+    except Exception:
+        pass
+
+    # Add sector peers from same portfolio
+    peers = [
+        p for p in all_positions
+        if p["symbol"] != signal["symbol"]
+        and float(p.get("unrealized_profit_loss_rate", 0)) != 0
+    ]
+    if peers:
+        peer_summary = ", ".join(
+            f"{p['symbol']} {float(p['unrealized_profit_loss_rate'])*100:+.0f}%"
+            for p in peers[:4]
+        )
+        lines.append(f"  Portfolio peers: {peer_summary}")
+
+    return "\n".join(lines)
+
+
+def evaluate_sell_signals_with_llm(
+    positions: list[dict],
+    user_id: str | None = None,
+) -> list[dict]:
+    """
+    LLM-enhanced sell signal evaluation.
+
+    Tier 1: Rule-based signals fire first (instant, always reliable)
+    Tier 2: LLM evaluates each actionable signal with full context:
+        - Position details + P&L
+        - TA signal
+        - UW options flow
+        - Sector peer performance
+        - Earnings proximity
+        Returns: nuanced recommendation, reasoning, partial exit %, confidence
+
+    Args:
+        positions: from WebullConnector.get_positions()
+        user_id:   for broker context
+
+    Returns:
+        Enhanced signals with LLM reasoning added to each actionable one
+    """
+    # Tier 1: Rule-based
+    signals    = evaluate_sell_signals(positions)
+    actionable = [s for s in signals if s["action"] in ("SELL", "WATCH")]
+
+    if not actionable:
+        return signals
+
+    # Tier 2: LLM analysis for each actionable signal
+    try:
+        from app.llm.service import LLMService
+        llm = LLMService()
+
+        for signal in actionable:
+            try:
+                context = _build_position_context(signal, positions)
+
+                prompt = f"""You are an expert options and stock trader analyzing exit decisions.
+
+{context}
+
+TASK: Provide a nuanced sell recommendation. Consider:
+1. Is this a full exit or partial profit-taking?
+2. Does the momentum/sector suggest the trend continues?
+3. Any upcoming catalysts (earnings, Fed meetings) that change the thesis?
+4. For large gains: should the trader roll up strikes or take profit?
+5. For large losses: is this a fundamentals change or temporary weakness?
+
+Respond in this exact format:
+ACTION: [FULL_EXIT / PARTIAL_EXIT / HOLD / ROLL]
+EXIT_PCT: [0-100% of position to exit]
+CONFIDENCE: [HIGH / MEDIUM / LOW]
+SUMMARY: [One sentence recommendation]
+REASONING: [2-3 sentences explaining the nuanced view]
+RISK: [One sentence about the main risk of this recommendation]"""
+
+                response = llm.complete(prompt, max_tokens=300)
+
+                # Parse LLM response
+                llm_action    = "HOLD"
+                llm_exit_pct  = 100
+                llm_conf      = "MEDIUM"
+                llm_summary   = ""
+                llm_reasoning = ""
+                llm_risk      = ""
+
+                for line in response.splitlines():
+                    line = line.strip()
+                    if line.startswith("ACTION:"):
+                        llm_action = line.split(":",1)[1].strip()
+                    elif line.startswith("EXIT_PCT:"):
+                        try:
+                            llm_exit_pct = int(line.split(":",1)[1].strip().replace("%",""))
+                        except Exception:
+                            pass
+                    elif line.startswith("CONFIDENCE:"):
+                        llm_conf = line.split(":",1)[1].strip()
+                    elif line.startswith("SUMMARY:"):
+                        llm_summary = line.split(":",1)[1].strip()
+                    elif line.startswith("REASONING:"):
+                        llm_reasoning = line.split(":",1)[1].strip()
+                    elif line.startswith("RISK:"):
+                        llm_risk = line.split(":",1)[1].strip()
+
+                signal["llm"] = {
+                    "action":     llm_action,
+                    "exit_pct":   llm_exit_pct,
+                    "confidence": llm_conf,
+                    "summary":    llm_summary,
+                    "reasoning":  llm_reasoning,
+                    "risk":       llm_risk,
+                }
+
+            except Exception as e:
+                signal["llm"] = {"error": str(e)}
+
+    except Exception as e:
+        # LLM unavailable — return rule-based only
+        for s in actionable:
+            s["llm"] = {"error": f"LLM unavailable: {e}"}
+
+    return signals
+
+
+def format_sell_report(signals: list[dict], pnl: dict) -> str:
+    """
+    Format sell signals + P&L into a clean Claude Desktop response.
+    """
+    lines = []
+
+    # Header
+    lines.append("## Portfolio P&L Summary")
+    lines.append(f"**Total Value:** ${pnl['total_value']:,.2f} | "
+                 f"**P&L:** ${pnl['total_pnl']:,.2f} ({pnl['total_pnl_pct']:+.2f}%) | "
+                 f"**Win Rate:** {pnl['win_rate']}% ({pnl['winners']}W/{pnl['losers']}L)")
+    if pnl.get("buying_power"):
+        lines.append(f"**Buying Power:** ${float(pnl['buying_power']):,.2f}")
+    lines.append("")
+
+    # Actionable signals
+    actionable = [s for s in signals if s["action"] in ("SELL","WATCH")]
+    if actionable:
+        lines.append("## Exit Recommendations")
+        for s in actionable:
+            emoji = "🔴" if s["action"] == "SELL" else "🟡"
+            lines.append(f"\n{emoji} **{s['symbol']}** — {s['action']} ({s['urgency']} urgency) | P&L: {s['pnl_pct']:+.1f}%")
+            for sig in s["signals"]:
+                lines.append(f"  - {sig}")
+            if s.get("llm") and not s["llm"].get("error"):
+                llm = s["llm"]
+                lines.append(f"  💬 **LLM:** {llm.get('summary','')}")
+                if llm.get("exit_pct", 100) < 100:
+                    lines.append(f"  📊 **Exit:** {llm['exit_pct']}% of position | Confidence: {llm.get('confidence','')}")
+                if llm.get("reasoning"):
+                    lines.append(f"  📝 {llm['reasoning']}")
+                if llm.get("risk"):
+                    lines.append(f"  ⚠️ Risk: {llm['risk']}")
+    else:
+        lines.append("## Exit Recommendations\n✅ No urgent exit signals at this time.")
+
+    return "\n".join(lines)
+
+@mcp.tool()
+def get_sell_signals(use_llm: bool = True) -> dict:
+    """
+    Analyze all open positions for exit signals.
+    Tier 1: Rule-based — stop loss, take profit, DTE, earnings, TA reversal.
+    Tier 2: LLM batch — nuanced recommendation for ALL positions including HOLDs.
+    Checks past recommendations — flags if signal was previously ignored.
+    Returns: actionable exits with LLM reasoning + hold assessments.
+    """
+    from app.broker.webull_connector import WebullConnector
+    from app.broker.sell_signals import (
+        evaluate_sell_signals,
+        evaluate_sell_signals_with_llm,
+        format_sell_report,
+        get_portfolio_pnl_summary,
+    )
+    from app.utils.current_user import get_current_user_id
+
+    user_id = get_current_user_id()
+    pos     = WebullConnector(user_id).get_positions()
+    pnl     = get_portfolio_pnl_summary(pos, None)
+    fn      = evaluate_sell_signals_with_llm if use_llm else evaluate_sell_signals
+    signals = fn(pos, user_id=user_id) if use_llm else fn(pos)
+    return {"report": format_sell_report(signals, pnl), "signals": signals, "pnl": pnl}
+
+
+@mcp.tool()
+def get_portfolio_pnl() -> dict:
+    """
+    Full portfolio P&L snapshot.
+    Returns: total value, cost, unrealized P&L, win rate,
+    per-position breakdown sorted by P&L, best/worst performers.
+    """
+    from app.broker.webull_connector import WebullConnector
+    from app.broker.sell_signals import get_portfolio_pnl_summary
+    from app.utils.current_user import get_current_user_id
+
+    user_id = get_current_user_id()
+    wb      = WebullConnector(user_id)
+    pos     = wb.get_positions()
+    try:    bal = wb.get_balances()
+    except: bal = None
+    return get_portfolio_pnl_summary(pos, bal)
+
+
 if __name__ == "__main__":
     mcp.run()

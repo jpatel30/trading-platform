@@ -242,3 +242,53 @@ def _get_previous_close_yahoo(ticker: str) -> dict | None:
     except Exception as e:
         print(f"[MarketData] Yahoo fallback also failed for {ticker}: {e}")
         return None
+
+"""
+Add to app/market_data/polygon_client.py
+
+Grouped daily bar — one API call returns closing price for ALL US stocks on a given date.
+Much more efficient than 127 individual calls for the scanner.
+
+Polygon free tier: /v2/aggs/grouped/locale/us/market/stocks/{date}
+Returns: list of {T: ticker, o: open, h: high, l: low, c: close, v: volume, ...}
+"""
+
+
+def get_grouped_daily(date: str) -> list[dict]:
+    """
+    Get closing prices for ALL US stocks on a given date.
+    One API call instead of N individual calls.
+
+    Args:
+        date: 'YYYY-MM-DD' — use last trading day (skip weekends/holidays)
+
+    Returns:
+        list of {T, o, h, l, c, v, vw, n, t} per ticker
+        T = ticker, c = close, o = open, v = volume
+
+    Usage:
+        from datetime import datetime, timedelta
+        date = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+        data = get_grouped_daily(date)
+        prices = {d['T']: d['c'] for d in data}
+    """
+    key = f"grouped:{date}"
+    cached = _cache_get(key)
+    if cached:
+        return cached
+
+    try:
+        import requests
+        from app.utils.config import settings
+
+        url = f"https://api.polygon.io/v2/aggs/grouped/locale/us/market/stocks/{date}"
+        r   = requests.get(url, params={"apiKey": settings.polygon_api_key}, timeout=15)
+
+        if r.status_code == 200:
+            data   = r.json()
+            result = data.get("results", [])
+            _cache_set(key, result, "bars")  # cache for the session
+            return result
+        return []
+    except Exception:
+        return []

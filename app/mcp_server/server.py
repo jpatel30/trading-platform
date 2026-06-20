@@ -570,6 +570,34 @@ def scan_tickers(
     results.sort(key=lambda x: x["confidence"], reverse=True)
     return results[:top_n]
 
+@mcp.tool()
+def scan_watchlist(
+    budget: float = 2000.0,
+    max_loss: float | None = None,
+    top_n: int = 5,
+) -> dict:
+    """
+    THE DAILY ANALYSIS TOOL — scans your entire Webull watchlist (127 stocks)
+    using the Two-Tier Convergence Scanner.
+
+    Tier 1 (30s): Scores ALL watchlist tickers on:
+      - Price momentum (±2%+ today via yfinance)
+      - Options flow (unusual sweeps via UW)
+      - Dark pool (institutional prints via UW)
+      Selects top 5 where ≥2 signals converge in the same direction.
+
+    Tier 2 (60-90s): Deep LLM analysis on top 5:
+      - Stock price: Webull → yfinance → Polygon (most current)
+      - Options prices/IV/volume: UW exclusively
+      - Greeks: BSM with UW IV + live spot
+      - LLM decides strategy + strikes from full data package
+      - Python executes exact math with real UW prices
+
+    Returns 2-3 complete trade setups with specific strikes, entry,
+    target, stop, and Webull order instructions. Total ~2 minutes.
+    """
+    from app.scanner.quick_scan import run_full_scan
+    return run_full_scan(budget=budget, max_loss=max_loss, top_quick=top_n)
 
 if __name__ == "__main__":
     mcp.run()

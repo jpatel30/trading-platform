@@ -96,3 +96,23 @@ def list_broker_connections(user_id: str) -> list[dict]:
             {"user_id": user_id},
         )
         return [dict(row._mapping) for row in result.fetchall()]
+
+
+"""
+Add to app/db/queries/broker_connections.py
+"""
+
+def get_all_user_brokers(user_id: str) -> list[str]:
+    """Return list of broker names the user has connected."""
+    with get_session() as session:
+        result = session.execute(
+            text("""
+                 SELECT DISTINCT broker_name
+                 FROM broker_connections
+                 WHERE user_id = :user_id
+                   AND is_active = TRUE
+                 ORDER BY broker_name
+                 """),
+            {"user_id": user_id}
+        )
+        return [r[0] for r in result.fetchall()]

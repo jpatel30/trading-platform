@@ -286,13 +286,20 @@ def _build_signal_prompt(pos: dict, all_positions: list[dict], user_id: str | No
                 "User has NOT acted on previous signals — increase urgency" if not past[0].get("user_acted")
                 else "User acted on last signal — provide fresh analysis"
             )
-
+    # RAG context for this ticker
+    rag_text = ""
+    try:
+        from app.rag.context_builder import get_context_for_prompt
+        rag_text = "\n[MARKET CONTEXT]\n" + get_context_for_prompt(sym)[:1000] + "\n\n"
+    except Exception:
+        pass
     return (
         "Position: {sym} | P&L: {pnl:+.1f}% | Cost: ${cost:,.0f} | Value: ${val:,.0f}\n"
         "Rule signals: {rules}\n"
         "TA: {ta} | {earn}\n"
         "Portfolio peers: {peers}"
         "{history}\n\n"
+        "{rag}"
         "Reply ONLY:\n"
         "ACTION: FULL_EXIT or PARTIAL_EXIT or HOLD or ROLL\n"
         "EXIT_PCT: 0-100\n"
@@ -302,7 +309,8 @@ def _build_signal_prompt(pos: dict, all_positions: list[dict], user_id: str | No
         "RISK: one sentence"
     ).format(
         sym=sym, pnl=pnl_pct, cost=pos["cost"], val=pos["market_value"],
-        rules=rules, ta=ta_sig, earn=earn, peers=peers, history=history_text
+        rules=rules, ta=ta_sig, earn=earn, peers=peers, history=history_text,
+        rag=rag_text
     )
 
 

@@ -219,6 +219,7 @@ def _build_llm_data_package(
     budget: float,
     max_loss: float,
     profit_target: float | None,
+    rag_context: str = "",
 ) -> str:
     """
     Build a structured data package for the LLM to reason over.
@@ -290,7 +291,12 @@ PUT SPREAD RULE: sell strike MUST be higher than buy strike (sell closer to ATM,
 CALL SPREAD RULE: buy strike MUST be higher than sell strike (sell closer to ATM, buy further OTM)
 IRON CONDOR LEG ORDER (Webull convention): BUY PUT (lowest) → SELL PUT → SELL CALL → BUY CALL (highest)"""
 
-    return ta + flow + expiry_str + constraints + rules
+    # RAG context: historical price + earnings + macro + news
+    rag_section = ""
+    if rag_context:
+        rag_section = "\n\nMARKET CONTEXT (Historical + News + Macro):\n" + rag_context[:2000]
+
+    return ta + flow + expiry_str + constraints + rules + rag_section
 
 
 def _log_llm_decision(ticker: str, decision: dict, outcome: str, status: str) -> None:
@@ -818,9 +824,25 @@ def build_recommendation(
         })
 
     # ── Step 2: LLM decides strategy + strikes ────────────────────────────────
+    # Fetch RAG context (historical price, earnings, macro, news)
+    rag_context = ""
+    try:
+        from app.rag.context_builder import get_context_for_prompt
+        rag_context = get_context_for_prompt(ticker)
+        print(f"[Strategy] RAG context loaded for {ticker}")
+    except Exception as e:
+        print(f"[Strategy] RAG unavailable: {e}")
+
     data_package = _build_llm_data_package(
-        ticker, ta_profile, flow_signal, spot,
-        expiry_options, budget, max_loss, profit_target
+        ticker=ticker,
+        ta_profile=ta_profile,
+        flow_signal=flow_signal,
+        spot=spot,
+        expiry_options=expiry_options,
+        budget=budget,
+        max_loss=max_loss,
+        profit_target=profit_target,
+        rag_context=rag_context,
     )
 
     llm_decision = _llm_decide_strategy(data_package, ticker)

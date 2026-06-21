@@ -523,6 +523,35 @@ def get_sell_signals(use_llm: bool = True) -> dict:
         "pnl":     pnl,
     }
 
+@mcp.tool()
+def get_market_context(ticker: str) -> dict:
+    """
+    Full market context for any ticker — used automatically by scan_watchlist
+    and get_sell_signals, but call directly to research before trading.
+
+    Returns:
+    - Price trend: 6-month performance, MA50/200, S/R levels, volume
+    - Earnings: last 4 quarters (beat/miss + reaction %) + next upcoming
+    - Macro calendar: Fed/CPI/NFP/PCE in next 30 days
+    - Ticker news: Polygon AI-analyzed articles with sentiment per ticker
+    - Global news: CNBC + MarketWatch + Federal Reserve + UW market headlines
+    - Sector: sector ETF performance vs SPY (outperforming/underperforming)
+
+    All data fetched fresh, session-cached for 1 hour.
+    """
+    from app.rag.context_builder import build_ticker_context
+    ctx = build_ticker_context(ticker.upper())
+    return {
+        "ticker":          ctx["ticker"],
+        "price":           ctx.get("price", {}),
+        "earnings":        ctx.get("earnings", {}),
+        "macro":           ctx.get("macro", {}),
+        "ticker_news":     ctx.get("ticker_news", []),
+        "global_news":     ctx.get("global_news", []),
+        "sector":          ctx.get("sector", {}),
+        "formatted":       ctx.get("formatted_prompt", ""),
+        "build_time_s":    ctx.get("build_time_s"),
+    }
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ENTRY POINT

@@ -554,6 +554,99 @@ def get_market_context(ticker: str) -> dict:
     }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# POSITION MONITOR (W13)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def start_monitor() -> dict:
+    """
+    Start background position monitor — polls every 2 minutes during market hours.
+    Fires alerts when positions hit stop loss, take profit, earnings risk, or DTE warning.
+    Alerts stored in DB, readable via get_active_alerts().
+    Also caches portfolio for instant reads (used by get_portfolio_pnl).
+    """
+    from app.monitor.position_monitor import get_monitor
+    return get_monitor(get_current_user_id()).start()
+
+
+@mcp.tool()
+def stop_monitor() -> dict:
+    """Stop the background position monitor."""
+    from app.monitor.position_monitor import get_monitor
+    return get_monitor(get_current_user_id()).stop()
+
+
+@mcp.tool()
+def get_monitor_status() -> dict:
+    """
+    Current monitor status: running, last check time, pending alerts,
+    total checks run, total alerts fired.
+    """
+    from app.monitor.position_monitor import get_monitor
+    return get_monitor(get_current_user_id()).status()
+
+
+@mcp.tool()
+def get_active_alerts(limit: int = 20) -> list[dict]:
+    """
+    Unread position alerts sorted by urgency (HIGH first).
+    Each alert: symbol, type, urgency, message, P&L, triggered_at.
+    Alert types: STOP_LOSS / TAKE_PROFIT / EARNINGS / DTE_WARNING / TA_REVERSAL / WATCH
+    """
+    from app.monitor.position_monitor import get_active_alerts as _get
+    return _get(get_current_user_id(), limit=limit)
+
+
+@mcp.tool()
+def dismiss_alert(alert_id: str) -> dict:
+    """Mark a specific alert as read and dismissed."""
+    from app.monitor.position_monitor import dismiss_alert as _dismiss
+    dismissed = _dismiss(get_current_user_id(), alert_id)
+    return {"dismissed": dismissed, "alert_id": alert_id}
+
+
+@mcp.tool()
+def dismiss_all_alerts() -> dict:
+    """Dismiss all pending alerts."""
+    from app.monitor.position_monitor import dismiss_all_alerts as _dismiss_all
+    count = _dismiss_all(get_current_user_id())
+    return {"dismissed": count}
+
+@mcp.tool()
+def mute_alerts(symbol: str | None = None, hours: int | None = None) -> dict:
+    """
+    Stop alerts — globally or for a specific symbol.
+    Examples:
+      "stop all alerts"              → mute_alerts()
+      "stop GLD alerts"              → mute_alerts(symbol='GLD')
+      "mute GLD for 24 hours"        → mute_alerts(symbol='GLD', hours=24)
+      "stop all alerts for 8 hours"  → mute_alerts(hours=8)
+    Args:
+        symbol: specific ticker to mute (None = mute everything)
+        hours:  how long to mute (None = until you say unmute)
+    """
+    from app.monitor.position_monitor import mute_alerts as _mute
+    return _mute(get_current_user_id(), symbol=symbol, hours=hours)
+
+
+@mcp.tool()
+def unmute_alerts(symbol: str | None = None) -> dict:
+    """
+    Re-enable alerts — globally or for a specific symbol.
+    Args:
+        symbol: specific ticker to unmute (None = unmute everything)
+    """
+    from app.monitor.position_monitor import unmute_alerts as _unmute
+    return _unmute(get_current_user_id(), symbol=symbol)
+
+
+@mcp.tool()
+def get_mute_status() -> dict:
+    """Show what's currently muted — global and per-symbol."""
+    from app.monitor.position_monitor import get_mute_status as _status
+    return _status(get_current_user_id())
+
+# ─────────────────────────────────────────────────────────────────────────────
 # ENTRY POINT
 # ─────────────────────────────────────────────────────────────────────────────
 

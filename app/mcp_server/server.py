@@ -769,17 +769,6 @@ def mark_sell_acted(symbol: str, exit_pct: int = 100) -> dict:
 
 
 @mcp.tool()
-def get_accuracy_report(days_back: int = 30) -> dict:
-    """
-    Full accuracy report — how good are our recommendations?
-    Shows: win rate, best/worst strategies, ignored sell signals,
-    missed opportunities, and actionable learnings.
-    """
-    from app.learning.prediction_tracker import get_accuracy_report as _report
-    return _report(get_current_user_id(), days_back)
-
-
-@mcp.tool()
 def get_trade_history(limit: int = 20) -> list[dict]:
     """
     Full history of executed trades — open and closed.

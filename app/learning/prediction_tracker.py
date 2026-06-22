@@ -13,7 +13,7 @@ Flow:
     1. Claude recommends trade (strategy engine)
     2. User says "yes I executed" → confirm_execution() → tracked_positions
     3. Position closes → log_exit() → tracked_positions + sell_recommendations
-    4. get_accuracy_report() → reads both tables → win rate + learnings
+    4. get_learning_report() → reads both tables → win rate + learnings
     5. update_user_profile() → writes learnings to user_profiles
 """
 from datetime import datetime, timedelta
@@ -192,139 +192,14 @@ def log_exit(
 
 def get_accuracy_report(user_id: str, days_back: int = 90) -> dict:
     """
-    Calculates win rate and performance from tracked outcomes.
-
-    Reads from:
-        tracked_positions    → closed positions with P&L
-        sell_recommendations → was our exit signal correct?
+    Deprecated — use get_learning_report() from app.learning.engine instead.
+    This is kept as a thin alias for backwards compatibility.
     """
     try:
-        from sqlalchemy import text
-        from app.db.session import get_session
-        with get_session() as s:
-
-            # ── Closed positions performance ──────────────────────────────────
-            positions = s.execute(text("""
-                SELECT symbol, source, entry_price, exit_price, qty,
-                       target_pct, stop_pct, exit_reason, entry_date, exit_date,
-                       llm_entry_note
-                FROM tracked_positions
-                WHERE user_id  = :uid
-                  AND is_active = FALSE
-                  AND exit_date >= CURRENT_DATE - :days
-                  AND exit_price IS NOT NULL
-                ORDER BY exit_date DESC
-            """), {"uid": user_id, "days": days_back}).fetchall()
-
-            closed = []
-            for p in positions:
-                if p.entry_price and p.exit_price:
-                    ep     = float(p.entry_price)
-                    xp     = float(p.exit_price)
-                    qty    = float(p.qty or 1)
-                    pct    = (xp - ep) / ep * 100
-                    abs_pl = (xp - ep) * qty
-                    closed.append({
-                        "symbol":      p.symbol,
-                        "source":      p.source,
-                        "pnl_pct":     round(pct, 1),
-                        "pnl_abs":     round(abs_pl, 2),
-                        "won":         pct > 0,
-                        "exit_reason": p.exit_reason,
-                        "strategy":    (p.llm_entry_note or "").split("|")[0].strip(),
-                        "hold_days":   (p.exit_date - p.entry_date).days if p.exit_date and p.entry_date else None,
-                    })
-
-            # ── Sell signal accuracy ──────────────────────────────────────────
-            sell_recs = s.execute(text("""
-                SELECT symbol, llm_action, pnl_pct, outcome_pnl,
-                       was_correct, llm_confidence
-                FROM sell_recommendations
-                WHERE user_id    = :uid
-                  AND was_correct IS NOT NULL
-                  AND recommended_at >= now() - :days * interval '1 day'
-            """), {"uid": user_id, "days": days_back}).fetchall()
-
-            # ── Ignored signals ───────────────────────────────────────────────
-            ignored = s.execute(text("""
-                SELECT symbol, COUNT(*) as times, MAX(pnl_pct) as last_pnl
-                FROM sell_recommendations
-                WHERE user_id    = :uid
-                  AND user_acted = FALSE
-                  AND recommended_at >= now() - :days * interval '1 day'
-                GROUP BY symbol
-                HAVING COUNT(*) > 1
-                ORDER BY times DESC
-            """), {"uid": user_id, "days": days_back}).fetchall()
-
-        # ── Compute stats ──────────────────────────────────────────────────────
-        wins   = [p for p in closed if p["won"]]
-        losses = [p for p in closed if not p["won"]]
-
-        win_rate   = round(len(wins) / max(len(closed), 1) * 100, 1)
-        avg_win    = round(sum(p["pnl_pct"] for p in wins) / max(len(wins), 1), 1)
-        avg_loss   = round(sum(p["pnl_pct"] for p in losses) / max(len(losses), 1), 1)
-        total_pnl  = round(sum(p["pnl_abs"] for p in closed), 2)
-
-        # Best/worst strategy
-        by_strategy: dict[str, list] = {}
-        for p in closed:
-            s_key = p["strategy"] or "Unknown"
-            by_strategy.setdefault(s_key, []).append(p["pnl_pct"])
-
-        strategy_stats = {
-            k: {
-                "trades":   len(v),
-                "win_rate": round(sum(1 for x in v if x > 0) / len(v) * 100, 1),
-                "avg_pnl":  round(sum(v) / len(v), 1),
-            }
-            for k, v in by_strategy.items() if len(v) >= 1
-        }
-
-        best_strategy  = max(strategy_stats, key=lambda k: strategy_stats[k]["win_rate"], default=None)
-        worst_strategy = min(strategy_stats, key=lambda k: strategy_stats[k]["win_rate"], default=None)
-
-        # Sell signal accuracy
-        sell_correct = sum(1 for r in sell_recs if r.was_correct)
-        sell_total   = len(sell_recs)
-        sell_accuracy = round(sell_correct / max(sell_total, 1) * 100, 1)
-
-        # Average hold time
-        hold_days = [p["hold_days"] for p in closed if p["hold_days"] is not None]
-        avg_hold  = round(sum(hold_days) / max(len(hold_days), 1), 1) if hold_days else None
-
-        return {
-            "period_days":   days_back,
-            "total_trades":  len(closed),
-
-            "win_rate":      win_rate,
-            "wins":          len(wins),
-            "losses":        len(losses),
-            "total_pnl":     total_pnl,
-            "avg_win_pct":   avg_win,
-            "avg_loss_pct":  avg_loss,
-            "avg_hold_days": avg_hold,
-
-            "sell_signal_accuracy": sell_accuracy,
-            "sell_signals_tracked": sell_total,
-
-            "strategy_performance": strategy_stats,
-            "best_strategy":        best_strategy,
-            "worst_strategy":       worst_strategy,
-
-            "ignored_signals": [
-                {
-                    "symbol": r.symbol,
-                    "times_ignored": r.times,
-                    "last_pnl": float(r.last_pnl),
-                }
-                for r in ignored
-            ],
-
-            "recent_trades": closed[:10],
-        }
+        from app.learning.engine import get_learning_report
+        return get_learning_report(user_id)
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": str(e), "message": "Use get_learning_report() directly"}
 
 
 def format_accuracy_report(report: dict) -> str:
@@ -389,7 +264,7 @@ def update_user_profile_from_outcomes(user_id: str) -> bool:
     Called after enough trades accumulate (5+).
     """
     try:
-        report = get_accuracy_report(user_id, days_back=90)
+        from app.learning.engine import get_learning_report as _lr; report = _lr(user_id)
         if report.get("total_trades", 0) < 3:
             return False
 

@@ -712,6 +712,83 @@ def get_notification_config() -> dict:
     return get_config(get_current_user_id())
 
 # ─────────────────────────────────────────────────────────────────────────────
+# PREDICTION TRACKER (W15)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def confirm_execution(
+    symbol: str,
+    actual_entry: float,
+    contracts: int,
+    recommendation_id: str | None = None,
+) -> dict:
+    """
+    Confirm you executed a recommended trade.
+    Links to the original recommendation for accuracy tracking.
+    Adds position to 15-min monitoring automatically.
+    Args:
+        symbol:            ticker e.g. 'NVDA'
+        actual_entry:      price per contract you paid e.g. 1.85
+        contracts:         number of contracts e.g. 6
+        recommendation_id: optional — links to specific recommendation
+    """
+    from app.learning.prediction_tracker import confirm_execution as _confirm
+    return _confirm(get_current_user_id(), symbol, actual_entry,
+                    contracts, recommendation_id)
+
+
+@mcp.tool()
+def log_outcome(
+    symbol: str,
+    exit_price: float,
+    exit_reason: str = "MANUAL",
+) -> dict:
+    """
+    Record what happened when you closed a position.
+    Calculates actual P&L, updates win rate, feeds learning engine.
+    Args:
+        symbol:      ticker e.g. 'NVDA'
+        exit_price:  price per contract you received e.g. 4.20
+        exit_reason: TAKE_PROFIT / STOP_LOSS / MANUAL / EXPIRED
+    """
+    from app.learning.prediction_tracker import log_outcome as _log
+    return _log(get_current_user_id(), symbol, exit_price, exit_reason)
+
+
+@mcp.tool()
+def mark_sell_acted(symbol: str, exit_pct: int = 100) -> dict:
+    """
+    Confirm you acted on a sell recommendation.
+    Updates sell_recommendations so we can track if our signals were right.
+    Args:
+        symbol:   ticker you sold e.g. 'GLD'
+        exit_pct: percentage of position you exited (default 100)
+    """
+    from app.learning.prediction_tracker import mark_sell_acted as _mark
+    return _mark(get_current_user_id(), symbol, exit_pct)
+
+
+@mcp.tool()
+def get_accuracy_report(days_back: int = 30) -> dict:
+    """
+    Full accuracy report — how good are our recommendations?
+    Shows: win rate, best/worst strategies, ignored sell signals,
+    missed opportunities, and actionable learnings.
+    """
+    from app.learning.prediction_tracker import get_accuracy_report as _report
+    return _report(get_current_user_id(), days_back)
+
+
+@mcp.tool()
+def get_trade_history(limit: int = 20) -> list[dict]:
+    """
+    Full history of executed trades — open and closed.
+    Shows entry, exit, actual P&L, and win/loss for each.
+    """
+    from app.learning.prediction_tracker import get_trade_history as _history
+    return _history(get_current_user_id(), limit)
+
+# ─────────────────────────────────────────────────────────────────────────────
 # ENTRY POINT
 # ─────────────────────────────────────────────────────────────────────────────
 

@@ -341,7 +341,7 @@ def fire_alert(user_id: str, symbol: str, alert_type: str, urgency: str,
                 VALUES (:uid, :sym, :at, :urg, :msg, :pct, :abs)
             """), {"uid": user_id, "sym": symbol, "at": alert_type,
                    "urg": urgency, "msg": message, "pct": pnl_pct, "abs": pnl_abs})
-            
+
         # Send Discord notification
         try:
             from app.notifications.discord import notify

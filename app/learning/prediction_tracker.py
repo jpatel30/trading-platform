@@ -1,0 +1,469 @@
+"""
+C10 Prediction Tracker (W15).
+
+Tracks every recommendation → execution → outcome to calculate win rate
+and improve future recommendations.
+
+Uses EXISTING tables — no new schema needed:
+    tracked_positions    → execution log (entry_price, qty, target, stop)
+    sell_recommendations → sell signal outcomes (user_acted, outcome_pnl, was_correct)
+    user_profiles        → learned preferences (best_strategy, risk_tolerance)
+
+Flow:
+    1. Claude recommends trade (strategy engine)
+    2. User says "yes I executed" → confirm_execution() → tracked_positions
+    3. Position closes → log_exit() → tracked_positions + sell_recommendations
+    4. get_accuracy_report() → reads both tables → win rate + learnings
+    5. update_user_profile() → writes learnings to user_profiles
+"""
+from datetime import datetime, timedelta
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Confirm Execution (user bought the recommended trade)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def confirm_execution(
+    user_id: str,
+    symbol: str,
+    entry_price: float,
+    qty: int,
+    strategy: str = "",
+    target_pct: float = 20.0,
+    stop_pct: float = -40.0,
+    note: str = "",
+) -> dict:
+    """
+    Log when user confirms they executed a recommended trade.
+    Upserts into tracked_positions with source='recommendation'.
+
+    Args:
+        symbol:      ticker e.g. 'NVDA'
+        entry_price: actual price paid per share/contract
+        qty:         number of shares or contracts
+        strategy:    e.g. 'DEBIT_PUT_SPREAD Jul 10 R/R=5.19'
+        target_pct:  profit target % (default +20% stocks, +80% options)
+        stop_pct:    stop loss % (default -40%)
+        note:        any extra context
+    """
+    try:
+        from sqlalchemy import text
+        from app.db.session import get_session
+
+        target_price = round(entry_price * (1 + target_pct / 100), 2)
+        stop_price   = round(entry_price * (1 + stop_pct / 100), 2)
+        llm_note     = f"{strategy} | {note}".strip(" |") if strategy or note else None
+
+        with get_session() as s:
+            s.execute(text("""
+                INSERT INTO tracked_positions (
+                    user_id, symbol, source, entry_date, entry_price, qty,
+                    target_pct, stop_pct, target_price, stop_price,
+                    check_interval_min, llm_entry_note, is_active
+                ) VALUES (
+                    :uid, :sym, 'recommendation', CURRENT_DATE, :ep, :qty,
+                    :tgt_pct, :stp_pct, :tgt_price, :stp_price,
+                    15, :note, TRUE
+                )
+                ON CONFLICT (user_id, symbol, entry_date)
+                DO UPDATE SET
+                    entry_price    = EXCLUDED.entry_price,
+                    qty            = EXCLUDED.qty,
+                    target_pct     = EXCLUDED.target_pct,
+                    stop_pct       = EXCLUDED.stop_pct,
+                    target_price   = EXCLUDED.target_price,
+                    stop_price     = EXCLUDED.stop_price,
+                    llm_entry_note = EXCLUDED.llm_entry_note,
+                    is_active      = TRUE
+            """), {
+                "uid": user_id, "sym": symbol.upper(),
+                "ep": entry_price, "qty": qty,
+                "tgt_pct": target_pct, "stp_pct": stop_pct,
+                "tgt_price": target_price, "stp_price": stop_price,
+                "note": llm_note,
+            })
+
+        investment = round(entry_price * qty, 2)
+        print(f"[Tracker] Execution logged: {symbol} x{qty} @ ${entry_price} = ${investment:,.0f}")
+
+        return {
+            "logged":        True,
+            "symbol":        symbol.upper(),
+            "qty":           qty,
+            "entry_price":   entry_price,
+            "investment":    investment,
+            "target_at":     f"+{target_pct:.0f}% (${target_price})",
+            "stop_at":       f"{stop_pct:.0f}% (${stop_price})",
+            "monitor_interval": "15 min (recommended position)",
+        }
+    except Exception as e:
+        print(f"[Tracker] confirm_execution failed: {e}")
+        return {"logged": False, "error": str(e)}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Log Exit (user closed the position)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def log_exit(
+    user_id: str,
+    symbol: str,
+    exit_price: float,
+    exit_reason: str = "MANUAL",
+) -> dict:
+    """
+    Log when user exits a position.
+    Updates tracked_positions + links to sell_recommendations outcome.
+
+    exit_reason: STOP_LOSS / TAKE_PROFIT / MANUAL / EXPIRED / ROLLED
+    """
+    try:
+        from sqlalchemy import text
+        from app.db.session import get_session
+        with get_session() as s:
+            # Get entry details
+            pos = s.execute(text("""
+                SELECT id, entry_price, qty, target_pct, stop_pct
+                FROM tracked_positions
+                WHERE user_id = :uid AND symbol = :sym AND is_active = TRUE
+                ORDER BY entry_date DESC LIMIT 1
+            """), {"uid": user_id, "sym": symbol.upper()}).fetchone()
+
+            if not pos:
+                return {"logged": False, "error": f"No active position found for {symbol}"}
+
+            # Calculate P&L
+            entry_price = float(pos.entry_price)
+            qty         = float(pos.qty)
+            pnl_pct     = (exit_price - entry_price) / entry_price * 100
+            pnl_abs     = (exit_price - entry_price) * qty
+            won         = pnl_pct > 0
+
+            # Close tracked_position
+            s.execute(text("""
+                UPDATE tracked_positions
+                SET is_active  = FALSE,
+                    exit_date  = CURRENT_DATE,
+                    exit_price = :ep,
+                    exit_reason = :reason
+                WHERE id = :id
+            """), {"ep": exit_price, "reason": exit_reason, "id": pos.id})
+
+            # Update most recent sell_recommendation for this symbol
+            s.execute(text("""
+                UPDATE sell_recommendations
+                SET user_acted     = TRUE,
+                    exit_price     = :ep,
+                    outcome_pnl    = :pnl,
+                    outcome_at     = now(),
+                    was_correct    = :won
+                WHERE user_id = :uid AND symbol = :sym
+                  AND recommended_at = (
+                      SELECT MAX(recommended_at) FROM sell_recommendations
+                      WHERE user_id = :uid AND symbol = :sym
+                  )
+            """), {
+                "ep": exit_price, "pnl": round(pnl_abs, 2),
+                "won": won, "uid": user_id, "sym": symbol.upper(),
+            })
+
+        result = {
+            "logged":      True,
+            "symbol":      symbol.upper(),
+            "exit_price":  exit_price,
+            "entry_price": entry_price,
+            "pnl_pct":     round(pnl_pct, 1),
+            "pnl_abs":     round(pnl_abs, 2),
+            "outcome":     "WIN ✅" if won else "LOSS ❌",
+            "exit_reason": exit_reason,
+        }
+
+        print(f"[Tracker] Exit logged: {symbol} {pnl_pct:+.1f}% (${pnl_abs:+,.0f}) — {exit_reason}")
+        return result
+
+    except Exception as e:
+        print(f"[Tracker] log_exit failed: {e}")
+        return {"logged": False, "error": str(e)}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Accuracy Report
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_accuracy_report(user_id: str, days_back: int = 90) -> dict:
+    """
+    Calculates win rate and performance from tracked outcomes.
+
+    Reads from:
+        tracked_positions    → closed positions with P&L
+        sell_recommendations → was our exit signal correct?
+    """
+    try:
+        from sqlalchemy import text
+        from app.db.session import get_session
+        with get_session() as s:
+
+            # ── Closed positions performance ──────────────────────────────────
+            positions = s.execute(text("""
+                SELECT symbol, source, entry_price, exit_price, qty,
+                       target_pct, stop_pct, exit_reason, entry_date, exit_date,
+                       llm_entry_note
+                FROM tracked_positions
+                WHERE user_id  = :uid
+                  AND is_active = FALSE
+                  AND exit_date >= CURRENT_DATE - :days
+                  AND exit_price IS NOT NULL
+                ORDER BY exit_date DESC
+            """), {"uid": user_id, "days": days_back}).fetchall()
+
+            closed = []
+            for p in positions:
+                if p.entry_price and p.exit_price:
+                    ep     = float(p.entry_price)
+                    xp     = float(p.exit_price)
+                    qty    = float(p.qty or 1)
+                    pct    = (xp - ep) / ep * 100
+                    abs_pl = (xp - ep) * qty
+                    closed.append({
+                        "symbol":      p.symbol,
+                        "source":      p.source,
+                        "pnl_pct":     round(pct, 1),
+                        "pnl_abs":     round(abs_pl, 2),
+                        "won":         pct > 0,
+                        "exit_reason": p.exit_reason,
+                        "strategy":    (p.llm_entry_note or "").split("|")[0].strip(),
+                        "hold_days":   (p.exit_date - p.entry_date).days if p.exit_date and p.entry_date else None,
+                    })
+
+            # ── Sell signal accuracy ──────────────────────────────────────────
+            sell_recs = s.execute(text("""
+                SELECT symbol, llm_action, pnl_pct, outcome_pnl,
+                       was_correct, llm_confidence
+                FROM sell_recommendations
+                WHERE user_id    = :uid
+                  AND was_correct IS NOT NULL
+                  AND recommended_at >= now() - :days * interval '1 day'
+            """), {"uid": user_id, "days": days_back}).fetchall()
+
+            # ── Ignored signals ───────────────────────────────────────────────
+            ignored = s.execute(text("""
+                SELECT symbol, COUNT(*) as times, MAX(pnl_pct) as last_pnl
+                FROM sell_recommendations
+                WHERE user_id    = :uid
+                  AND user_acted = FALSE
+                  AND recommended_at >= now() - :days * interval '1 day'
+                GROUP BY symbol
+                HAVING COUNT(*) > 1
+                ORDER BY times DESC
+            """), {"uid": user_id, "days": days_back}).fetchall()
+
+        # ── Compute stats ──────────────────────────────────────────────────────
+        wins   = [p for p in closed if p["won"]]
+        losses = [p for p in closed if not p["won"]]
+
+        win_rate   = round(len(wins) / max(len(closed), 1) * 100, 1)
+        avg_win    = round(sum(p["pnl_pct"] for p in wins) / max(len(wins), 1), 1)
+        avg_loss   = round(sum(p["pnl_pct"] for p in losses) / max(len(losses), 1), 1)
+        total_pnl  = round(sum(p["pnl_abs"] for p in closed), 2)
+
+        # Best/worst strategy
+        by_strategy: dict[str, list] = {}
+        for p in closed:
+            s_key = p["strategy"] or "Unknown"
+            by_strategy.setdefault(s_key, []).append(p["pnl_pct"])
+
+        strategy_stats = {
+            k: {
+                "trades":   len(v),
+                "win_rate": round(sum(1 for x in v if x > 0) / len(v) * 100, 1),
+                "avg_pnl":  round(sum(v) / len(v), 1),
+            }
+            for k, v in by_strategy.items() if len(v) >= 1
+        }
+
+        best_strategy  = max(strategy_stats, key=lambda k: strategy_stats[k]["win_rate"], default=None)
+        worst_strategy = min(strategy_stats, key=lambda k: strategy_stats[k]["win_rate"], default=None)
+
+        # Sell signal accuracy
+        sell_correct = sum(1 for r in sell_recs if r.was_correct)
+        sell_total   = len(sell_recs)
+        sell_accuracy = round(sell_correct / max(sell_total, 1) * 100, 1)
+
+        # Average hold time
+        hold_days = [p["hold_days"] for p in closed if p["hold_days"] is not None]
+        avg_hold  = round(sum(hold_days) / max(len(hold_days), 1), 1) if hold_days else None
+
+        return {
+            "period_days":   days_back,
+            "total_trades":  len(closed),
+
+            "win_rate":      win_rate,
+            "wins":          len(wins),
+            "losses":        len(losses),
+            "total_pnl":     total_pnl,
+            "avg_win_pct":   avg_win,
+            "avg_loss_pct":  avg_loss,
+            "avg_hold_days": avg_hold,
+
+            "sell_signal_accuracy": sell_accuracy,
+            "sell_signals_tracked": sell_total,
+
+            "strategy_performance": strategy_stats,
+            "best_strategy":        best_strategy,
+            "worst_strategy":       worst_strategy,
+
+            "ignored_signals": [
+                {
+                    "symbol": r.symbol,
+                    "times_ignored": r.times,
+                    "last_pnl": float(r.last_pnl),
+                }
+                for r in ignored
+            ],
+
+            "recent_trades": closed[:10],
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def format_accuracy_report(report: dict) -> str:
+    """Format accuracy report for Claude Desktop display."""
+    if report.get("error"):
+        return f"❌ Error: {report['error']}"
+
+    if report["total_trades"] == 0:
+        return (
+            "## Prediction Tracker\n\n"
+            "No closed trades recorded yet.\n\n"
+            "After executing a recommendation, say:\n"
+            "  *'I bought NVDA at $210, 6 contracts'*\n\n"
+            "After closing, say:\n"
+            "  *'I sold NVDA at $195'*"
+        )
+
+    lines = ["## Prediction Tracker — Accuracy Report"]
+    lines.append(f"**Period:** Last {report['period_days']} days\n")
+
+    lines.append("### Trade Performance")
+    lines.append(f"**Win Rate:** {report['win_rate']}% ({report['wins']}W / {report['losses']}L)")
+    lines.append(f"**Total P&L:** ${report['total_pnl']:+,.2f}")
+    lines.append(f"**Avg Win:** {report['avg_win_pct']:+.1f}% | **Avg Loss:** {report['avg_loss_pct']:+.1f}%")
+    if report.get("avg_hold_days"):
+        lines.append(f"**Avg Hold:** {report['avg_hold_days']} days")
+
+    if report.get("sell_signals_tracked", 0) > 0:
+        lines.append(f"\n**Sell Signal Accuracy:** {report['sell_signal_accuracy']}% ({report['sell_signals_tracked']} signals tracked)")
+
+    if report.get("strategy_performance"):
+        lines.append("\n### By Strategy")
+        for name, stats in sorted(
+            report["strategy_performance"].items(),
+            key=lambda x: x[1]["win_rate"], reverse=True
+        ):
+            badge = "🥇" if name == report.get("best_strategy") else \
+                    "⚠️" if name == report.get("worst_strategy") else "  "
+            lines.append(f"{badge} **{name}**: {stats['win_rate']}% win rate | {stats['trades']} trades | avg {stats['avg_pnl']:+.1f}%")
+
+    if report.get("ignored_signals"):
+        lines.append("\n### Ignored Signals — Cost of Not Acting")
+        for ig in report["ignored_signals"]:
+            lines.append(f"  ⚠️ **{ig['symbol']}**: ignored {ig['times_ignored']}x | current P&L: {ig['last_pnl']:+.1f}%")
+
+    if report.get("recent_trades"):
+        lines.append("\n### Recent Trades")
+        for t in report["recent_trades"][:5]:
+            icon = "✅" if t["won"] else "❌"
+            lines.append(f"  {icon} {t['symbol']} {t['pnl_pct']:+.1f}% (${t['pnl_abs']:+,.0f}) — {t['exit_reason']}")
+
+    return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Update User Profile from Learnings
+# ─────────────────────────────────────────────────────────────────────────────
+
+def update_user_profile_from_outcomes(user_id: str) -> bool:
+    """
+    Update user_profiles table with learnings from trade outcomes.
+    Called after enough trades accumulate (5+).
+    """
+    try:
+        report = get_accuracy_report(user_id, days_back=90)
+        if report.get("total_trades", 0) < 3:
+            return False
+
+        from sqlalchemy import text
+        from app.db.session import get_session
+        import json
+
+        with get_session() as s:
+            s.execute(text("""
+                INSERT INTO user_profiles (user_id, best_performing_strategy,
+                    worst_performing_strategy, avg_hold_days, updated_at)
+                VALUES (:uid, :best, :worst, :hold, now())
+                ON CONFLICT (user_id)
+                DO UPDATE SET
+                    best_performing_strategy  = EXCLUDED.best_performing_strategy,
+                    worst_performing_strategy = EXCLUDED.worst_performing_strategy,
+                    avg_hold_days             = EXCLUDED.avg_hold_days,
+                    updated_at                = now()
+            """), {
+                "uid":   user_id,
+                "best":  report.get("best_strategy"),
+                "worst": report.get("worst_strategy"),
+                "hold":  report.get("avg_hold_days"),
+            })
+
+        print(f"[Tracker] User profile updated from {report['total_trades']} trades")
+        return True
+    except Exception as e:
+        print(f"[Tracker] Profile update failed: {e}")
+        return False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Trade History
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_trade_history(user_id: str, days_back: int = 90) -> list[dict]:
+    """Full trade history — open and closed positions."""
+    try:
+        from sqlalchemy import text
+        from app.db.session import get_session
+        with get_session() as s:
+            rows = s.execute(text("""
+                SELECT symbol, source, entry_date, entry_price, qty,
+                       target_pct, stop_pct, exit_date, exit_price,
+                       exit_reason, is_active, llm_entry_note
+                FROM tracked_positions
+                WHERE user_id = :uid
+                  AND entry_date >= CURRENT_DATE - :days
+                ORDER BY entry_date DESC
+            """), {"uid": user_id, "days": days_back}).fetchall()
+
+            history = []
+            for r in rows:
+                pnl_pct = None
+                if r.entry_price and r.exit_price:
+                    pnl_pct = round(
+                        (float(r.exit_price) - float(r.entry_price)) / float(r.entry_price) * 100, 1
+                    )
+                history.append({
+                    "symbol":      r.symbol,
+                    "source":      r.source,
+                    "status":      "OPEN" if r.is_active else "CLOSED",
+                    "entry_date":  str(r.entry_date),
+                    "entry_price": float(r.entry_price) if r.entry_price else None,
+                    "qty":         r.qty,
+                    "target_pct":  float(r.target_pct) if r.target_pct else None,
+                    "stop_pct":    float(r.stop_pct) if r.stop_pct else None,
+                    "exit_date":   str(r.exit_date) if r.exit_date else None,
+                    "exit_price":  float(r.exit_price) if r.exit_price else None,
+                    "pnl_pct":     pnl_pct,
+                    "exit_reason": r.exit_reason,
+                    "note":        r.llm_entry_note,
+                })
+            return history
+    except Exception as e:
+        return [{"error": str(e)}]

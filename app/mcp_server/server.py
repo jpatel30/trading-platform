@@ -789,6 +789,39 @@ def get_trade_history(limit: int = 20) -> list[dict]:
     return _history(get_current_user_id(), limit)
 
 # ─────────────────────────────────────────────────────────────────────────────
+# LEARNING (W16)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def get_learning_report() -> dict:
+    """
+    Full learning report — what is the platform learning from your trades?
+    Shows: sell signal compliance, strategy win rates, weight adjustments,
+    prioritised action items and behavioural insights.
+    """
+    from app.learning.engine import get_learning_report as _report
+    return _report(get_current_user_id())
+
+@mcp.tool()
+def get_strategy_weights() -> dict:
+    """
+    Current strategy confidence weights based on your trade history.
+    High win rate = boosted, low win rate = penalised.
+    Applied automatically in get_strategy_recommendation().
+    """
+    from app.learning.engine import get_strategy_weights as _weights
+    return _weights(get_current_user_id())
+
+@mcp.tool()
+def get_sell_signal_compliance() -> dict:
+    """
+    How often do you act on sell signals vs ignore them?
+    Shows which symbols you repeatedly ignore and at what cost.
+    """
+    from app.learning.engine import analyze_sell_signal_compliance as _c
+    return _c(get_current_user_id())
+
+# ─────────────────────────────────────────────────────────────────────────────
 # ENTRY POINT
 # ─────────────────────────────────────────────────────────────────────────────
 

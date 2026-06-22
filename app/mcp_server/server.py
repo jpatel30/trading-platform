@@ -88,6 +88,38 @@ def get_orders() -> list[dict]:
     except BrokerNotConnectedError:
         return [{"error": "Webull not connected."}]
 
+@mcp.tool()
+def get_active_bets() -> dict:
+    """
+    All current positions with full trade context — the trader's dashboard.
+
+    For each position shows:
+    - How much invested (cost basis) vs current value
+    - P&L amount and %
+    - Target exit: price, %, potential gain $
+    - Stop loss: price, %, potential loss $
+    - Distance remaining to target and stop
+    - Status: TARGET_HIT / NEAR_TARGET / ON_TRACK / NEAR_STOP / STOP_HIT
+    - Source: from our recommendation engine or manually opened
+    - How many times we already recommended selling (ignored signals)
+
+    Sorted by urgency: stop hits first, then near-stop, then target hits.
+    """
+    from app.broker.active_bets import get_active_bets as _get, format_bets_report
+    user_id  = get_current_user_id()
+    pos      = WebullConnector(user_id).get_positions()
+    bets     = _get(pos, user_id=user_id)
+    return {
+        "report": format_bets_report(bets),
+        "bets":   bets,
+        "counts": {
+            "stop_hit":    len([b for b in bets if b["status"] == "STOP_HIT"]),
+            "near_stop":   len([b for b in bets if b["status"] == "NEAR_STOP"]),
+            "on_track":    len([b for b in bets if b["status"] == "ON_TRACK"]),
+            "near_target": len([b for b in bets if b["status"] == "NEAR_TARGET"]),
+            "target_hit":  len([b for b in bets if b["status"] == "TARGET_HIT"]),
+        }
+    }
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MARKET DATA TOOLS (W4)
@@ -645,6 +677,39 @@ def get_mute_status() -> dict:
     """Show what's currently muted — global and per-symbol."""
     from app.monitor.position_monitor import get_mute_status as _status
     return _status(get_current_user_id())
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NOTIFICATION (W14)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def configure_discord(webhook_url: str) -> dict:
+    """
+    Configure Discord notifications for trading alerts.
+    Get webhook URL from: Discord channel → ⚙️ Settings → Integrations → Webhooks
+    HIGH urgency alerts ping @here so your phone buzzes.
+    MEDIUM urgency alerts post silently.
+    LOW urgency = no notification.
+    """
+    from app.notifications.discord import save_webhook, send_test_notification
+    saved = save_webhook(get_current_user_id(), webhook_url)
+    if saved:
+        return send_test_notification(get_current_user_id())
+    return {"success": False, "error": "Failed to save webhook URL"}
+
+
+@mcp.tool()
+def test_notification() -> dict:
+    """Send a test alert to Discord to verify notifications are working."""
+    from app.notifications.discord import send_test_notification
+    return send_test_notification(get_current_user_id())
+
+
+@mcp.tool()
+def get_notification_config() -> dict:
+    """Show current notification settings — which channels configured, routing rules."""
+    from app.notifications.discord import get_config
+    return get_config(get_current_user_id())
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ENTRY POINT

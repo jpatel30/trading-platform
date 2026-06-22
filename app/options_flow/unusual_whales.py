@@ -70,6 +70,9 @@ def _get(path: str, params: dict | None = None) -> Any:
         "Accept": "application/json",
     }
     r = requests.get(f"{BASE}{path}", headers=headers, params=params, timeout=10)
+    if r.status_code == 429:
+        print(f"[UW] Rate limited (429) on {path} — returning empty result")
+        return {}
     r.raise_for_status()
     body = r.json()
     return body.get("data", body)

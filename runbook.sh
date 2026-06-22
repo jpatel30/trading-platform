@@ -1,235 +1,229 @@
-# Trading Platform — Command Runbook
-# Run these in order to validate the full platform before each session.
-# Project: ~/Documents/Claude/Projects/trading-platform
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 0. ENVIRONMENT SETUP
-# ─────────────────────────────────────────────────────────────────────────────
+#!/bin/bash
+# TRADING PLATFORM — RUNBOOK v3
+# Usage: bash runbook.sh
 
 cd ~/Documents/Claude/Projects/trading-platform
 source venv/bin/activate
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 1. INFRASTRUCTURE HEALTH
-# ─────────────────────────────────────────────────────────────────────────────
+echo "=== SECTION 1: ALL CLAUDE DESKTOP COMMANDS ==="
 
-# 1a. Docker (Postgres)
-docker ps | grep trading_postgres && echo "✅ Postgres running" || echo "❌ Postgres down — run: docker-compose up -d"
+cat << 'EOF'
+----------------------------------------------------------
+SYSTEM
+  ping
+  What is today's market status?
 
-# 1b. Ollama (local LLM)
-curl -s http://localhost:11434/api/tags | python3 -c "
-import json, sys
-d = json.load(sys.stdin)
-models = [m['name'] for m in d.get('models', [])]
-print('✅ Ollama running | Models:', models)
-" 2>/dev/null || echo "❌ Ollama not running — run: ollama serve &"
+USE CASE 1 — PORTFOLIO
+  Show me my full portfolio P&L
+  What is my account balance and buying power?
+  Show me today's orders
 
-# 1c. Ollama GPU check
-curl -s http://localhost:11434/api/ps | python3 -c "
-import json, sys
-d = json.load(sys.stdin)
-for m in d.get('models', []):
-    gb = round(m.get('size_vram', 0) / 1e9, 1)
-    gpu = '✅ Metal GPU' if m.get('size_vram', 0) > 0 else '❌ CPU only'
-    print('{} | {} | {:.1f} GB VRAM'.format(m['name'], gpu, gb))
-" 2>/dev/null || echo "No model loaded yet"
+USE CASE 2 — WATCHLIST
+  Show me my watchlist
+  Sync my watchlist with Webull now
+  Add TSLA to my watchlist
+  Remove TSLA from my watchlist
 
-# 1d. DB connection + tables
-python3 -c "
-from app.db.session import get_session
-from sqlalchemy import text
-with get_session() as s:
-    tables = s.execute(text(\"SELECT tablename FROM pg_tables WHERE schemaname='public' ORDER BY tablename\")).fetchall()
-    print('✅ DB connected | Tables:', [t[0] for t in tables])
-"
+USE CASE 3 — ACTIVE BETS (investment, profit target, stop loss)
+  Show me my active bets with targets and stop losses
+  Which positions have hit their stop loss?
+  Which positions have hit their profit target?
+  Which positions are near their stop loss?
+  How many times have you recommended selling GLD that I ignored?
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 2. WEBULL CONNECTOR (W2)
-# ─────────────────────────────────────────────────────────────────────────────
+USE CASE 4 — BEST OPTIONS SUGGESTION
+  Scan my watchlist and find the top picks today
+  Give me a full options trade recommendation for NVDA with $2000 budget
+  Give me a bearish trade on SPY with max loss $500
+  Run the daily scan and give me top 10 picks instead of 5
+  Give me a full recommendation for GOOGL with $3000 budget
 
-# 2a. Positions
-python3 -c "
-from app.broker.webull_connector import WebullConnector
-from app.utils.current_user import get_current_user_id
-wb  = WebullConnector(get_current_user_id())
-pos = wb.get_positions()
-print('✅ Positions: {} holdings'.format(len(pos)))
-for p in pos[:3]:
-    rate = float(p.get('unrealized_profit_loss_rate', 0)) * 100
-    print('  {} | qty={} | pnl={:+.1f}%'.format(p['symbol'], p['qty'], rate))
-"
+USE CASE 5 — MONITOR PORTFOLIO
+  Start monitoring my positions
+  What is the monitor status?
+  Show me my active alerts
+  Dismiss all alerts
+  Stop the position monitor
 
-# 2b. Balances
-python3 -c "
-from app.broker.webull_connector import WebullConnector
-from app.utils.current_user import get_current_user_id
-wb  = WebullConnector(get_current_user_id())
-try:
-    bal = wb.get_balances()
-    print('✅ Balances:', {k: v for k, v in list(bal.items())[:4]})
-except Exception as e:
-    print('⚠️  Balances:', e)
-"
+USE CASE 5b — MUTE / UNMUTE ALERTS
+  Stop all alerts
+  Stop alerts for GLD
+  Mute GLD alerts for 24 hours
+  Mute all alerts for 48 hours
+  Resume alerts for GLD
+  Resume all alerts
+  What is currently muted?
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 3. WEBULL WATCHLIST (W11)
-# ─────────────────────────────────────────────────────────────────────────────
+USE CASE 6 — SELL SIGNALS
+  Should I sell anything in my portfolio today?
+  Run sell signals without LLM, just rule-based instant check
+  What should I do with GLD?
+  What should I do with SNDK at +287%?
+  Show me past sell recommendations
 
-python3 -c "
-from app.broker.webull_watchlist_api import get_watchlist_tickers, load_token, is_expiring_soon
-from app.utils.current_user import get_current_user_id
-user_id    = get_current_user_id()
-token_data = load_token(user_id)
-if token_data:
-    expiring = is_expiring_soon(token_data, hours=48)
-    print('Token expiring soon:', expiring)
-tickers = get_watchlist_tickers(user_id)
-print('✅ Watchlist: {} tickers'.format(len(tickers)))
-print('  First 10:', tickers[:10])
-"
+USE CASE 7 — MONITOR OPTION RECOMMENDATIONS
+  Show me my active bets with targets and stop losses
+  Show me my active alerts
+  Which positions have hit their profit target?
+  Which positions are approaching their stop loss?
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 4. MARKET DATA (W4)
-# ─────────────────────────────────────────────────────────────────────────────
+USE CASE 8 — NEW STOCKS TO ADD
+  Scan my watchlist for stocks with strong momentum this week
+  Show me the top converging picks from my watchlist today
+  Give me market context for BE, should I add it to my portfolio?
+  What is the sector momentum for semiconductors right now?
 
-# 4a. Trading calendar
-python3 -c "
-from app.scanner.quick_scan import get_last_trading_date, _get_last_trading_session, us_market_holidays
-from datetime import datetime
-print('Today:', datetime.now().date())
-print('Last trading day:', get_last_trading_date())
-print('Market status:', _get_last_trading_session())
-print('2026 holidays:', sorted(str(h) for h in us_market_holidays(2026)))
-"
+EXTRA — MARKET INTELLIGENCE
+  Show me the full market overview and sector flow
+  What is the options flow for NVDA?
+  Show me dark pool trades for NVDA today
+  What is the GEX for SPY this week?
+  What companies report earnings this week?
+  Show me recent market news
+  Have any congress members traded NVDA recently?
+  Which sectors are getting the most institutional money today?
 
-# 4b. Polygon grouped daily (one call, all US stocks)
-python3 -c "
-import requests, time
-from app.utils.config import settings
-from app.scanner.quick_scan import get_last_trading_date
-date = get_last_trading_date()
-t0   = time.time()
-r    = requests.get(
-    'https://api.polygon.io/v2/aggs/grouped/locale/us/market/stocks/' + date,
-    params={'apiKey': settings.polygon_api_key}, timeout=15)
-elapsed = round(time.time()-t0, 2)
-if r.status_code == 200:
-    data = r.json().get('results', [])
-    test = {d['T']: d['c'] for d in data if d.get('T') in ('NVDA','AAPL','AMD','SPY')}
-    print('✅ Polygon grouped {} | {} tickers | {}s'.format(date, len(data), elapsed))
-    for sym, price in test.items():
-        print('  {} \${}'.format(sym, price))
-else:
-    print('❌ Polygon:', r.status_code, r.text[:100])
-"
+EXTRA — RESEARCH BEFORE TRADING
+  Give me full market context for NVDA before I trade
+  Show me NVDA earnings history and how it reacted each time
+  Run full technical analysis on GOOGL
+  What is the latest news on NVDA?
+  Show me the complete options flow signal for IREN
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 5. SCANNER (W10)
-# ─────────────────────────────────────────────────────────────────────────────
+DAILY WORKFLOW (run in order every market day)
+  1. What is today's market status?
+  2. Show me my active alerts
+  3. Show me my active bets with targets and stop losses
+  4. Should I sell anything in my portfolio today?
+  5. Scan my watchlist and find the top picks today
+  6. Give me a full recommendation for [top pick] with $2000 budget
+  7. Start monitoring my positions
+----------------------------------------------------------
+EOF
 
-# 5a. Scan universe (watchlist + positions)
-python3 -c "
-from app.scanner.universe import get_scan_universe
-tickers = get_scan_universe()
-print('✅ Scan universe: {} tickers'.format(len(tickers)))
-print('  First 15:', tickers[:15])
-"
+echo ""
+echo "=== SECTION 2: USE CASE 1 — PORTFOLIO ==="
 
-# 5b. Quick scan Tier 1 (prices only, no UW flow on weekends)
-python3 -c "
-import time
-from app.scanner.quick_scan import quick_scan, get_last_trading_date
-from app.scanner.universe import get_scan_universe
-tickers = get_scan_universe()
-print('Scanning {} tickers for {}...'.format(len(tickers), get_last_trading_date()))
-t0    = time.time()
-picks = quick_scan(tickers, top_n=5)
-elapsed = round(time.time()-t0, 1)
-print('✅ Scan complete in {}s | {} converging picks'.format(elapsed, len(picks)))
-for p in picks:
-    print('  {:6} {:+.2f}% | {} | {}'.format(
-        p['ticker'], p['change_pct'], p['direction'], ', '.join(p['signals'])))
-"
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 6. OPTIONS FLOW (W7)
-# ─────────────────────────────────────────────────────────────────────────────
-
-python3 -c "
-from app.options_flow.unusual_whales import get_flow_alerts, get_market_tide, get_dark_pool_ticker
-# Flow alerts
-alerts = get_flow_alerts(ticker='NVDA', limit=3)
-print('✅ UW Flow alerts (NVDA):', len(alerts))
-for a in alerts[:2]:
-    print('  {} {} \${} vol={}'.format(
-        a.get('ticker'), a.get('sentiment'), a.get('strike'), a.get('volume')))
-# Market tide
-tide = get_market_tide()
-print('✅ Market tide:', tide.get('call_premium'), 'calls vs', tide.get('put_premium'), 'puts')
-# Dark pool
-dp = get_dark_pool_ticker('NVDA', limit=2)
-print('✅ Dark pool (NVDA):', len(dp), 'prints')
-"
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 7. TECHNICAL ANALYSIS (W8)
-# ─────────────────────────────────────────────────────────────────────────────
-
-python3 -c "
-from datetime import datetime, timedelta
-from app.market_data.polygon_client import get_bars
-from app.technical_analysis.engine import get_technical_profile
-ticker    = 'NVDA'
-from_date = (datetime.now() - timedelta(days=200)).strftime('%Y-%m-%d')
-to_date   = datetime.now().strftime('%Y-%m-%d')
-bars = get_bars(ticker, 1, 'day', from_date, to_date)
-ta   = get_technical_profile(ticker, bars)
-print('✅ TA for', ticker)
-print('  Signal:', ta.get('signal'))
-print('  RSI:', ta.get('rsi_14'))
-print('  Trend:', ta.get('trend'))
-print('  Summary:', ta.get('summary', '')[:80])
-"
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 8. LLM SERVICE (W6)
-# ─────────────────────────────────────────────────────────────────────────────
-
-python3 -c "
-import time
-from app.llm.service import _call_ollama
-t0 = time.time()
-r  = _call_ollama(
-    prompt='NVDA is up 2% today with heavy call flow. Bull or bear? One word.',
-    system='Expert trader. One word only.',
-    max_tokens=5
-)
-elapsed = round(time.time()-t0, 1)
-print('✅ LLM response: \"{}\" | {}s'.format(r.strip(), elapsed))
-"
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 9. PORTFOLIO P&L + SELL SIGNALS (W5)
-# ─────────────────────────────────────────────────────────────────────────────
-
-# 9a. Portfolio P&L (instant — no LLM)
-python3 -c "
+python3 << 'PYEOF'
 from app.broker.webull_connector import WebullConnector
 from app.utils.current_user import get_current_user_id
 from app.broker.sell_signals import get_portfolio_pnl_summary
 user_id = get_current_user_id()
-pos = WebullConnector(user_id).get_positions()
-pnl = get_portfolio_pnl_summary(pos, None)
-print('✅ Portfolio P&L')
-print('  Value: \${:,.2f} | PnL: \${:,.2f} ({:+.2f}%)'.format(
-    pnl['total_value'], pnl['total_pnl'], pnl['total_pnl_pct']))
-print('  Win rate: {}% ({} winners / {} losers)'.format(
-    pnl['win_rate'], pnl['winners'], pnl['losers']))
-print('  Best: {} | Worst: {}'.format(pnl['best_performer'], pnl['worst_performer']))
-"
+pos     = WebullConnector(user_id).get_positions()
+pnl     = get_portfolio_pnl_summary(pos, None)
+print(f'  Value:    ${pnl["total_value"]:,.2f}')
+print(f'  P&L:      ${pnl["total_pnl"]:,.2f} ({pnl["total_pnl_pct"]:+.2f}%)')
+print(f'  Win rate: {pnl["win_rate"]}% ({pnl["winners"]}W/{pnl["losers"]}L)')
+print(f'  Best: {pnl["best_performer"]} | Worst: {pnl["worst_performer"]}')
+print('✅ Portfolio P&L OK')
+PYEOF
 
-# 9b. Sell signals — rule-based only (no LLM, instant)
-python3 -c "
+sleep 5
+echo ""
+echo "=== SECTION 3: USE CASE 2 — WATCHLIST ==="
+
+python3 << 'PYEOF'
+from app.broker.watchlist_sync import get_db_watchlist
+from app.utils.current_user import get_current_user_id
+tickers = get_db_watchlist(get_current_user_id())
+print(f'  Count: {len(tickers)} tickers')
+print(f'  Sample: {tickers[:8]}')
+print('✅ Watchlist OK')
+PYEOF
+
+sleep 5
+echo ""
+echo "=== SECTION 4: USE CASE 3 — ACTIVE BETS ==="
+
+python3 << 'PYEOF'
+from app.broker.webull_connector import WebullConnector
+from app.utils.current_user import get_current_user_id
+from app.broker.active_bets import get_active_bets
+user_id = get_current_user_id()
+pos     = WebullConnector(user_id).get_positions()
+bets    = get_active_bets(pos, user_id=user_id)
+stop_hit   = [b for b in bets if b['status'] == 'STOP_HIT']
+target_hit = [b for b in bets if b['status'] == 'TARGET_HIT']
+near_stop  = [b for b in bets if b['status'] == 'NEAR_STOP']
+near_tgt   = [b for b in bets if b['status'] == 'NEAR_TARGET']
+on_track   = [b for b in bets if b['status'] == 'ON_TRACK']
+print(f'  Stop hit: {len(stop_hit)} | Near stop: {len(near_stop)} | On track: {len(on_track)} | Near target: {len(near_tgt)} | Target hit: {len(target_hit)}')
+if stop_hit:
+    print('  STOP HIT:')
+    for b in stop_hit:
+        print(f'    {b["symbol"]} {b["pnl_pct"]:.1f}% | invested ${b["investment"]:,.0f}')
+if target_hit:
+    print('  TARGET HIT:')
+    for b in target_hit:
+        print(f'    {b["symbol"]} +{b["pnl_pct"]:.1f}% | gain ${b["pnl_amount"]:,.0f}')
+print('✅ Active Bets OK')
+PYEOF
+
+sleep 5
+echo ""
+echo "=== SECTION 5: USE CASE 4 — SCANNER ==="
+
+python3 << 'PYEOF'
+import time
+from app.scanner.quick_scan import quick_scan, get_last_trading_date
+from app.scanner.universe import get_scan_universe
+tickers = get_scan_universe()
+t0      = time.time()
+picks   = quick_scan(tickers, top_n=5)
+print(f'  Scanned {len(tickers)} tickers in {round(time.time()-t0,1)}s — top {len(picks)} picks:')
+for p in picks:
+    print(f'    {p["ticker"]:6} {p["direction"]:8} {p["change_pct"]:+.2f}%')
+print('✅ Scanner OK')
+PYEOF
+
+sleep 60
+echo ""
+echo "=== SECTION 5b: STRATEGY ENGINE ==="
+
+python3 << 'PYEOF'
+import time
+from app.options_flow.unusual_whales import get_signal_package
+from app.options_flow.signals import score_signal_package
+from app.strategy.engine import build_recommendation
+from app.market_data.polygon_client import get_bars
+from app.technical_analysis.engine import get_technical_profile
+from datetime import datetime, timedelta
+ticker    = 'NVDA'
+from_date = (datetime.now()-timedelta(days=300)).strftime('%Y-%m-%d')
+bars      = get_bars(ticker, 1, 'day', from_date, datetime.now().strftime('%Y-%m-%d'))
+ta        = get_technical_profile(ticker, bars)
+signal    = score_signal_package(get_signal_package(ticker))
+t0        = time.time()
+rec       = build_recommendation(ticker, ta, signal, budget=2000)
+best      = rec.get('best', {})
+print(f'  Strategy: {best.get("strategy")} | Expiry: {best.get("expiry")} | R/R: {best.get("risk_reward")} | {round(time.time()-t0,1)}s')
+print('✅ Strategy Engine OK')
+PYEOF
+
+sleep 10
+echo ""
+echo "=== SECTION 6: USE CASE 5 — POSITION MONITOR ==="
+
+python3 << 'PYEOF'
+from app.monitor.position_monitor import get_monitor, get_active_alerts
+from app.utils.current_user import get_current_user_id
+user_id = get_current_user_id()
+monitor = get_monitor(user_id)
+fired   = monitor._check_positions(check_manual=True)
+alerts  = get_active_alerts(user_id, limit=10)
+high    = [a for a in alerts if a['urgency'] == 'HIGH']
+medium  = [a for a in alerts if a['urgency'] == 'MEDIUM']
+print(f'  Alerts fired: {fired} | Active — HIGH: {len(high)} | MEDIUM: {len(medium)}')
+for a in alerts[:3]:
+    print(f'  [{a["urgency"]}] {a["symbol"]} — {a["message"][:65]}')
+print('✅ Monitor OK')
+PYEOF
+
+sleep 15
+echo ""
+echo "=== SECTION 7: USE CASE 6 — SELL SIGNALS ==="
+
+python3 << 'PYEOF'
 from app.broker.webull_connector import WebullConnector
 from app.utils.current_user import get_current_user_id
 from app.broker.sell_signals import evaluate_sell_signals
@@ -238,162 +232,135 @@ pos     = WebullConnector(user_id).get_positions()
 signals = evaluate_sell_signals(pos)
 sell    = [s for s in signals if s['action'] == 'SELL']
 watch   = [s for s in signals if s['action'] == 'WATCH']
-print('✅ Sell signals (rule-based)')
-print('  SELL: {} | WATCH: {} | HOLD: {}'.format(
-    len(sell), len(watch), len(signals)-len(sell)-len(watch)))
-for s in sell[:3]:
-    print('  {} {:+.1f}% — {}'.format(s['symbol'], s['pnl_pct'], s['signals'][0]))
-"
+hold    = [s for s in signals if s['action'] == 'HOLD']
+print(f'  SELL: {len(sell)} | WATCH: {len(watch)} | HOLD: {len(hold)}')
+for s in (sell + watch)[:4]:
+    rule = s['signals'][0] if s['signals'] else ''
+    print(f'  [{s["urgency"]}] {s["symbol"]} {s["pnl_pct"]:+.1f}% — {rule}')
+print('✅ Sell Signals OK')
+PYEOF
 
-# 9c. Full sell signals with LLM (takes ~30-80s)
-python3 -c "
+echo ""
+echo "--- sell_recommendations table ---"
+docker exec trading_postgres psql -U trading -d trading_platform -c \
+"SELECT symbol, pnl_pct, llm_action, LEFT(llm_summary,50) AS summary, recommended_at::date AS date FROM sell_recommendations ORDER BY recommended_at DESC LIMIT 5;"
+
+echo ""
+echo "=== SECTION 8: USE CASE 7 — ALERTS + TRACKED ==="
+
+docker exec trading_postgres psql -U trading -d trading_platform -c \
+"SELECT symbol, alert_type, urgency, LEFT(message,60) AS message, triggered_at::date AS date FROM position_alerts WHERE dismissed=FALSE ORDER BY CASE urgency WHEN 'HIGH' THEN 0 WHEN 'MEDIUM' THEN 1 ELSE 2 END, triggered_at DESC LIMIT 8;"
+
+docker exec trading_postgres psql -U trading -d trading_platform -c \
+"SELECT symbol, source, target_pct, stop_pct, check_interval_min FROM tracked_positions WHERE is_active=TRUE LIMIT 10;"
+
+echo ""
+echo "=== SECTION 9: USE CASE 8 — NEW STOCK RESEARCH ==="
+
+python3 << 'PYEOF'
 import time
-from app.broker.webull_connector import WebullConnector
-from app.utils.current_user import get_current_user_id
-from app.broker.sell_signals import evaluate_sell_signals_with_llm, format_sell_report, get_portfolio_pnl_summary
-user_id = get_current_user_id()
-pos     = WebullConnector(user_id).get_positions()
-pnl     = get_portfolio_pnl_summary(pos, None)
-t0      = time.time()
-signals = evaluate_sell_signals_with_llm(pos, user_id=user_id)
-print(format_sell_report(signals, pnl))
-print('Time: {}s'.format(round(time.time()-t0, 1)))
-"
+from app.rag.context_builder import build_ticker_context
+ticker = 'BE'
+t0     = time.time()
+ctx    = build_ticker_context(ticker)
+print(f'  {ticker} context in {round(time.time()-t0,1)}s')
+print(f'  Trend: {ctx["price"].get("trend")} | 30d: {ctx["price"].get("ret_30d")}% | 90d: {ctx["price"].get("ret_90d")}%')
+print(f'  Sector: {ctx["sector"].get("sector_etf")} — {ctx["sector"].get("sector_vs_market")}')
+earn = ctx['earnings']
+if earn.get('upcoming'):
+    print(f'  Earnings: {earn["upcoming"]["date"]} ({earn["upcoming"]["days_away"]} days)')
+print('✅ RAG Context OK')
+PYEOF
 
-# 9d. Check sell_recommendations table
-docker exec trading_postgres psql -U trading -d trading_platform -c "
-SELECT symbol, pnl_pct, llm_action, llm_exit_pct,
-       LEFT(llm_summary, 50) AS summary,
-       recommended_at::date AS date
-FROM sell_recommendations
-ORDER BY recommended_at DESC
-LIMIT 10;"
+echo ""
+echo "=== SECTION 10: EXTRA — MARKET INTELLIGENCE ==="
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 10. MCP SERVER (W3)
-# ─────────────────────────────────────────────────────────────────────────────
+python3 << 'PYEOF'
+from app.options_flow.unusual_whales import get_market_tide
+tide = get_market_tide()
+if isinstance(tide, list): tide = tide[0] if tide else {}
+call = tide.get('call_premium') or tide.get('total_call_premium', 'N/A')
+put  = tide.get('put_premium')  or tide.get('total_put_premium', 'N/A')
+print(f'  Market tide — Calls: {call} | Puts: {put}')
+print('✅ Market Tide OK')
+PYEOF
 
-# 10a. List all MCP tools
-python3 -c "
-import subprocess, json
-result = subprocess.run(
-    ['python3', '-c', '''
-from app.mcp_server.server import mcp
-import asyncio
-async def main():
-    tools = await mcp.list_tools()
-    print(\"Tools ({}): {}\".format(len(tools), [t.name for t in tools]))
-asyncio.run(main())
-'''],
-    capture_output=True, text=True, cwd='.'
-)
-print(result.stdout or result.stderr)
-"
+sleep 5
 
-# 10b. MCP server import check
-python3 -c "
-from app.mcp_server.server import mcp
-print('✅ MCP server imports OK')
-"
+python3 << 'PYEOF'
+import time
+from app.llm.service import _call_ollama
+t0 = time.time()
+r  = _call_ollama('NVDA up 2% with heavy call sweeps. Bull or bear? One word.', 'Expert trader. One word.', max_tokens=5)
+print(f'  LLM: "{r.strip()}" in {round(time.time()-t0,1)}s')
+print('✅ LLM OK')
+PYEOF
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 11. STRATEGY ENGINE (W9)
-# ─────────────────────────────────────────────────────────────────────────────
+echo ""
+echo "=== SECTION 11: DB STATUS ==="
 
-python3 -c "
-from app.options_flow.signals import score_signal_package
-from app.options_flow.unusual_whales import get_flow_alerts, get_dark_pool_ticker, get_market_tide
-ticker = 'NVDA'
-pkg = {
-    'ticker':      ticker,
-    'flow_alerts': get_flow_alerts(ticker=ticker, limit=10),
-    'dark_pool':   get_dark_pool_ticker(ticker, limit=5),
-    'market_tide': get_market_tide(),
-}
-signal = score_signal_package(pkg)
-print('✅ Signal package for', ticker)
-print('  Direction:', signal.get('direction'))
-print('  Confidence:', signal.get('confidence'))
-print('  Flow score:', signal.get('flow_score'))
-"
+docker exec trading_postgres psql -U trading -d trading_platform -c \
+"SELECT 'position_alerts (active)' AS t, COUNT(*) FROM position_alerts WHERE dismissed=FALSE
+ UNION ALL SELECT 'sell_recommendations',        COUNT(*) FROM sell_recommendations
+ UNION ALL SELECT 'tracked_positions (active)',  COUNT(*) FROM tracked_positions WHERE is_active=TRUE
+ UNION ALL SELECT 'muted_symbols',               COUNT(*) FROM muted_symbols
+ UNION ALL SELECT 'portfolio_cache',             COUNT(*) FROM portfolio_cache
+ UNION ALL SELECT 'user_watchlist',              COUNT(*) FROM user_watchlist
+ ORDER BY t;"
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 12. QUICK VALIDATION — ALL SYSTEMS (run first every session)
-# ─────────────────────────────────────────────────────────────────────────────
+echo ""
+echo "=== SECTION 12: BLUEPRINT STATUS ==="
 
-python3 -c "
-print('=== TRADING PLATFORM HEALTH CHECK ===')
-errors = []
+cat << 'EOF'
+PHASE 1 (W1-W6)  COMPLETE: DB, Webull, MCP, Market Data, Sell Signals, LLM
+PHASE 2 (W7-W13) COMPLETE: Options Flow, TA, Strategy, Scanner, Watchlist, RAG, Monitor
+EXTRAS COMPLETE: Active Bets, Watchlist Sync, sell_recommendations, tracked_positions, muted_symbols, portfolio_cache
 
-# DB
-try:
-    from app.db.session import get_session
-    from sqlalchemy import text
-    with get_session() as s:
-        s.execute(text('SELECT 1'))
-    print('✅ Postgres')
-except Exception as e:
-    print('❌ Postgres:', e); errors.append('postgres')
+REMAINING:
+  W14  Notifications (SMS/Slack)       <- NEXT
+  W15  Prediction Tracker
+  W16  Learning Engine
+  W17  Backtesting
+  W18-20 Self-learning loop
+  W21  Trade Execution
+  W22-24 Dashboard
 
-# Ollama
-try:
-    import requests
-    r = requests.get('http://localhost:11434/api/tags', timeout=3)
-    models = [m['name'] for m in r.json().get('models', [])]
-    print('✅ Ollama:', models)
-except Exception as e:
-    print('❌ Ollama:', e); errors.append('ollama')
+DEFERRED (needs Polygon Starter $29/mo):
+  TA cache in DB — search for: REMOVE THIS LINE when on Polygon Starter plan
+EOF
 
-# Webull
-try:
-    from app.broker.webull_connector import WebullConnector
-    from app.utils.current_user import get_current_user_id
-    pos = WebullConnector(get_current_user_id()).get_positions()
-    print('✅ Webull:', len(pos), 'positions')
-except Exception as e:
-    print('❌ Webull:', e); errors.append('webull')
+echo ""
+echo "=== SECTION 13: MAINTENANCE ==="
 
-# Watchlist
-try:
-    from app.broker.webull_watchlist_api import get_watchlist_tickers
-    from app.utils.current_user import get_current_user_id
-    tickers = get_watchlist_tickers(get_current_user_id())
-    print('✅ Watchlist:', len(tickers), 'tickers')
-except Exception as e:
-    print('❌ Watchlist:', e); errors.append('watchlist')
+cat << 'EOF'
+Restart Ollama (if CPU-only):
+  pkill -f "ollama serve" && ollama serve &
 
-# Polygon
-try:
-    import requests
-    from app.utils.config import settings
-    from app.scanner.quick_scan import get_last_trading_date
-    r = requests.get(
-        'https://api.polygon.io/v2/aggs/ticker/NVDA/prev',
-        params={'apiKey': settings.polygon_api_key}, timeout=5)
-    price = r.json().get('results', [{}])[0].get('c', 0)
-    print('✅ Polygon: NVDA prev close \${}'.format(price))
-except Exception as e:
-    print('❌ Polygon:', e); errors.append('polygon')
+Force watchlist sync:
+  python3 -c "from app.broker.watchlist_sync import force_sync; from app.utils.current_user import get_current_user_id; print(force_sync(get_current_user_id()))"
 
-# UW
-try:
-    from app.options_flow.unusual_whales import get_flow_alerts
-    alerts = get_flow_alerts(ticker='NVDA', limit=1)
-    print('✅ UW Options Flow:', 'OK' if isinstance(alerts, list) else 'empty')
-except Exception as e:
-    print('❌ UW:', e); errors.append('uw')
+Clear all alerts (testing):
+  docker exec trading_postgres psql -U trading -d trading_platform -c "UPDATE position_alerts SET dismissed=TRUE WHERE dismissed=FALSE;"
 
-# MCP
-try:
-    from app.mcp_server.server import mcp
-    print('✅ MCP Server: imports OK')
-except Exception as e:
-    print('❌ MCP:', e); errors.append('mcp')
+Clear RAG cache:
+  python3 -c "from app.rag.context_builder import clear_cache; clear_cache(); print('done')"
 
-print()
-if errors:
-    print('❌ Issues found:', errors)
-else:
-    print('✅ ALL SYSTEMS OPERATIONAL')
-print('=====================================')
-"
+Git log:
+  git log --oneline -10
+EOF
+
+echo ""
+echo "=== SECTION 14: KNOWN ISSUES ==="
+
+cat << 'EOF'
+1. Ollama idle — model not in /api/ps: fine, loads on first call
+2. Webull 429: do not call get_positions() twice rapidly — reuse result
+3. Market tide AttributeError: check isinstance(tide, list) before .get()
+4. Polygon 429: free tier 5 req/min — runbook adds sleeps between sections
+   Real fix: Polygon Starter $29/mo = 100 req/min
+5. UW flow = 0 on weekends: expected, no live flow outside market hours
+6. Reuters RSS blocked: using CNBC + MarketWatch + Fed RSS instead
+EOF
+
+echo ""
+echo "=== RUNBOOK COMPLETE ==="

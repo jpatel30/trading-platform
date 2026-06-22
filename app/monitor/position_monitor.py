@@ -341,6 +341,13 @@ def fire_alert(user_id: str, symbol: str, alert_type: str, urgency: str,
                 VALUES (:uid, :sym, :at, :urg, :msg, :pct, :abs)
             """), {"uid": user_id, "sym": symbol, "at": alert_type,
                    "urg": urgency, "msg": message, "pct": pnl_pct, "abs": pnl_abs})
+            
+        # Send Discord notification
+        try:
+            from app.notifications.discord import notify
+            notify(user_id, symbol, alert_type, urgency, message, pnl_pct, pnl_abs)
+        except Exception as ne:
+            print(f"[Monitor] Notification failed: {ne}")
         return True
     except Exception as e:
         print(f"[Monitor] Alert insert failed: {e}")

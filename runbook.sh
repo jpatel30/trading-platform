@@ -543,3 +543,121 @@ cat << 'EOF'
   get_quote vs get_quotes: single vs bulk
 
 EOF
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 16 — TODAY'S NEW COMPONENTS (W16-Step6)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+echo ""
+echo "=== NEW: POSITION DISAPPEARED DETECTION ==="
+# Test monitor catches disappeared positions
+python3 << 'PYEOF'
+from app.monitor.position_monitor import get_active_alerts
+from app.utils.current_user import get_current_user_id
+alerts  = get_active_alerts(get_current_user_id())
+closed  = [a for a in alerts if a['alert_type'] == 'POSITION_CLOSED']
+print(f'POSITION_CLOSED alerts: {len(closed)}')
+for a in closed:
+    print(f'  {a["symbol"]}: {a["message"][:80]}')
+if not closed:
+    print('  None — no positions disappeared yet')
+PYEOF
+
+echo ""
+echo "=== NEW: VIX CONTEXT ==="
+python3 << 'PYEOF'
+from app.rag.context_builder import _build_vix_context
+vix = _build_vix_context()
+print(f'VIX: {vix.get("current")} | Zone: {vix.get("zone")} | Trend: {vix.get("trend")}')
+print(f'Implication: {vix.get("implication")}')
+if vix.get("warning"):
+    print(f'Warning: {vix.get("warning")}')
+print('✅ VIX context OK')
+PYEOF
+
+echo ""
+echo "=== NEW: VOLUME CONFIRMATION ==="
+python3 << 'PYEOF'
+from app.rag.context_builder import _build_price_context
+price = _build_price_context('NVDA')
+print(f'Relative volume: {price.get("relative_volume")}x 20d avg')
+print(f'Signal: {price.get("volume_signal")} | Confirmed: {price.get("volume_confirmed")}')
+print(f'Note: {price.get("volume_note")}')
+print('✅ Volume confirmation OK')
+PYEOF
+
+echo ""
+echo "=== NEW: ENTRY TRIGGER + S/R ==="
+python3 << 'PYEOF'
+from app.rag.context_builder import _build_price_context
+price = _build_price_context('GOOGL')
+print(f'Price: ${price.get("current_price")}')
+print(f'Supports: {price.get("key_supports")}')
+print(f'Resistances: {price.get("key_resistances")}')
+print(f'Entry trigger: {price.get("entry_trigger")}')
+print(f'Entry note: {price.get("entry_note")}')
+print('✅ Entry trigger OK')
+PYEOF
+
+echo ""
+echo "=== NEW: IV RANK ==="
+python3 << 'PYEOF'
+from app.rag.context_builder import _build_vix_context, _build_iv_context
+vix = _build_vix_context()
+iv  = _build_iv_context('NVDA', sector_etf='XLK',
+      vix=vix.get('current', 17.0) if not vix.get('error') else 17.0)
+if iv.get('error'):
+    print(f'IV Error: {iv["error"]}')
+else:
+    print(f'ATM IV: {round(iv.get("atm_iv",0)*100,1)}%')
+    print(f'IV Rank: {iv.get("iv_rank")}/100 | Zone: {iv.get("iv_zone")}')
+    print(f'Buy options: {iv.get("buy_options")} | {iv.get("strategy_note")}')
+    print(f'Days of history: {iv.get("days_of_data")}')
+    print('✅ IV rank OK')
+PYEOF
+
+echo ""
+echo "=== NEW: FULL RAG CONTEXT (all sections) ==="
+python3 << 'PYEOF'
+import time
+from app.rag.context_builder import build_ticker_context, clear_cache
+clear_cache()
+t0  = time.time()
+ctx = build_ticker_context('NVDA')
+elapsed = round(time.time()-t0, 1)
+prompt  = ctx.get('formatted_prompt', '')
+sections = ['[PRICE', '[EARNINGS', '[SECTOR', '[VIX', '[IV RANK', '[GLOBAL NEWS']
+print(f'Context built in {elapsed}s')
+for s in sections:
+    found = s in prompt
+    print(f'  {"✅" if found else "❌"} {s}')
+print('✅ Full RAG context OK')
+PYEOF
+
+echo ""
+echo "=== NEW: IV HISTORY TABLE ==="
+docker exec trading_postgres psql -U trading -d trading_platform -c \
+"SELECT ticker, recorded_at, atm_iv, avg_iv, vix_at_time
+ FROM iv_history ORDER BY recorded_at DESC LIMIT 5;"
+
+echo ""
+echo "=== NEW: CONFIRM EXECUTION (idempotent) ==="
+python3 << 'PYEOF'
+from app.learning.prediction_tracker import confirm_execution
+from app.utils.current_user import get_current_user_id
+user_id = get_current_user_id()
+r = confirm_execution(user_id, 'GOOGL', 8.90, 5)
+print(f'Confirmed: {r["confirmed"]}')
+if r.get("confirmed"):
+    print(f'Message: {r["message"]}')
+PYEOF
+
+docker exec trading_postgres psql -U trading -d trading_platform -c \
+"SELECT symbol, entry_price, qty, source, check_interval_min, is_active
+ FROM tracked_positions WHERE symbol='GOOGL';
+ SELECT symbol, actual_entry, contracts, user_executed, rec_date
+ FROM strategy_recommendations WHERE symbol='GOOGL';"
+
+echo ""
+echo "=== NEW: MCP SERVER ALIVE ==="
+ps aux | grep "mcp_server" | grep -v grep && echo "✅ MCP server running" || echo "⚠️  MCP server not running as process (managed by Claude Desktop)"

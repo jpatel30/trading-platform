@@ -754,11 +754,16 @@ def log_outcome(
     exit_reason: str = "MANUAL",
 ) -> dict:
     """
-    Record what happened when you closed a position.
-    Calculates actual P&L, updates win rate, feeds learning engine.
+    Call this when user says ANY of:
+    - "I sold X", "I closed X", "I exited X"
+    - "X expired", "I let X expire"
+    - "I sold X at $Y"
+    - After seeing a POSITION_CLOSED alert asking what happened
+
+    Calculates actual P&L vs entry, updates win rate, feeds learning engine.
     Args:
-        symbol:      ticker e.g. 'NVDA'
-        exit_price:  price per contract you received e.g. 4.20
+        symbol:      ticker e.g. 'NOW'
+        exit_price:  price received per share/contract e.g. 93.29
         exit_reason: TAKE_PROFIT / STOP_LOSS / MANUAL / EXPIRED
     """
     from app.learning.prediction_tracker import log_outcome as _log

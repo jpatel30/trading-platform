@@ -555,11 +555,16 @@ class PositionMonitor:
         tracked = get_tracked_symbols(self.user_id)
 
         # Detect NEW positions not seen before
-        current_symbols = {p["symbol"] for p in positions}
-        new_symbols     = current_symbols - self._known_symbols
+        current_symbols    = {p["symbol"] for p in positions}
+        new_symbols        = current_symbols - self._known_symbols
+        disappeared_symbols = self._known_symbols - current_symbols
+
         if self._known_symbols:   # skip on very first run
             for sym in new_symbols:
                 self._handle_new_position(sym, positions, tracked)
+            for sym in disappeared_symbols:
+                self._handle_disappeared_position(sym)
+
         self._known_symbols = current_symbols
 
         # Evaluate signals
@@ -652,6 +657,50 @@ class PositionMonitor:
                    msg, pnl, cooldown_min=9999)  # only fire once
 
     # ── Config helpers ────────────────────────────────────────────────────────
+
+    def _handle_disappeared_position(self, symbol: str) -> None:
+        """
+        Called when a position disappears from Webull.
+        Asks user what happened instead of guessing.
+        Fires POSITION_CLOSED alert with clear action instructions.
+        """
+        print(f"[Monitor] 📭 Position disappeared: {symbol}")
+
+        msg = (
+            f"{symbol} is no longer in your Webull positions. "
+            f"Did you close it? Please tell me: "
+            f"'I sold {symbol} at $X' so I can log the outcome, "
+            f"or 'it expired' if it was an option."
+        )
+
+        fired = fire_alert(
+            user_id    = self.user_id,
+            symbol     = symbol,
+            alert_type = "POSITION_CLOSED",
+            urgency    = "HIGH",
+            message    = msg,
+            cooldown_min = 9999,  # only fire once per position
+        )
+
+        if fired:
+            print(f"[Monitor] 🔔 POSITION_CLOSED alert fired for {symbol}")
+
+        # Also close tracked_position so monitor stops watching it
+        try:
+            from sqlalchemy import text
+            from app.db.session import get_session
+            with get_session() as s:
+                s.execute(text("""
+                    UPDATE tracked_positions
+                    SET is_active  = FALSE,
+                        exit_date  = CURRENT_DATE,
+                        exit_reason = 'DETECTED_CLOSED'
+                    WHERE user_id = :uid
+                      AND symbol  = :sym
+                      AND is_active = TRUE
+                """), {"uid": self.user_id, "sym": symbol})
+        except Exception as e:
+            print(f"[Monitor] Could not update tracked_position: {e}")
 
     def _save_config(self, **kwargs) -> None:
         try:

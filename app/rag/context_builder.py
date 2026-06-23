@@ -479,6 +479,94 @@ def _build_sector_context(ticker: str) -> dict:
 # Main Entry Point
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _build_vix_context() -> dict:
+    """
+    VIX trend and zone from yfinance.
+    Primary: yfinance ^VIX (actual spot VIX)
+    Polygon needs paid plan for I:VIX index.
+
+    Zones:
+        < 15   = LOW      → buy options freely, debit spreads ideal
+        15-20  = NORMAL   → standard strategy selection
+        20-25  = ELEVATED → prefer spreads over naked options
+        25-30  = HIGH     → sell premium only, avoid buying
+        > 30   = EXTREME  → avoid new positions entirely
+    """
+    try:
+        import yfinance as yf
+
+        hist = yf.Ticker('^VIX').history(period='30d')
+        if hist.empty:
+            return {"error": "VIX data unavailable"}
+
+        closes  = hist['Close'].tolist()
+        current = round(closes[-1], 2)
+        prev_5d = round(closes[-5], 2)  if len(closes) >= 5  else None
+        prev_30d = round(closes[0], 2)  if len(closes) >= 30 else None
+
+        # Trend over last 5 days
+        if prev_5d:
+            change_5d = round(current - prev_5d, 2)
+            if change_5d > 2:
+                trend = "RISING_FAST"
+            elif change_5d > 0.5:
+                trend = "RISING"
+            elif change_5d < -2:
+                trend = "FALLING_FAST"
+            elif change_5d < -0.5:
+                trend = "FALLING"
+            else:
+                trend = "STABLE"
+        else:
+            trend    = "UNKNOWN"
+            change_5d = None
+
+        # Zone classification
+        if current < 15:
+            zone        = "LOW"
+            implication = "Options cheap — debit spreads and naked options are cost-effective"
+            strategy    = "BUY_OPTIONS"
+        elif current < 20:
+            zone        = "NORMAL"
+            implication = "Normal volatility — standard strategy selection applies"
+            strategy    = "STANDARD"
+        elif current < 25:
+            zone        = "ELEVATED"
+            implication = "IV elevated — prefer spreads over naked options to reduce cost"
+            strategy    = "PREFER_SPREADS"
+        elif current < 30:
+            zone        = "HIGH"
+            implication = "High fear — sell premium (credit spreads), avoid buying options"
+            strategy    = "SELL_PREMIUM"
+        else:
+            zone        = "EXTREME"
+            implication = "Extreme fear — avoid new positions, capital preservation mode"
+            strategy    = "NO_NEW_POSITIONS"
+
+        # Warning if rising fast
+        warning = None
+        if trend in ("RISING_FAST",) and current > 20:
+            warning = "VIX rising fast above 20 — reduce position size or wait for stabilization"
+        elif trend in ("RISING",) and current > 25:
+            warning = "VIX rising above 25 — avoid buying options, credit spreads only"
+
+        return {
+            "current":      current,
+            "prev_5d":      prev_5d,
+            "prev_30d":     prev_30d,
+            "change_5d":    change_5d,
+            "trend":        trend,
+            "zone":         zone,
+            "implication":  implication,
+            "strategy":     strategy,
+            "warning":      warning,
+            "bars_available": len(closes),
+        }
+
+    except Exception as e:
+        return {"error": str(e)}
+
+
 def build_ticker_context(ticker: str, include_global_news: bool = True) -> dict:
     """
     Build full RAG context for any ticker.
@@ -510,6 +598,7 @@ def build_ticker_context(ticker: str, include_global_news: bool = True) -> dict:
     price    = _build_price_context(ticker)
     earnings = _build_earnings_context(ticker)
     macro    = _build_macro_context()
+    vix      = _build_vix_context()
     t_news   = _build_ticker_news(ticker)
     sector   = _build_sector_context(ticker)
     g_news   = _build_global_news() if include_global_news else []
@@ -519,6 +608,7 @@ def build_ticker_context(ticker: str, include_global_news: bool = True) -> dict:
         "price":         price,
         "earnings":      earnings,
         "macro":         macro,
+        "vix":           vix,
         "ticker_news":   t_news,
         "global_news":   g_news,
         "sector":        sector,
@@ -594,6 +684,18 @@ def _format_for_llm(ctx: dict) -> str:
             lines.append("Avg post-earnings move: ±{:.1f}% | Beat rate: {}%".format(
                 earn["avg_move_1d_pct"], earn.get("beat_rate", "?"),
             ))
+
+    # VIX
+    vix = ctx.get("vix", {})
+    if vix and not vix.get("error"):
+        lines.append("\n[VIX — MARKET FEAR]")
+        warn = f" ⚠️  {vix['warning']}" if vix.get("warning") else ""
+        lines.append("VIX: {} | Zone: {} | Trend: {} (5d change: {:+.1f}){}".format(
+            vix.get("current"), vix.get("zone"),
+            vix.get("trend"), vix.get("change_5d") or 0, warn
+        ))
+        lines.append("Implication: {}".format(vix.get("implication")))
+        lines.append("Strategy guidance: {}".format(vix.get("strategy")))
 
     # Sector
     if sector and not sector.get("error"):

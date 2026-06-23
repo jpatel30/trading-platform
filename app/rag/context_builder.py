@@ -882,6 +882,52 @@ def _build_iv_context(ticker: str, sector_etf: str = "XLK",
         return {"error": str(e)}
 
 
+def _tag_geopolitical_risk(ticker: str, global_news: list[dict]) -> dict:
+    """
+    Prepare global news for LLM consumption.
+    No hard-coded sector decisions — LLM decides relevance and weight.
+    All major headlines passed through, LLM tags and weights them.
+    New/unknown events are NOT missed (no keyword filter).
+    """
+    if not global_news:
+        return {
+            "geo_risk_level":    "UNKNOWN",
+            "relevant_headlines": [],
+            "risk_summary":      "No global news available",
+        }
+
+    # Pass ALL headlines — let LLM judge relevance
+    # Prioritise: Fed/central bank → geopolitical → sector-specific → macro
+    fed_news   = [n for n in global_news if n.get("type") == "fed"]
+    other_news = [n for n in global_news if n.get("type") != "fed"]
+
+    all_headlines = fed_news + other_news  # Fed news first
+
+    formatted = [
+        {
+            "headline": n.get("headline", "")[:120],
+            "source":   n.get("source", ""),
+            "type":     n.get("type", "market"),
+        }
+        for n in all_headlines[:12]  # top 12 to LLM
+        if n.get("headline")
+    ]
+
+    return {
+        "geo_risk_level":    "LLM_ASSESSED",  # LLM decides, not us
+        "relevant_headlines": formatted,
+        "total_headlines":   len(global_news),
+        "risk_summary":      (
+            "Global news provided — LLM to assess impact on {} "
+            "({} headlines, {} Fed/CB items)".format(
+                ticker.upper(),
+                len(formatted),
+                len(fed_news)
+            )
+        ),
+    }
+
+
 def build_ticker_context(ticker: str, include_global_news: bool = True) -> dict:
     """
     Build full RAG context for any ticker.
@@ -923,6 +969,8 @@ def build_ticker_context(ticker: str, include_global_news: bool = True) -> dict:
     t_news   = _build_ticker_news(ticker)
     g_news   = _build_global_news() if include_global_news else []
 
+    geo  = _tag_geopolitical_risk(ticker, g_news)
+
     ctx = {
         "ticker":        ticker,
         "price":         price,
@@ -932,6 +980,7 @@ def build_ticker_context(ticker: str, include_global_news: bool = True) -> dict:
         "iv":            iv,
         "ticker_news":   t_news,
         "global_news":   g_news,
+        "geo_risk":      geo,
         "sector":        sector,
         "built_at":      datetime.now().isoformat(),
         "build_time_s":  round(time.time() - t0, 1),
@@ -1087,6 +1136,21 @@ def _format_for_llm(ctx: dict) -> str:
             head = n.get("headline", "")
             if head:
                 lines.append("  [{}] {}".format(src, head[:120]))
+
+    # Global news — all passed to LLM, LLM decides relevance and weight
+    geo = ctx.get("geo_risk", {})
+    if geo and geo.get("relevant_headlines"):
+        lines.append("\n[GLOBAL NEWS — ASSESS IMPACT ON {}]".format(ticker))
+        lines.append("Evaluate each headline for relevance to {} price action:".format(ticker))
+        for h in geo.get("relevant_headlines", [])[:10]:
+            src = h.get("source", "")
+            hdl = h.get("headline", "")
+            if hdl:
+                lines.append("  [{}] {}".format(src, hdl[:110]))
+        lines.append(
+            "Note: Include the most relevant 1-2 headlines in your "
+            "recommendation summary under KEY_NEWS field."
+        )
 
     lines.append("\n=== END CONTEXT ===")
     return "\n".join(lines)

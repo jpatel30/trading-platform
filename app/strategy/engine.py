@@ -323,6 +323,7 @@ def _log_llm_decision(ticker: str, decision: dict, outcome: str, status: str) ->
         "confidence": decision.get("confidence"),
         "legs": decision.get("legs", []),
         "reasoning": decision.get("reasoning", ""),
+        "key_news":  decision.get("key_news", "NONE"),
     }
 
     try:
@@ -361,6 +362,7 @@ JSON format:
   "confidence": 65,
   "reasoning": "2-3 sentences on why this trade",
   "key_risk": "1 sentence on main risk",
+  "key_news": "1-2 global headlines that influenced this recommendation, or NONE",
   "regime_check": "PASS or FAIL with reason"
 }}
 
@@ -615,6 +617,7 @@ def _execute_trade_math(
         ),
         "llm_decision": {
             "reasoning":    decision.get("reasoning",""),
+            "key_news":     decision.get("key_news","NONE"),
             "key_risk":     decision.get("key_risk",""),
             "confidence":   decision.get("confidence", 50),
             "regime_check": decision.get("regime_check",""),
@@ -696,6 +699,7 @@ def _deterministic_strategy(
         "strategy": strategy, "expiry": expiry, "legs": legs,
         "direction": direction, "confidence": confidence,
         "reasoning": f"Fallback deterministic rules: {direction} + {'HIGH' if avg_iv >= IV_HIGH else 'LOW'} IV",
+        "key_news": "NONE — LLM unavailable",
         "key_risk": "LLM unavailable — rule-based fallback",
         "regime_check": "PASS (not verified)"
     }

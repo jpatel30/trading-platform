@@ -88,10 +88,63 @@ def _build_price_context(ticker: str) -> dict:
             vol_signal, vol_confirmed = "VERY_LOW", False
             vol_note = "Very low volume — signal unreliable"
 
-        # Key support/resistance (simplified: recent swing lows/highs)
-        recent = closes[-30:]
-        supports    = sorted(set([round(min(recent[i:i+5]), 0) for i in range(0, 25, 5)]))[:3]
-        resistances = sorted(set([round(max(recent[i:i+5]), 0) for i in range(0, 25, 5)]), reverse=True)[:3]
+        # Key support/resistance via swing detection + price filter
+        # Swing low: lower than 2 bars each side
+        # Swing high: higher than 2 bars each side
+        # CRITICAL: supports must be BELOW current, resistances ABOVE current
+        swing_lows, swing_highs = [], []
+        lookback = closes[-60:] if len(closes) >= 60 else closes
+        for i in range(2, len(lookback) - 2):
+            if lookback[i] < lookback[i-1] and lookback[i] < lookback[i-2] and                lookback[i] < lookback[i+1] and lookback[i] < lookback[i+2]:
+                swing_lows.append(round(lookback[i], 0))
+            if lookback[i] > lookback[i-1] and lookback[i] > lookback[i-2] and                lookback[i] > lookback[i+1] and lookback[i] > lookback[i+2]:
+                swing_highs.append(round(lookback[i], 0))
+
+        # Filter by current price — supports below, resistances above
+        supports    = sorted(
+            set(l for l in swing_lows if l < current),
+            reverse=True)[:3]   # nearest first
+        resistances = sorted(
+            set(h for h in swing_highs if h > current))[:3]  # nearest first
+
+        # Fallback if not enough swing points
+        if len(supports) < 2:
+            ma_support = round(min(ma50, ma200), 0)
+            if ma_support < current:
+                supports = sorted(set(supports + [ma_support]), reverse=True)[:3]
+        if len(resistances) < 2:
+            ma_resist = round(max(ma50, ma200) * 1.02, 0)
+            if ma_resist > current:
+                resistances = sorted(set(resistances + [ma_resist]))[:3]
+
+        # Entry trigger: how close is price to nearest S/R level?
+        nearest_support    = supports[0]    if supports    else None
+        nearest_resistance = resistances[0] if resistances else None
+
+        pct_to_support    = round((current - nearest_support) / current * 100, 1)                             if nearest_support    else None
+        pct_to_resistance = round((nearest_resistance - current) / current * 100, 1)                             if nearest_resistance else None
+
+        # Entry condition
+        if pct_to_resistance is not None and pct_to_resistance <= 1.5:
+            entry_trigger = "AT_RESISTANCE"
+            entry_note    = f"Price within 1.5% of ${nearest_resistance} resistance — good bearish entry now"
+        elif pct_to_support is not None and pct_to_support <= 1.5:
+            entry_trigger = "AT_SUPPORT"
+            entry_note    = f"Price within 1.5% of ${nearest_support} support — good bullish entry now"
+        elif pct_to_resistance is not None and pct_to_resistance <= 3.0:
+            entry_trigger = "NEAR_RESISTANCE"
+            entry_note    = f"Wait for rejection at ${nearest_resistance} resistance ({pct_to_resistance}% away) before bearish entry"
+        elif pct_to_support is not None and pct_to_support <= 3.0:
+            entry_trigger = "NEAR_SUPPORT"
+            entry_note    = f"Wait for bounce at ${nearest_support} support ({pct_to_support}% away) before bullish entry"
+        else:
+            entry_trigger = "BETWEEN_LEVELS"
+            entry_note    = (
+                f"Price between levels — "
+                f"wait for move to ${nearest_resistance} resistance or ${nearest_support} support"
+                if nearest_resistance and nearest_support else
+                "No clear entry trigger — enter on momentum confirmation"
+            )
 
         # Trend determination
         if above_ma50 and above_ma200 and (ret_30d or 0) > 0:
@@ -128,8 +181,14 @@ def _build_price_context(ticker: str) -> dict:
             "volume_signal":   vol_signal,
             "volume_confirmed": vol_confirmed,
             "volume_note":     vol_note,
-            "key_supports":    supports,
-            "key_resistances": resistances,
+            "key_supports":      supports,
+            "key_resistances":   resistances,
+            "nearest_support":   nearest_support,
+            "nearest_resistance": nearest_resistance,
+            "pct_to_support":    pct_to_support,
+            "pct_to_resistance": pct_to_resistance,
+            "entry_trigger":     entry_trigger,
+            "entry_note":        entry_note,
         }
     except Exception as e:
         return {"error": str(e)}
@@ -688,6 +747,9 @@ def _format_for_llm(ctx: dict) -> str:
         if price.get("key_supports"):
             lines.append("Support: {} | Resistance: {}".format(
                 price.get("key_supports"), price.get("key_resistances")))
+        if price.get("entry_trigger"):
+            lines.append("Entry trigger: {} — {}".format(
+                price.get("entry_trigger"), price.get("entry_note")))
         rel_vol   = price.get("relative_volume", 1.0)
         vol_sig   = price.get("volume_signal", "UNKNOWN")
         confirmed = price.get("volume_confirmed", False)

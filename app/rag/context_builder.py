@@ -70,6 +70,24 @@ def _build_price_context(ticker: str) -> dict:
         vol_trend  = "increasing" if vol_recent > vol_prior * 1.1 else \
                      "decreasing" if vol_recent < vol_prior * 0.9 else "normal"
 
+        # Relative volume and confirmation signal
+        vol_today  = volumes[-1] if volumes else 0
+        vol_avg_20 = sum(volumes[-21:-1]) / 20 if len(volumes) >= 21 else vol_recent
+        rel_vol    = round(vol_today / vol_avg_20, 2) if vol_avg_20 > 0 else 1.0
+
+        if rel_vol >= 1.5:
+            vol_signal, vol_confirmed = "HIGH", True
+            vol_note = "Strong volume — move backed by conviction"
+        elif rel_vol >= 1.0:
+            vol_signal, vol_confirmed = "ABOVE_AVERAGE", True
+            vol_note = "Above average volume — reasonable confirmation"
+        elif rel_vol >= 0.5:
+            vol_signal, vol_confirmed = "BELOW_AVERAGE", False
+            vol_note = "Below average volume — signal may be weak"
+        else:
+            vol_signal, vol_confirmed = "VERY_LOW", False
+            vol_note = "Very low volume — signal unreliable"
+
         # Key support/resistance (simplified: recent swing lows/highs)
         recent = closes[-30:]
         supports    = sorted(set([round(min(recent[i:i+5]), 0) for i in range(0, 25, 5)]))[:3]
@@ -97,7 +115,19 @@ def _build_price_context(ticker: str) -> dict:
             "pct_from_52w_low":  pct_from_low,
             "high_52w":      round(high_52w, 2),
             "low_52w":       round(low_52w, 2),
-            "volume_trend":  vol_trend,
+            "volume_trend":    vol_trend,
+            "relative_volume": rel_vol,
+            "volume_today":    int(vol_today),
+            "volume_avg_20":   int(vol_avg_20),
+            "volume_signal":   vol_signal,
+            "volume_confirmed": vol_confirmed,
+            "volume_note":     vol_note,
+            "volume_today":    vol_today,
+            "volume_avg_20":   round(vol_avg_20),
+            "relative_volume": rel_vol,
+            "volume_signal":   vol_signal,
+            "volume_confirmed": vol_confirmed,
+            "volume_note":     vol_note,
             "key_supports":    supports,
             "key_resistances": resistances,
         }
@@ -658,7 +688,15 @@ def _format_for_llm(ctx: dict) -> str:
         if price.get("key_supports"):
             lines.append("Support: {} | Resistance: {}".format(
                 price.get("key_supports"), price.get("key_resistances")))
-        lines.append("Volume: {}".format(price.get("volume_trend")))
+        rel_vol   = price.get("relative_volume", 1.0)
+        vol_sig   = price.get("volume_signal", "UNKNOWN")
+        confirmed = price.get("volume_confirmed", False)
+        vol_note  = price.get("volume_note", "")
+        lines.append("Volume: {} | Rel vol: {}x 20d avg | {} | {}".format(
+            price.get("volume_trend"), rel_vol,
+            "✓ CONFIRMED" if confirmed else "✗ NOT CONFIRMED",
+            vol_note
+        ))
 
     # Earnings
     if earn and not earn.get("error"):

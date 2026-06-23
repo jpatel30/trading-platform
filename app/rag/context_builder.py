@@ -656,6 +656,232 @@ def _build_vix_context() -> dict:
         return {"error": str(e)}
 
 
+# IV sector baselines when VIX is at NORMAL (15-20)
+# Format: sector_etf → (low_iv, typical_iv, high_iv)
+IV_SECTOR_BASELINES = {
+    "XLK": (0.22, 0.32, 0.55),   # Tech
+    "XLE": (0.22, 0.32, 0.50),   # Energy
+    "XLF": (0.18, 0.28, 0.45),   # Financials
+    "XLV": (0.18, 0.28, 0.45),   # Healthcare
+    "XLI": (0.18, 0.28, 0.45),   # Industrials
+    "XLY": (0.22, 0.32, 0.55),   # Consumer Disc
+    "GLD": (0.12, 0.18, 0.30),   # Gold
+    "SLV": (0.18, 0.25, 0.40),   # Silver
+    "QQQ": (0.18, 0.25, 0.45),   # Nasdaq
+    "SPY": (0.10, 0.16, 0.30),   # S&P 500
+}
+
+
+def _get_real_iv_rank(ticker: str, current_iv: float) -> float | None:
+    """
+    Compute IV rank from stored iv_history if enough data exists (min 30 days).
+    Returns None if insufficient history.
+    """
+    try:
+        from sqlalchemy import text
+        from app.db.session import get_session
+        with get_session() as s:
+            rows = s.execute(text("""
+                SELECT atm_iv FROM iv_history
+                WHERE ticker = :t
+                  AND recorded_at >= CURRENT_DATE - 365
+                  AND atm_iv IS NOT NULL
+                ORDER BY recorded_at
+            """), {"t": ticker.upper()}).fetchall()
+
+            if len(rows) < 30:
+                return None
+
+            ivs    = [float(r.atm_iv) for r in rows]
+            iv_min = min(ivs)
+            iv_max = max(ivs)
+            if iv_max == iv_min:
+                return 50.0
+            rank = round((current_iv - iv_min) / (iv_max - iv_min) * 100, 1)
+            return rank
+    except Exception:
+        return None
+
+
+def _proxy_iv_rank(current_iv: float, sector_etf: str, vix: float) -> dict:
+    """
+    Option A: Proxy IV rank using sector baselines + VIX adjustment.
+    Used when we have < 30 days of stored IV history.
+    """
+    # Get sector baseline
+    baseline = IV_SECTOR_BASELINES.get(sector_etf, (0.20, 0.30, 0.50))
+    low_iv, typical_iv, high_iv = baseline
+
+    # VIX adjustment: scale baselines by VIX vs normal (17)
+    vix_factor = vix / 17.0
+    low_iv     = round(low_iv * vix_factor, 3)
+    typical_iv = round(typical_iv * vix_factor, 3)
+    high_iv    = round(high_iv * vix_factor, 3)
+
+    # Estimate rank 0-100
+    if current_iv <= low_iv:
+        proxy_rank = round((current_iv / low_iv) * 20, 1)          # 0-20
+    elif current_iv <= typical_iv:
+        proxy_rank = round(20 + (current_iv - low_iv) /
+                    (typical_iv - low_iv) * 30, 1)                  # 20-50
+    elif current_iv <= high_iv:
+        proxy_rank = round(50 + (current_iv - typical_iv) /
+                    (high_iv - typical_iv) * 35, 1)                 # 50-85
+    else:
+        proxy_rank = round(min(85 + (current_iv - high_iv) /
+                    high_iv * 15, 100), 1)                          # 85-100
+
+    return {
+        "proxy_rank":  proxy_rank,
+        "low_iv":      low_iv,
+        "typical_iv":  typical_iv,
+        "high_iv":     high_iv,
+        "vix_factor":  round(vix_factor, 2),
+    }
+
+
+def _record_iv_history(ticker: str, avg_iv: float, atm_iv: float,
+                        expiry: str, contract_count: int, vix: float) -> None:
+    """Option B: Store today's IV for building real history over time."""
+    try:
+        from sqlalchemy import text
+        from app.db.session import get_session
+        with get_session() as s:
+            s.execute(text("""
+                INSERT INTO iv_history
+                    (ticker, recorded_at, expiry, atm_iv, avg_iv,
+                     contract_count, vix_at_time)
+                VALUES
+                    (:t, CURRENT_DATE, :exp, :atm, :avg, :cnt, :vix)
+                ON CONFLICT (ticker, recorded_at, expiry)
+                DO UPDATE SET
+                    atm_iv         = EXCLUDED.atm_iv,
+                    avg_iv         = EXCLUDED.avg_iv,
+                    vix_at_time    = EXCLUDED.vix_at_time
+            """), {
+                "t": ticker.upper(), "exp": expiry,
+                "atm": atm_iv, "avg": avg_iv,
+                "cnt": contract_count, "vix": vix,
+            })
+    except Exception as e:
+        print(f"[IV] History record failed: {e}")
+
+
+def _build_iv_context(ticker: str, sector_etf: str = "XLK",
+                       vix: float = 17.0) -> dict:
+    """
+    IV rank for a ticker — dual approach:
+
+    Option A (immediate): proxy rank from sector baseline + VIX
+    Option B (parallel):  store today's IV, real rank after 30 days
+
+    IV Rank interpretation:
+        0-20:  Very cheap — strong buy signal for options buyers
+        20-40: Cheap — good for debit spreads and naked options
+        40-60: Fair value — standard strategy selection
+        60-80: Expensive — prefer credit spreads, reduce size
+        80-100: Very expensive — sell premium only, avoid buying
+    """
+    try:
+        from app.options_flow.unusual_whales import get_option_contracts
+        from datetime import datetime, timedelta
+
+        # Get nearest expiry (3-5 weeks out)
+        target_date = datetime.now() + timedelta(days=28)
+        expiry      = target_date.strftime("%Y-%m-%d")
+
+        # Round to nearest Friday
+        while target_date.weekday() != 4:
+            target_date += timedelta(days=1)
+        expiry = target_date.strftime("%Y-%m-%d")
+
+        contracts = get_option_contracts(ticker, expiry=expiry)
+        if not contracts:
+            return {"error": "No contracts found", "expiry": expiry}
+
+        # Calculate IV metrics
+        ivs = [float(c["implied_volatility"])
+               for c in contracts
+               if c.get("implied_volatility") is not None
+               and float(c["implied_volatility"]) > 0.05]
+
+        if not ivs:
+            return {"error": "No IV data in contracts"}
+
+        avg_iv = round(sum(ivs) / len(ivs), 3)
+        atm_iv = round(sorted(ivs)[len(ivs) // 2], 3)  # median IV ≈ ATM
+
+        # Option B: record for history
+        _record_iv_history(ticker, avg_iv, atm_iv, expiry,
+                           len(contracts), vix)
+
+        # Option A: try real rank first, fall back to proxy
+        real_rank = _get_real_iv_rank(ticker, atm_iv)
+
+        if real_rank is not None:
+            iv_rank       = real_rank
+            rank_source   = "historical"
+            days_of_data  = None  # filled below
+        else:
+            proxy         = _proxy_iv_rank(atm_iv, sector_etf, vix)
+            iv_rank       = proxy["proxy_rank"]
+            rank_source   = "proxy_estimate"
+
+        # Days of history we have
+        try:
+            from sqlalchemy import text
+            from app.db.session import get_session
+            with get_session() as s:
+                cnt = s.execute(text(
+                    "SELECT COUNT(DISTINCT recorded_at) FROM iv_history WHERE ticker=:t"
+                ), {"t": ticker.upper()}).scalar()
+                days_of_data = cnt
+        except Exception:
+            days_of_data = 0
+
+        # Interpretation
+        if iv_rank <= 20:
+            iv_zone       = "VERY_CHEAP"
+            strategy_note = "Options very cheap — buy naked options or wide debit spreads"
+            buy_options   = True
+        elif iv_rank <= 40:
+            iv_zone       = "CHEAP"
+            strategy_note = "IV below average — debit spreads and naked options cost-effective"
+            buy_options   = True
+        elif iv_rank <= 60:
+            iv_zone       = "FAIR"
+            strategy_note = "IV at fair value — standard strategy selection"
+            buy_options   = True
+        elif iv_rank <= 80:
+            iv_zone       = "EXPENSIVE"
+            strategy_note = "IV elevated — prefer credit spreads, reduce position size"
+            buy_options   = False
+        else:
+            iv_zone       = "VERY_EXPENSIVE"
+            strategy_note = "IV very high — sell premium only, avoid buying options"
+            buy_options   = False
+
+        return {
+            "ticker":        ticker.upper(),
+            "expiry":        expiry,
+            "avg_iv":        avg_iv,
+            "atm_iv":        atm_iv,
+            "iv_rank":       iv_rank,
+            "rank_source":   rank_source,
+            "days_of_data":  days_of_data,
+            "iv_zone":       iv_zone,
+            "strategy_note": strategy_note,
+            "buy_options":   buy_options,
+            "contract_count": len(contracts),
+            "note": f"Real rank after 30 days ({30 - (days_of_data or 0)} more days)"
+                    if rank_source == "proxy_estimate" else
+                    f"Real rank from {days_of_data} days of history",
+        }
+
+    except Exception as e:
+        return {"error": str(e)}
+
+
 def build_ticker_context(ticker: str, include_global_news: bool = True) -> dict:
     """
     Build full RAG context for any ticker.
@@ -688,8 +914,13 @@ def build_ticker_context(ticker: str, include_global_news: bool = True) -> dict:
     earnings = _build_earnings_context(ticker)
     macro    = _build_macro_context()
     vix      = _build_vix_context()
-    t_news   = _build_ticker_news(ticker)
     sector   = _build_sector_context(ticker)
+    iv       = _build_iv_context(
+                   ticker,
+                   sector_etf = sector.get("sector_etf", "XLK"),
+                   vix        = vix.get("current", 17.0) if not vix.get("error") else 17.0,
+               )
+    t_news   = _build_ticker_news(ticker)
     g_news   = _build_global_news() if include_global_news else []
 
     ctx = {
@@ -698,6 +929,7 @@ def build_ticker_context(ticker: str, include_global_news: bool = True) -> dict:
         "earnings":      earnings,
         "macro":         macro,
         "vix":           vix,
+        "iv":            iv,
         "ticker_news":   t_news,
         "global_news":   g_news,
         "sector":        sector,
@@ -784,6 +1016,22 @@ def _format_for_llm(ctx: dict) -> str:
             lines.append("Avg post-earnings move: ±{:.1f}% | Beat rate: {}%".format(
                 earn["avg_move_1d_pct"], earn.get("beat_rate", "?"),
             ))
+
+    # IV Rank
+    iv = ctx.get("iv", {})
+    if iv and not iv.get("error"):
+        lines.append("\n[IV RANK — OPTIONS PRICING]")
+        lines.append("ATM IV: {:.1f}% | IV Rank: {:.0f}/100 | Zone: {} | Source: {}".format(
+            iv.get("atm_iv", 0) * 100,
+            iv.get("iv_rank", 50),
+            iv.get("iv_zone", "UNKNOWN"),
+            iv.get("rank_source", "unknown"),
+        ))
+        lines.append("Strategy: {}".format(iv.get("strategy_note", "")))
+        lines.append("Buy options: {} | {}".format(
+            "YES" if iv.get("buy_options") else "NO — sell premium instead",
+            iv.get("note", "")
+        ))
 
     # VIX
     vix = ctx.get("vix", {})

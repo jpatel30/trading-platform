@@ -5,6 +5,89 @@
 cd ~/Documents/Claude/Projects/trading-platform
 source venv/bin/activate
 
+echo "=== SECTION 0: HEALTH CHECK ==="
+
+python3 << 'PYEOF'
+print('=== TRADING PLATFORM HEALTH CHECK ===')
+errors = []
+
+try:
+    from app.db.session import get_session
+    from sqlalchemy import text
+    with get_session() as s: s.execute(text('SELECT 1'))
+    print('✅ Postgres')
+except Exception as e: print('❌ Postgres:', e); errors.append('postgres')
+
+try:
+    import requests
+    r      = requests.get('http://localhost:11434/api/tags', timeout=3)
+    models = [m['name'] for m in r.json().get('models', [])]
+    ps     = requests.get('http://localhost:11434/api/ps', timeout=3).json()
+    loaded = ps.get('models', [])
+    if loaded:
+        vram = loaded[0].get('size_vram', 0)
+        gpu  = 'Metal GPU' if vram > 0 else 'CPU only'
+        print(f'✅ Ollama: {models} | {gpu} | {round(vram/1e9,1)}GB VRAM')
+    else:
+        print(f'✅ Ollama: {models} | idle (loads on first call)')
+except Exception as e: print('❌ Ollama:', e); errors.append('ollama')
+
+try:
+    from app.broker.webull_connector import WebullConnector
+    from app.utils.current_user import get_current_user_id
+    pos = WebullConnector(get_current_user_id()).get_positions()
+    print(f'✅ Webull: {len(pos)} positions')
+except Exception as e: print('❌ Webull:', e); errors.append('webull')
+
+try:
+    from app.broker.watchlist_sync import get_db_watchlist
+    from app.utils.current_user import get_current_user_id
+    t = get_db_watchlist(get_current_user_id())
+    print(f'✅ Watchlist DB: {len(t)} tickers')
+except Exception as e: print('❌ Watchlist:', e); errors.append('watchlist')
+
+try:
+    import requests
+    from app.utils.config import settings
+    r = requests.get('https://api.polygon.io/v2/aggs/ticker/NVDA/prev',
+        params={'apiKey': settings.polygon_api_key}, timeout=5)
+    price = r.json().get('results', [{}])[0].get('c', 0)
+    print(f'✅ Polygon: NVDA prev close ${price}')
+except Exception as e: print('❌ Polygon:', e); errors.append('polygon')
+
+try:
+    from app.options_flow.unusual_whales import get_flow_alerts
+    get_flow_alerts(ticker='NVDA', limit=1)
+    print('✅ UW Options Flow')
+except Exception as e: print('❌ UW:', e); errors.append('uw')
+
+try:
+    from app.mcp_server.server import mcp
+    print('✅ MCP Server')
+except Exception as e: print('❌ MCP:', e); errors.append('mcp')
+
+try:
+    from app.rag.context_builder import build_ticker_context
+    print('✅ RAG Pipeline')
+except Exception as e: print('❌ RAG:', e); errors.append('rag')
+
+try:
+    from app.monitor.position_monitor import get_monitor
+    print('✅ Position Monitor')
+except Exception as e: print('❌ Monitor:', e); errors.append('monitor')
+
+try:
+    from app.broker.active_bets import get_active_bets
+    print('✅ Active Bets')
+except Exception as e: print('❌ Active Bets:', e); errors.append('active_bets')
+
+print()
+if errors: print('❌ Issues:', errors)
+else:       print('✅ ALL SYSTEMS GO')
+print('======================================')
+PYEOF
+
+echo ""
 echo "=== SECTION 1: ALL CLAUDE DESKTOP COMMANDS ==="
 
 cat << 'EOF'
@@ -176,7 +259,7 @@ for p in picks:
 print('✅ Scanner OK')
 PYEOF
 
-sleep 60
+sleep 15
 echo ""
 echo "=== SECTION 5b: STRATEGY ENGINE ==="
 
@@ -364,3 +447,99 @@ EOF
 
 echo ""
 echo "=== RUNBOOK COMPLETE ==="
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 15 — MCP TOOL REGISTRY (48 tools — no overlaps)
+# Reference before adding any new tool
+# ═══════════════════════════════════════════════════════════════════════════════
+
+cat << 'EOF'
+
+╔══════════════════════════════════════════════════════════════╗
+║              MCP TOOL REGISTRY — 48 TOOLS                   ║
+║         Check this before adding any new tool               ║
+╚══════════════════════════════════════════════════════════════╝
+
+── PING ────────────────────────────────────────────────────────
+  ping                      Health check — DB + server alive
+
+── BROKER / PORTFOLIO ──────────────────────────────────────────
+  get_positions             Raw Webull live positions (pre/post market prices)
+  get_balances              Account balance + buying power
+  get_orders                Today's orders
+  get_portfolio_pnl         Financial snapshot: total value, P&L, win rate
+  get_active_bets           Trading view: targets, stops, status, action needed
+
+── MARKET DATA ─────────────────────────────────────────────────
+  get_market_status         NYSE open/closed, last trading day, next open
+  get_quote                 Single ticker previous close (Polygon)
+  get_quotes                Bulk previous close (Polygon)
+  get_price_history         Historical OHLCV bars
+  get_ticker_info           Fundamentals: name, market cap, exchange
+
+── TECHNICAL ANALYSIS ──────────────────────────────────────────
+  analyze_ticker            RSI, MACD, BB, ATR, S/R, signal, strength score
+
+── OPTIONS FLOW (Unusual Whales) ───────────────────────────────
+  get_market_overview       Market tide, sector flow, economic calendar
+  get_options_flow          Institutional sweeps
+  get_dark_pool             Block trades
+  get_gex                   Gamma exposure, gamma walls
+  get_ticker_signal         Combined flow signal: direction + confidence
+  get_earnings_calendar     Today earnings pre/post market
+  get_news                  UW market headlines (fast, no RAG)
+  get_congress_trades       Congressional trading activity
+
+── STRATEGY ────────────────────────────────────────────────────
+  get_strategy_recommendation  Full options trade recommendation
+
+── WATCHLIST + SCANNER ─────────────────────────────────────────
+  get_watchlist             DB watchlist instant (126 tickers)
+  force_sync_watchlist      Immediate Webull sync
+  add_to_watchlist          Add ticker
+  remove_from_watchlist     Remove ticker
+  get_scan_universe         Watchlist + positions + filters (scanner input)
+  scan_watchlist            Two-tier convergence scanner + top picks
+
+── SELL SIGNALS ────────────────────────────────────────────────
+  get_sell_signals          Exit analysis: rule-based + LLM batch
+
+── RAG / RESEARCH ──────────────────────────────────────────────
+  get_market_context        Full RAG: price + earnings + macro + news + sector
+
+── POSITION MONITOR ────────────────────────────────────────────
+  start_monitor             Start background polling (15/30 min two-tier)
+  stop_monitor              Stop polling
+  get_monitor_status        Running status, last check, pending alerts
+  get_active_alerts         Unread alerts sorted by urgency
+  dismiss_alert             Mark one alert read
+  dismiss_all_alerts        Mark all alerts read
+  mute_alerts               Mute global or per-symbol, with optional expiry
+  unmute_alerts             Re-enable alerts
+  get_mute_status           What is currently muted
+
+── NOTIFICATIONS (Discord) ─────────────────────────────────────
+  configure_discord         Save webhook + send test
+  test_notification         Send test alert to verify setup
+  get_notification_config   Show current settings
+
+── PREDICTION TRACKER ──────────────────────────────────────────
+  confirm_execution         User confirms they bought a recommendation
+  log_outcome               Position closed — record result + update win rate
+  mark_sell_acted           Confirm acted on a sell signal
+  get_trade_history         Full history of executed trades
+
+── LEARNING ENGINE ─────────────────────────────────────────────
+  get_learning_report       FULL: compliance + performance + weights + actions
+                            USE THIS — not get_accuracy_report (deprecated)
+  get_strategy_weights      Current confidence weight adjustments per strategy
+  get_sell_signal_compliance  Quick compliance check (subset of learning report)
+
+── RULES ───────────────────────────────────────────────────────
+  DO NOT add duplicate tools — check this list first
+  get_accuracy_report is DEPRECATED — use get_learning_report
+  get_news vs get_market_context: news=fast headlines, context=full RAG
+  get_portfolio_pnl vs get_active_bets: financial vs trading action view
+  get_quote vs get_quotes: single vs bulk
+
+EOF

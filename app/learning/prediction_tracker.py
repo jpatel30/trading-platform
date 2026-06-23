@@ -28,82 +28,140 @@ def confirm_execution(
     symbol: str,
     entry_price: float,
     qty: int,
-    strategy: str = "",
-    target_pct: float = 20.0,
-    stop_pct: float = -40.0,
-    note: str = "",
+    recommendation_id: str | None = None,
 ) -> dict:
     """
-    Log when user confirms they executed a recommended trade.
-    Upserts into tracked_positions with source='recommendation'.
-
-    Args:
-        symbol:      ticker e.g. 'NVDA'
-        entry_price: actual price paid per share/contract
-        qty:         number of shares or contracts
-        strategy:    e.g. 'DEBIT_PUT_SPREAD Jul 10 R/R=5.19'
-        target_pct:  profit target % (default +20% stocks, +80% options)
-        stop_pct:    stop loss % (default -40%)
-        note:        any extra context
+    User confirms they executed a recommended trade.
+    Fully idempotent — same symbol + price + date = always 1 row.
+    Tomorrow same price = new row. Different price today = new row.
     """
     try:
         from sqlalchemy import text
         from app.db.session import get_session
 
-        target_price = round(entry_price * (1 + target_pct / 100), 2)
-        stop_price   = round(entry_price * (1 + stop_pct / 100), 2)
-        llm_note     = f"{strategy} | {note}".strip(" |") if strategy or note else None
-
         with get_session() as s:
-            s.execute(text("""
-                INSERT INTO tracked_positions (
-                    user_id, symbol, source, entry_date, entry_price, qty,
-                    target_pct, stop_pct, target_price, stop_price,
-                    check_interval_min, llm_entry_note, is_active
-                ) VALUES (
-                    :uid, :sym, 'recommendation', CURRENT_DATE, :ep, :qty,
-                    :tgt_pct, :stp_pct, :tgt_price, :stp_price,
-                    15, :note, TRUE
-                )
-                ON CONFLICT (user_id, symbol, entry_date)
-                DO UPDATE SET
-                    entry_price    = EXCLUDED.entry_price,
-                    qty            = EXCLUDED.qty,
-                    target_pct     = EXCLUDED.target_pct,
-                    stop_pct       = EXCLUDED.stop_pct,
-                    target_price   = EXCLUDED.target_price,
-                    stop_price     = EXCLUDED.stop_price,
-                    llm_entry_note = EXCLUDED.llm_entry_note,
-                    is_active      = TRUE
-            """), {
-                "uid": user_id, "sym": symbol.upper(),
-                "ep": entry_price, "qty": qty,
-                "tgt_pct": target_pct, "stp_pct": stop_pct,
-                "tgt_price": target_price, "stp_price": stop_price,
-                "note": llm_note,
-            })
 
-        investment = round(entry_price * qty, 2)
-        print(f"[Tracker] Execution logged: {symbol} x{qty} @ ${entry_price} = ${investment:,.0f}")
+            # 1. Find existing rec for today at this price (any status)
+            if not recommendation_id:
+                row = s.execute(text("""
+                    SELECT id FROM strategy_recommendations
+                    WHERE user_id      = :uid
+                      AND symbol       = :sym
+                      AND actual_entry = :entry
+                      AND rec_date     = CURRENT_DATE
+                    LIMIT 1
+                """), {"uid": user_id, "sym": symbol,
+                       "entry": entry_price}).fetchone()
 
+                if row:
+                    recommendation_id = str(row.id)
+                    print(f"[Tracker] Found existing rec for {symbol} @ ${entry_price}")
+                else:
+                    # Try unexecuted rec from today (from strategy engine)
+                    row = s.execute(text("""
+                        SELECT id FROM strategy_recommendations
+                        WHERE user_id         = :uid
+                          AND symbol          = :sym
+                          AND rec_date        = CURRENT_DATE
+                          AND user_executed IS NULL
+                        ORDER BY recommended_at DESC
+                        LIMIT 1
+                    """), {"uid": user_id, "sym": symbol}).fetchone()
+                    if row:
+                        recommendation_id = str(row.id)
+                        print(f"[Tracker] Found unexecuted rec for {symbol}")
+
+            # 2. Update existing or create new
+            if recommendation_id:
+                s.execute(text("""
+                    UPDATE strategy_recommendations
+                    SET user_executed = TRUE,
+                        actual_entry  = :entry,
+                        contracts     = :qty,
+                        executed_at   = now(),
+                        rec_date      = COALESCE(rec_date, CURRENT_DATE)
+                    WHERE id = :rid AND user_id = :uid
+                """), {
+                    "rid": recommendation_id, "uid": user_id,
+                    "entry": entry_price, "qty": qty,
+                })
+                print(f"[Tracker] Updated strategy_recommendation for {symbol}")
+            else:
+                # No existing rec — create new MANUAL entry
+                row = s.execute(text("""
+                    INSERT INTO strategy_recommendations
+                        (user_id, symbol, strategy, user_executed,
+                         actual_entry, contracts, executed_at, rec_date)
+                    VALUES
+                        (:uid, :sym, 'MANUAL', TRUE, :entry, :qty,
+                         now(), CURRENT_DATE)
+                    ON CONFLICT DO NOTHING
+                    RETURNING id
+                """), {
+                    "uid": user_id, "sym": symbol,
+                    "entry": entry_price, "qty": qty,
+                }).fetchone()
+                if row:
+                    recommendation_id = str(row.id)
+                    print(f"[Tracker] Created strategy_recommendation for {symbol}")
+
+            # 3. tracked_positions — update if exists today at this price, else insert
+            existing = s.execute(text("""
+                SELECT id FROM tracked_positions
+                WHERE user_id      = :uid
+                  AND symbol       = :sym
+                  AND entry_date   = CURRENT_DATE
+                  AND entry_price  = :entry
+                  AND is_active    = TRUE
+            """), {"uid": user_id, "sym": symbol,
+                   "entry": entry_price}).fetchone()
+
+            if existing:
+                s.execute(text("""
+                    UPDATE tracked_positions
+                    SET qty                = :qty,
+                        source             = 'recommendation',
+                        check_interval_min = 15,
+                        is_active          = TRUE
+                    WHERE id = :id
+                """), {"id": existing.id, "qty": qty})
+                print(f"[Tracker] Updated tracked_position for {symbol}")
+            else:
+                s.execute(text("""
+                    INSERT INTO tracked_positions (
+                        user_id, symbol, source, entry_date,
+                        entry_price, qty, target_pct, stop_pct,
+                        check_interval_min
+                    ) VALUES (
+                        :uid, :sym, 'recommendation', CURRENT_DATE,
+                        :entry, :qty, 20.0, -40.0, 15
+                    )
+                """), {
+                    "uid": user_id, "sym": symbol,
+                    "entry": entry_price, "qty": qty,
+                })
+                print(f"[Tracker] Created tracked_position for {symbol}")
+
+        total_cost = round(entry_price * qty * 100, 2)
         return {
-            "logged":        True,
-            "symbol":        symbol.upper(),
-            "qty":           qty,
-            "entry_price":   entry_price,
-            "investment":    investment,
-            "target_at":     f"+{target_pct:.0f}% (${target_price})",
-            "stop_at":       f"{stop_pct:.0f}% (${stop_price})",
-            "monitor_interval": "15 min (recommended position)",
+            "confirmed":         True,
+            "symbol":            symbol,
+            "entry_price":       entry_price,
+            "qty":               qty,
+            "total_cost":        total_cost,
+            "recommendation_id": recommendation_id,
+            "monitoring":        "every 15 min during market hours",
+            "message": (
+                f"✅ Logged: {qty} {symbol} contracts at ${entry_price} "
+                f"(total ${total_cost:,.0f}). "
+                f"Monitoring every 15 min. "
+                f"Discord alert fires when target or stop is hit."
+            ),
         }
+
     except Exception as e:
-        print(f"[Tracker] confirm_execution failed: {e}")
-        return {"logged": False, "error": str(e)}
+        return {"confirmed": False, "error": str(e)}
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Log Exit (user closed the position)
-# ─────────────────────────────────────────────────────────────────────────────
 
 def log_exit(
     user_id: str,

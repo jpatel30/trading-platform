@@ -375,6 +375,11 @@ def get_strategy_recommendation(
         max_dte:       maximum days to expiry (default 365)
 
     ⚠️ Educational analysis only. Not financial advice.
+
+    CRITICAL: After showing this recommendation, ALWAYS end with:
+    "Did you execute this trade? Reply YES with the price you paid per
+    contract and number of contracts, and I will log it and start
+    monitoring your position every 15 minutes."
     """
     from app.options_flow.unusual_whales import get_signal_package
     from app.options_flow.signals import score_signal_package
@@ -718,23 +723,28 @@ def get_notification_config() -> dict:
 @mcp.tool()
 def confirm_execution(
     symbol: str,
-    actual_entry: float,
-    contracts: int,
+    entry_price: float,
+    qty: int,
     recommendation_id: str | None = None,
 ) -> dict:
     """
-    Confirm you executed a recommended trade.
-    Links to the original recommendation for accuracy tracking.
-    Adds position to 15-min monitoring automatically.
+    Call this when user says ANY of:
+    - "I bought it", "I filled it", "I executed the trade"
+    - "I placed the order", "I got filled", "position opened"
+    - "I bought X contracts at $Y"
+
+    Logs execution, links to recommendation, starts 15-min monitoring,
+    sends Discord confirmation, adds to tracked_positions.
+
     Args:
-        symbol:            ticker e.g. 'NVDA'
-        actual_entry:      price per contract you paid e.g. 1.85
-        contracts:         number of contracts e.g. 6
+        symbol:            ticker e.g. 'GOOGL'
+        entry_price:      price paid per contract e.g. 8.50
+        qty:         number of contracts e.g. 5
         recommendation_id: optional — links to specific recommendation
     """
     from app.learning.prediction_tracker import confirm_execution as _confirm
-    return _confirm(get_current_user_id(), symbol, actual_entry,
-                    contracts, recommendation_id)
+    return _confirm(get_current_user_id(), symbol, entry_price,
+                    qty, recommendation_id)
 
 
 @mcp.tool()

@@ -594,6 +594,15 @@ class PositionMonitor:
                     alerts_fired += 1
                     print(f"[Monitor] 🔔 {urgency} [{source}] {msg[:70]}")
 
+        # Check thesis invalidation conditions
+        try:
+            from app.recommendations.daily_engine import check_invalidation_conditions
+            invalidated = check_invalidation_conditions(self.user_id, positions)
+            if invalidated > 0:
+                alerts_fired += invalidated
+        except Exception as e:
+            print(f"[Monitor] Invalidation check failed: {e}")
+
         return alerts_fired
 
     def _classify_rule(

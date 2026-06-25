@@ -348,6 +348,82 @@ def get_congress_trades(ticker: str | None = None) -> list[dict]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 @mcp.tool()
+def get_daily_recommendations(force_refresh: bool = False) -> dict:
+    """
+    Today's high-conviction trading thesis — the main daily recommendation.
+
+    Call this when user says ANY of:
+    - "What should I trade today?"
+    - "Give me today's recommendations"
+    - "What are the best picks today?"
+    - "Show me today's thesis"
+
+    Returns top 5 picks with conviction score (0-100), thesis, entry zone,
+    target, stop, and invalidation conditions. Only surfaces picks >= 70/100.
+
+    After returning, if any pick has act_now=True, ALWAYS ask:
+    "Did you execute [ticker]? Tell me how many contracts at what price."
+
+    Args:
+        force_refresh: True to re-run scanner (default: use today's cached recs)
+    """
+    from app.recommendations.daily_engine import (
+        run_daily_recommendations, format_daily_recommendations
+    )
+    result = run_daily_recommendations(
+        user_id       = get_current_user_id(),
+        force_refresh = force_refresh
+    )
+    result["formatted"] = format_daily_recommendations(result)
+    return result
+
+
+@mcp.tool()
+def invalidate_recommendation(ticker: str, reason: str = "Manual invalidation") -> dict:
+    """
+    Mark today's recommendation for a ticker as invalidated (thesis broken).
+    Fires Discord alert asking user to book profit or loss.
+
+    Call when user says ANY of:
+    - "The GOOGL thesis is broken"
+    - "NVDA crossed my stop"
+    - "Invalidate [ticker]"
+    - "The [ticker] trade isn't working"
+    """
+    from app.recommendations.daily_engine import invalidate_recommendation as _inv
+    success = _inv(get_current_user_id(), ticker.upper(), reason)
+    return {
+        "invalidated": success,
+        "ticker":      ticker.upper(),
+        "reason":      reason,
+        "message":     f"Thesis invalidated for {ticker}. Discord alert sent — please review your position.",
+    }
+
+
+@mcp.tool()
+def get_recommendation_history(days_back: int = 7) -> list[dict]:
+    """
+    Historical daily recommendations — see past thesis and outcomes.
+    Shows what we recommended, conviction score, and current status.
+    """
+    try:
+        from sqlalchemy import text
+        from app.db.session import get_session
+        with get_session() as s:
+            rows = s.execute(text("""
+                SELECT ticker, date, direction, conviction_score,
+                       conviction_tier, thesis, target_pct, stop_pct,
+                       status, invalidated_reason, strategy, risk_reward
+                FROM daily_recommendations
+                WHERE user_id = :uid
+                  AND date >= CURRENT_DATE - :days
+                ORDER BY date DESC, conviction_score DESC
+            """), {"uid": get_current_user_id(), "days": days_back}).fetchall()
+            return [dict(r._mapping) for r in rows]
+    except Exception as e:
+        return [{"error": str(e)}]
+
+@mcp.tool()
 def get_strategy_recommendation(
     ticker: str,
     budget: float = 2000.0,

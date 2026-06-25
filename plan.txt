@@ -1,0 +1,323 @@
+Complete Product Roadmap — Trading Intelligence Platform
+
+Current State (What's Built)
+W1-W6:   Infrastructure (DB, Webull, MCP, Market Data, Sell Signals, LLM)
+W7-W13:  Intelligence (Options Flow, TA, Strategy, Scanner, Watchlist, RAG, Monitor)
+W14:     Discord Notifications
+W15:     Prediction Tracker
+W16:     Learning Engine
+Steps 1-7: Signal Quality (VIX, Volume, Entry Trigger, IV Rank, News, Re-evaluation)
+Honest assessment of current quality: Works for a technically sophisticated single user (JP) who understands the limitations. Not ready for consumers who expect reliability and accuracy.
+
+What Makes This Consumer-Ready
+A consumer using this platform needs:
+1. Recommendations they can TRUST
+   → Stable, not changing every minute
+   → Clear conviction level (don't act on weak signals)
+   → Thesis they understand ("why this trade")
+
+2. Recommendations that are ACCURATE
+   → Backtested approach
+   → Weighted signals based on what actually works
+   → Right strategy for right time horizon
+
+3. System that LEARNS
+   → Gets better the more trades tracked
+   → Personalises to each user's risk tolerance
+   → Tells user what's working and what's not
+
+4. Experience that is SEAMLESS
+   → Dashboard (not just Claude Desktop)
+   → Mobile access
+   → Clear onboarding
+   → Alerts that fire reliably
+
+Full Roadmap — Phased
+
+PHASE A — Recommendation Quality (This Week)
+Goal: Make recommendations trustworthy and stable
+A1 — Recommendation Persistence Layer (Day 1, 3h)
+New table: daily_recommendations
+  user_id, ticker, horizon, direction, thesis
+  entry_zone, target, stop, invalidation_conditions
+  conviction_score (0-100), conviction_tier (HIGH/MODERATE/WATCH)
+  valid_from, valid_until, status (ACTIVE/INVALIDATED/EXPIRED)
+  created_at, last_checked_at
+
+Rules:
+  One recommendation per ticker per user per day
+  Persists until: price crosses invalidation level
+                  VIX spikes past threshold
+                  Earnings within 2 days
+                  User manually closes it
+
+New MCP tools:
+  get_daily_recommendations()   — today's active thesis
+  invalidate_recommendation()   — mark thesis broken
+  get_recommendation_history()  — all past recommendations
+A2 — Weighted Conviction Scoring (Day 1, 2h)
+Replace 0-6 binary scoring with 0-100 weighted probability:
+
+Signal weights (start with these, calibrate over time):
+  Entry trigger (AT_RESISTANCE/AT_SUPPORT): 25 points
+  Volume confirmed (rel_vol ≥ 1.0):         20 points
+  IV rank appropriate:                       20 points
+  Options flow confirming:                   20 points
+  VIX zone OK:                              10 points
+  No geo risk:                               5 points
+
+Conviction tiers:
+  85-100: VERY HIGH → full position, act immediately
+  70-84:  HIGH      → standard position, good entry
+  55-69:  MODERATE  → small position, wait for trigger
+  40-54:  WATCH     → monitor only, do not act
+  <40:    SKIP      → filter out, don't show user
+
+New output fields:
+  conviction_score: 78
+  conviction_tier:  HIGH
+  act_now:          true/false
+  position_size:    "standard" / "small" / "watch"
+A3 — Thesis Generation (Day 2, 2h)
+Each recommendation includes:
+  THESIS:        "GOOGL rejecting $350 resistance in confirmed downtrend.
+                  Bearish institutional flow (DP 72). IV cheap at rank 38.
+                  Target: $332 support zone. Risk: close above $355."
+
+  ENTRY:         "Enter when GOOGL touches $349-351 (AT_RESISTANCE)"
+  TARGET:        "$332 (-4.8%) — key support level"
+  STOP:          "$355 close above resistance (invalidates thesis)"
+  TIMEFRAME:     "5-10 trading days"
+  INVALIDATED_IF: "GOOGL closes above $355 OR VIX drops below 14"
+  KEY_CATALYST:  "No earnings until Aug 22 (59 days)"
+
+LLM generates thesis from RAG context — stored in DB, not regenerated on every call
+A4 — Data Quality Gate (Day 2, 1h)
+Before running any recommendation:
+  Check Polygon rate limit status
+  Check UW rate limit status
+  Check if market is open
+
+If >30% of data calls failed → return:
+  "Insufficient data quality — retry at [time when rate limits reset]"
+  "Partial data available for: [list of working sources]"
+
+Never return recommendation based on partial data without flagging it
+A5 — "Did You Fill?" Enforcement (Day 2, 1h)
+Structural change to recommendation return value:
+  Add field: pending_confirmation: true
+  Add field: next_action: "reply YES if you filled, or NO to pass"
+
+Claude sees this field in the return value and MUST ask
+Not just in docstring — in the actual data returned
+
+PHASE B — Time Horizon Engine (Next Week)
+Goal: Right strategy for right timeframe
+B1 — Stock Recommendations (Day 3-4, 3h)
+get_stock_recommendation(ticker, horizon, budget)
+
+3 month:
+  Signal: momentum + earnings catalyst + sector rotation
+  Source: scanner top picks + portfolio
+  Output: stock entry, target (+15-25%), stop (-8%), catalyst date
+
+6 month:
+  Signal: institutional accumulation (30d dark pool trend)
+           + earnings growth trajectory
+           + sector leadership
+  Output: stock entry zone, target (+25-40%), quarterly checkpoints
+
+1 year:
+  Signal: fundamental thesis (revenue growth, margin expansion)
+           + valuation vs peers (P/E, P/S relative)
+           + moat assessment (LLM)
+  Output: stock entry zone, 12-month target, annual thesis
+
+New MCP tool: get_stock_recommendation(ticker, horizon)
+B2 — Options Time Horizon Expansion (Day 4, 2h)
+Current: defaults to 21-28 DTE for everything
+
+Add horizon-aware strategy selection:
+  1 day:   0DTE or 1DTE, momentum only, very high conviction required (>80)
+  1 week:  Weekly options, 5-7 DTE, breakout/breakdown plays
+  1 month: Monthly options, 21-35 DTE (current — keep this)
+  3 month: LEAPS-lite, 60-90 DTE, trend following
+
+Each horizon has different:
+  Min conviction score required
+  Strike selection logic (ATM vs further OTM)
+  Position sizing guidance
+  Stop loss calculation
+B3 — Portfolio Addition Signals (Day 4, 1h)
+"Should I add more to existing positions?"
+
+Check every active position:
+  IF P&L > +10% AND TA still bullish AND flow still bullish
+     AND not within 14 days of earnings
+  THEN: "NVDA +51% — thesis intact, adding here has good R/R"
+
+get_portfolio_additions() MCP tool
+Returns: which positions are worth adding to, why, how much
+
+PHASE C — Backtesting & Learning (Week 3)
+Goal: Prove the system works, make it smarter
+C1 — W17 Backtesting (Day 1-2, 4h)
+Two backtests:
+
+Backtest 1: "Cost of ignoring sell signals"
+  GLD: ignored exit at -17% → now -94% → saved $4,881 if acted
+  NOW: ignored exit at -29% → now -93% → saved $2,847 if acted
+  Summary: "Acting on all first sell signals would have saved $X"
+
+Backtest 2: "Signal quality validation"
+  Did AT_RESISTANCE entries outperform BETWEEN_LEVELS?
+  Did volume-confirmed picks win more?
+  Did high IV rank entries lose more?
+  Did conviction score ≥ 70 outperform < 70?
+
+Output: calibrated signal weights based on actual outcomes
+  "AT_RESISTANCE" has 73% accuracy → weight boosted from 25 to 30
+  "BETWEEN_LEVELS" has 41% accuracy → weight reduced from 25 to 15
+C2 — News Impact Learning (Day 3, 3h)
+Store news + outcome correlation:
+
+news_impact_log table:
+  headline, source, type (Fed/geo/sector/company)
+  tickers_affected, date_published
+  ticker_pnl_1d, ticker_pnl_5d, ticker_pnl_30d (filled in later)
+
+After 30+ samples per news type:
+  "Fed hawkish language → XLK avg -2.1% next 5 days (n=23)"
+  "Iran tensions → XLE avg +1.8% next 5 days (n=12)"
+
+Use these weights in real-time news impact scoring
+C3 — W18-20 Self-Learning Loop (Day 4, 3h)
+Auto-calibrate everything monthly:
+  Signal weights → updated based on win rates per signal
+  Conviction thresholds → adjusted based on tier performance
+  Stop loss levels → adjusted per sector based on volatility
+  Take profit targets → adjusted based on typical move size
+
+Auto-generate monthly learning report:
+  "Your win rate improved from 45% to 67% this month"
+  "DEBIT_PUT_SPREAD is your best strategy (74% win rate)"
+  "You still ignore stop losses on metals — GLD/SLV pattern"
+
+PHASE D — Consumer Experience (Week 4)
+Goal: Invite consumers who can actually use this
+D1 — Cloud Deployment (Day 1, 3h)
+Railway.app deployment:
+  MCP server → Railway (always on, ~$5/mo)
+  Postgres → Railway (already Docker, easy migrate)
+  Ollama → stays on JP's Mac (Metal GPU)
+             OR switch to claude-haiku-4-5 API (~$0.01/rec)
+
+After deployment:
+  ✅ Claude Mobile works from anywhere
+  ✅ Monitor fires Discord alerts 24/7
+  ✅ No caffeinate needed
+  ✅ Multiple users can connect simultaneously
+D2 — User Onboarding Flow (Day 2, 2h)
+When new invited user connects:
+  Step 1: "Connect your Webull account"
+           → broker_connections table
+  Step 2: "Set your risk profile"
+           → risk_tolerance, max_loss_per_trade, preferred_strategies
+  Step 3: "Set your investment goals"
+           → horizons they care about (day trade / swing / long term)
+  Step 4: "Sync your watchlist"
+           → import from Webull or build from scratch
+  Step 5: "Set up Discord alerts"
+           → configure_discord()
+
+MCP tool: onboard_user() — walks through steps
+D3 — W22-24 Dashboard (Day 3-5, 8h)
+Next.js web app:
+
+Page 1: Daily Recommendations
+  Today's thesis cards per ticker
+  Conviction meter (0-100)
+  Entry trigger status
+  "Fill this trade" button → calls confirm_execution()
+
+Page 2: Portfolio Dashboard
+  All positions with targets/stops
+  Active bets view (status: ON_TRACK/NEAR_STOP/TARGET_HIT)
+  P&L chart (requires portfolio_snapshots from W17)
+
+Page 3: Alerts Center
+  All alerts sorted by urgency
+  One-click dismiss
+  Discord notification history
+
+Page 4: Learning Report
+  Win rate trend
+  Best/worst strategies
+  Compliance rate (are you acting on signals?)
+  What the system learned this month
+
+Page 5: Watchlist + Scanner
+  Watchlist management
+  Today's scan results with re-eval scores
+  Add/remove tickers
+D4 — Multi-User Polish (Day 5, 2h)
+Each user has:
+  Own Webull connection
+  Own watchlist
+  Own risk profile
+  Own recommendations (based on their portfolio + watchlist)
+  Own Discord webhook
+  Own learning profile
+
+Invite system (already in DB):
+  JP invites user → email with invite code
+  User onboards → gets full platform access
+  JP sees aggregate stats (admin view)
+
+PHASE E — Advanced Intelligence (Month 2-3)
+Goal: Approach institutional quality
+E1 — Factor Model v1
+Score every watchlist ticker on 4 factors daily:
+  Momentum:     1m, 3m price return percentile vs universe
+  Quality:      earnings consistency, revenue growth rate
+  Options flow: institutional accumulation score (30d dark pool)
+  Technical:    trend strength, S/R proximity score
+
+Composite factor score → ranking → top decile = candidates for recommendation
+E2 — Signal Correlation Cleanup
+Some signals are redundant (correlated):
+  Volume + momentum often move together
+  TA bearish + dark pool sell often same signal
+
+Build correlation matrix from our outcome data
+Reduce redundant signals to avoid false conviction from correlated data
+E3 — Alpha Decay Measurement
+How long does each signal remain valid?
+  Momentum signal: test performance at 1d, 3d, 5d, 10d after signal
+  Flow signal: test performance at 1d, 3d, 5d, 10d
+  Find optimal holding period per signal type
+E4 — Portfolio-Level Risk
+Total Greeks across all options positions:
+  Net delta (market exposure)
+  Net gamma (acceleration risk)
+  Net vega (IV exposure)
+  Net theta (time decay per day)
+
+Alert when portfolio Greeks exceed risk limits
+"Your portfolio is net short delta — you're exposed to a market rally"
+
+Summary Timeline
+WeekPhaseDeliverableThis weekARecommendation stability, weighted scoring, thesis, stock recsNext weekBTime horizon engine, portfolio additions, backtestingWeek 3CNews impact learning, self-learning loopWeek 4DCloud deployment, dashboard, consumer onboardingMonth 2EFactor model, signal correlation, alpha decayMonth 3EPortfolio Greeks, institutional-grade output
+
+Consumer Launch Criteria
+Before inviting consumers the system needs:
+✅ Recommendation stability (no minute-to-minute flipping)
+✅ Conviction gating (don't show weak signals)
+✅ Thesis persistence (reason behind recommendation)
+✅ Cloud deployment (works on any device)
+✅ Dashboard (consumers need UI, not just Claude Desktop)
+✅ Onboarding flow (Webull + Discord + risk profile)
+✅ Backtesting proof (show the system works historically)
+✅ Error resilience (no crashes, graceful data gaps)
+❌ Not required at launch: ML model, factor model, alpha decay
+Realistically ready for beta consumers: end of Week 4

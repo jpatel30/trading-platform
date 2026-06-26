@@ -353,7 +353,7 @@ Respond with valid JSON ONLY — no text before or after the JSON.
 JSON format:
 {{
   "strategy": "DEBIT_PUT_SPREAD",
-  "expiry": "2026-07-10",
+  "expiry": "YYYY-MM-DD from AVAILABLE OPTION EXPIRIES list only",
   "legs": [
     {{"action": "BUY", "type": "PUT", "strike": 205.0}},
     {{"action": "SELL", "type": "PUT", "strike": 195.0}}
@@ -365,6 +365,10 @@ JSON format:
   "key_news": "1-2 global headlines that influenced this recommendation, or NONE",
   "regime_check": "PASS or FAIL with reason"
 }}
+
+CRITICAL EXPIRY RULE — YOU MUST FOLLOW:
+Use ONLY dates from the AVAILABLE OPTION EXPIRIES list above.
+Do NOT invent dates. Do NOT use example dates. Copy exactly from the list.
 
 CRITICAL STRIKE RULES — ALWAYS OTM/ATM ONLY:
 - DEBIT_PUT_SPREAD (bearish): BUY strike 0-3% below spot, SELL strike 5-10% below spot
@@ -827,6 +831,9 @@ def build_recommendation(
             "avg_iv":       f"{chain_iv:.1%}",
         })
 
+    # Build lookup set of valid expiries (for post-LLM validation)
+    valid_expiry_set = {exp for exp, _ in expiry_dtes}
+
     # ── Step 2: LLM decides strategy + strikes ────────────────────────────────
     # Fetch RAG context (historical price, earnings, macro, news)
     rag_context = ""
@@ -861,6 +868,16 @@ def build_recommendation(
             call_strikes, put_strikes, atr
         )
         llm_decision["expiry"] = exp
+
+    # ── Validate LLM expiry is within allowed DTE range ─────────────────────
+    if llm_decision and llm_decision.get("expiry"):
+        chosen_exp = llm_decision["expiry"]
+        if chosen_exp not in valid_expiry_set:
+            # LLM hallucinated an expiry outside our range — correct it
+            corrected_exp, corrected_dte = expiry_dtes[min(1, len(expiry_dtes)-1)]
+            print(f"[Strategy] LLM chose {chosen_exp} outside range — correcting to {corrected_exp} ({corrected_dte} DTE)")
+            llm_decision["expiry"] = corrected_exp
+            llm_decision["dte"]    = corrected_dte
 
     # ── Step 3: Python executes exact arithmetic with real UW prices ──────────
     try:

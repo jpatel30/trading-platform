@@ -77,8 +77,8 @@ STOCK_UPSIDE_TARGETS = {
 # S&P 500 large-cap supplement (top 30 by market cap — supplement watchlist)
 SP500_SUPPLEMENT = [
     "AAPL","MSFT","NVDA","AMZN","META","GOOGL","TSLA","BRK.B","AVGO","LLY",
-    "JPM","V","XOM","UNH","MA","JNJ","COST","HD","PG","ABBV",
-    "BAC","KO","NFLX","CRM","MRK","CVX","AMD","PEP","ADBE","WMT",
+    "JPM","V","XOM","UNH","MA","JNJ","COST","HD","PG","ABBV","BA","WDC","SNDK"
+    "BAC","KO","NFLX","CRM","MRK","CVX","AMD","PEP","ADBE","WMT","MU","DIS",
 ]
 
 
@@ -139,14 +139,29 @@ def get_options_for_horizon(
     ta        = get_technical_profile(ticker, bars) if bars else {}
     signal    = score_signal_package(get_signal_package(ticker))
 
+    # Pre-select best available expiry in the DTE range
+    from app.strategy.engine import _get_all_expiries
+    all_exp  = _get_all_expiries(ticker)
+    today_dt = datetime.now()
+    valid    = [
+        (exp, (datetime.strptime(exp, "%Y-%m-%d") - today_dt).days)
+        for exp in all_exp
+        if dte_min <= (datetime.strptime(exp, "%Y-%m-%d") - today_dt).days <= dte_max
+    ]
+    if not valid:
+        return {"error": f"No expiry found between {dte_min}-{dte_max} DTE for {ticker}"}
+    # Pick middle of range for better liquidity
+    best_exp, best_dte = sorted(valid, key=lambda x: abs(x[1] - (dte_min+dte_max)//2))[0]
+    print(f"[Horizon] {ticker} {horizon}: using expiry {best_exp} ({best_dte} DTE)")
+
     rec = build_recommendation(
-        ticker,
-        ta,
-        signal,
-        budget   = budget,
-        user_id  = user_id,
-        dte_min  = dte_min,
-        dte_max  = dte_max,
+        ticker      = ticker,
+        ta_profile  = ta,
+        flow_signal = signal,
+        budget      = budget,
+        user_id     = user_id,
+        min_dte     = best_dte - 1,
+        max_dte     = best_dte + 1,
     )
 
     if rec:

@@ -1,0 +1,523 @@
+"""
+Phase B — Horizon-Aware Recommendation Engine.
+
+Routes to options or stocks based on horizon.
+Applies appropriate DTE, strategy selection, and scoring per timeframe.
+
+Horizons:
+    1w  → options 5-7 DTE   (swing trade — high conviction only ≥75)
+    1m  → options 21-35 DTE (standard — conviction ≥70)
+    3m  → options 60-90 DTE OR stock with 3-month thesis (conviction ≥65)
+    6m  → stock primarily, LEAPS if available (conviction ≥60)
+    1yr → stock only, fundamental thesis (conviction ≥55)
+
+For 3m+: uses fundamental_score from fundamentals.py
+For 1w/1m: uses conviction_score from conviction.py (options focus)
+
+Pre-market: allowed, flagged as "next-day recommendation"
+"""
+from datetime import datetime, date, timedelta
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Horizon Configuration
+# ─────────────────────────────────────────────────────────────────────────────
+
+HORIZON_CONFIG = {
+    "1w":  {
+        "type":           "options",
+        "dte_min":        5,
+        "dte_max":        9,
+        "min_conviction": 75,   # higher bar for short-term
+        "stop_pct":       -8,
+        "label":          "1 Week",
+        "description":    "Short-term swing trade — options expiring this week or next",
+    },
+    "1m":  {
+        "type":           "options",
+        "dte_min":        21,
+        "dte_max":        35,
+        "min_conviction": 70,
+        "stop_pct":       -10,
+        "label":          "1 Month",
+        "description":    "Monthly options — standard recommendation timeframe",
+    },
+    "3m":  {
+        "type":           "both",   # options or stock
+        "dte_min":        60,
+        "dte_max":        90,
+        "min_conviction": 65,
+        "min_fundamental": 55,
+        "stop_pct":       -8,       # tighter for stocks
+        "label":          "3 Month",
+        "description":    "Quarterly — options LEAPS-lite or stock with catalyst",
+    },
+    "6m":  {
+        "type":           "stock",
+        "min_fundamental": 60,
+        "stop_pct":       -12,
+        "label":          "6 Month",
+        "description":    "Semi-annual stock pick — institutional accumulation focus",
+    },
+    "1yr": {
+        "type":           "stock",
+        "min_fundamental": 55,
+        "stop_pct":       -15,
+        "label":          "1 Year",
+        "description":    "Annual stock thesis — fundamental growth focus",
+    },
+}
+
+STOCK_UPSIDE_TARGETS = {
+    "3m":  0.20,   # +20% target for 3-month stock picks
+    "6m":  0.35,   # +35% target for 6-month
+    "1yr": 0.50,   # +50% target for 1-year (or analyst mean, whichever higher)
+}
+
+# S&P 500 large-cap supplement (top 30 by market cap — supplement watchlist)
+SP500_SUPPLEMENT = [
+    "AAPL","MSFT","NVDA","AMZN","META","GOOGL","TSLA","BRK.B","AVGO","LLY",
+    "JPM","V","XOM","UNH","MA","JNJ","COST","HD","PG","ABBV",
+    "BAC","KO","NFLX","CRM","MRK","CVX","AMD","PEP","ADBE","WMT",
+]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stock Universe (watchlist + portfolio + S&P supplement)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_stock_universe(user_id: str) -> list[str]:
+    """Watchlist + portfolio positions + S&P 500 top 30."""
+    tickers = set()
+
+    try:
+        from app.broker.watchlist_sync import get_db_watchlist
+        tickers.update(get_db_watchlist(user_id))
+    except Exception:
+        pass
+
+    try:
+        from app.broker.webull_connector import WebullConnector
+        positions = WebullConnector(user_id).get_positions()
+        tickers.update(p["symbol"] for p in positions)
+    except Exception:
+        pass
+
+    # Add S&P 500 supplement
+    tickers.update(SP500_SUPPLEMENT)
+
+    return list(tickers)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Options Horizon Recommendation
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_options_for_horizon(
+    ticker: str,
+    horizon: str,
+    budget: float,
+    user_id: str | None = None,
+) -> dict:
+    """
+    Build options recommendation for 1w / 1m / 3m horizon.
+    Uses existing strategy engine with horizon-aware DTE selection.
+    """
+    from app.strategy.engine import build_recommendation
+    from app.options_flow.unusual_whales import get_signal_package
+    from app.options_flow.signals import score_signal_package
+    from app.market_data.polygon_client import get_bars
+    from app.technical_analysis.engine import get_technical_profile
+
+    config    = HORIZON_CONFIG.get(horizon, HORIZON_CONFIG["1m"])
+    dte_min   = config["dte_min"]
+    dte_max   = config["dte_max"]
+
+    from_date = (datetime.now()-timedelta(days=300)).strftime('%Y-%m-%d')
+    to_date   = datetime.now().strftime('%Y-%m-%d')
+    bars      = get_bars(ticker, 1, 'day', from_date, to_date)
+    ta        = get_technical_profile(ticker, bars) if bars else {}
+    signal    = score_signal_package(get_signal_package(ticker))
+
+    rec = build_recommendation(
+        ticker,
+        ta,
+        signal,
+        budget   = budget,
+        user_id  = user_id,
+        dte_min  = dte_min,
+        dte_max  = dte_max,
+    )
+
+    if rec:
+        rec["horizon"]      = horizon
+        rec["horizon_label"] = config["label"]
+        rec["rec_type"]     = "options"
+    return rec
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stock Horizon Recommendation
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_stock_for_horizon(
+    ticker: str,
+    horizon: str,
+    budget: float,
+    current_price: float | None = None,
+) -> dict:
+    """
+    Build stock recommendation for 3m / 6m / 1yr horizon.
+    Uses fundamentals + dark pool accumulation + momentum.
+    """
+    from app.recommendations.fundamentals import (
+        get_fundamentals, get_dp_accumulation_score, score_fundamentals
+    )
+
+    config = HORIZON_CONFIG.get(horizon, HORIZON_CONFIG["6m"])
+
+    # Get live price
+    if not current_price:
+        try:
+            import yfinance as yf
+            current_price = yf.Ticker(ticker).fast_info.last_price
+        except Exception:
+            current_price = 0
+
+    if not current_price:
+        return {"error": "Could not get current price"}
+
+    # Fundamentals
+    fundamentals = get_fundamentals(ticker)
+    dp           = get_dp_accumulation_score(ticker)
+    fund_score   = score_fundamentals(fundamentals, dp, current_price)
+
+    # Check minimum fundamental score
+    min_fund = config.get("min_fundamental", 55)
+    if fund_score["fundamental_score"] < min_fund:
+        return {
+            "filtered": True,
+            "reason":   f"Fundamental score {fund_score['fundamental_score']}/100 below {min_fund} threshold",
+            "ticker":   ticker,
+            "horizon":  horizon,
+        }
+
+    # Momentum (price return for the horizon period)
+    momentum = _get_momentum(ticker, horizon)
+
+    # Target price
+    analyst_target = fundamentals.get("target_mean_price")
+    momentum_target = current_price * (1 + STOCK_UPSIDE_TARGETS.get(horizon, 0.25))
+
+    # Use higher of analyst mean or momentum target
+    if analyst_target and analyst_target > current_price:
+        target_price = max(analyst_target, momentum_target)
+        target_source = "analyst + momentum"
+    else:
+        target_price = momentum_target
+        target_source = "momentum"
+
+    target_pct = round((target_price - current_price) / current_price * 100, 1)
+
+    # Stop loss
+    stop_pct   = config["stop_pct"]
+    stop_price = round(current_price * (1 + stop_pct / 100), 2)
+
+    # Position size (shares)
+    shares = int(budget / current_price)
+    if shares < 1:
+        shares = 1
+    total_cost = round(shares * current_price, 2)
+
+    # Thesis
+    thesis = _generate_stock_thesis(
+        ticker, horizon, config, fundamentals, dp, fund_score,
+        current_price, target_price, target_pct, momentum
+    )
+
+    return {
+        "ticker":            ticker,
+        "horizon":           horizon,
+        "horizon_label":     config["label"],
+        "rec_type":          "stock",
+        "direction":         "BULLISH",
+
+        # Fundamental data
+        "fundamental_score": fund_score["fundamental_score"],
+        "fundamental_breakdown": fund_score["breakdown"],
+        "dp_score":          dp["score"],
+        "dp_note":           dp["note"],
+        "analyst_target":    analyst_target,
+        "analyst_rec":       fundamentals.get("analyst_recommendation"),
+        "analyst_count":     fundamentals.get("analyst_count"),
+        "revenue_growth":    fundamentals.get("revenue_growth"),
+        "peg_ratio":         fundamentals.get("peg_ratio"),
+        "profit_margins":    fundamentals.get("profit_margins"),
+
+        # Trade levels
+        "current_price":     current_price,
+        "entry_price":       current_price,
+        "target_price":      round(target_price, 2),
+        "target_pct":        target_pct,
+        "target_source":     target_source,
+        "stop_price":        stop_price,
+        "stop_pct":          stop_pct,
+
+        # Position
+        "shares":            shares,
+        "total_cost":        total_cost,
+        "potential_gain":    round((target_price - current_price) * shares, 2),
+        "potential_loss":    round((stop_price - current_price) * shares, 2),
+        "risk_reward":       round(abs(target_pct / stop_pct), 2),
+
+        # Thesis
+        "thesis":             thesis,
+        "momentum_score":     momentum.get("score", 50),
+        "momentum_note":      momentum.get("note", ""),
+        "invalidation_conditions": (
+            f"{ticker} closes below ${stop_price} ({stop_pct}% stop) | "
+            f"Analyst consensus downgrades to HOLD/SELL | "
+            f"Revenue growth decelerates below 15%"
+        ),
+    }
+
+
+def _get_momentum(ticker: str, horizon: str) -> dict:
+    """Price momentum score for the given horizon lookback."""
+    try:
+        import yfinance as yf
+        lookback = {"3m": "3mo", "6m": "6mo", "1yr": "1y"}.get(horizon, "3mo")
+        hist     = yf.Ticker(ticker).history(period=lookback)
+        if hist.empty:
+            return {"score": 50, "note": "No price history"}
+
+        start_price = hist["Close"].iloc[0]
+        end_price   = hist["Close"].iloc[-1]
+        ret_pct     = (end_price - start_price) / start_price * 100
+
+        if ret_pct >= 30:
+            score, note = 90, f"Strong uptrend +{ret_pct:.1f}% over {lookback}"
+        elif ret_pct >= 15:
+            score, note = 70, f"Positive momentum +{ret_pct:.1f}% over {lookback}"
+        elif ret_pct >= 5:
+            score, note = 55, f"Moderate gain +{ret_pct:.1f}% over {lookback}"
+        elif ret_pct >= -5:
+            score, note = 45, f"Flat {ret_pct:.1f}% over {lookback}"
+        elif ret_pct >= -15:
+            score, note = 35, f"Weak -{abs(ret_pct):.1f}% over {lookback} — check thesis"
+        else:
+            score, note = 20, f"Downtrend -{abs(ret_pct):.1f}% over {lookback} — caution"
+
+        return {"score": score, "return_pct": round(ret_pct, 1), "note": note}
+    except Exception:
+        return {"score": 50, "note": "Momentum data unavailable"}
+
+
+def _generate_stock_thesis(
+    ticker: str, horizon: str, config: dict,
+    fundamentals: dict, dp: dict, fund_score: dict,
+    current_price: float, target_price: float, target_pct: float,
+    momentum: dict,
+) -> str:
+    """Generate plain-English stock thesis."""
+    rev_g   = fundamentals.get("revenue_growth", 0) or 0
+    peg     = fundamentals.get("peg_ratio")
+    margins = fundamentals.get("profit_margins", 0) or 0
+    analyst = fundamentals.get("analyst_recommendation", "N/A")
+    n_analysts = fundamentals.get("analyst_count", 0)
+
+    parts = [
+        f"{ticker} {config['label']} thesis ({config['description']}).",
+        f"Analyst consensus: {analyst} across {n_analysts} analysts — "
+        f"mean target ${target_price:.0f} ({target_pct:+.1f}% upside).",
+    ]
+
+    if rev_g > 0:
+        parts.append(f"Revenue growing {rev_g*100:.0f}% YoY.")
+    if peg and peg < 1.5:
+        parts.append(f"PEG {peg:.2f} — trading cheaply relative to growth.")
+    if margins > 0:
+        parts.append(f"Strong margins at {margins*100:.0f}%.")
+    if dp.get("score", 50) >= 60:
+        parts.append(f"Dark pool shows institutional accumulation ({dp['note']}).")
+
+    parts.append(
+        f"Momentum: {momentum.get('note', 'N/A')}. "
+        f"Entry near ${current_price:.2f}, target ${target_price:.2f}, "
+        f"stop ${current_price * (1 + config['stop_pct']/100):.2f} ({config['stop_pct']}%)."
+    )
+
+    return " ".join(parts)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Unified Entry Point
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_horizon_recommendation(
+    ticker: str,
+    horizon: str,
+    budget:  float = 2000,
+    user_id: str | None = None,
+) -> dict:
+    """
+    Main entry point — routes to options or stock based on horizon.
+
+    For 3m: returns BOTH options and stock recommendation, lets LLM/user choose.
+    For 6m/1yr: stock only.
+    For 1w/1m: options only.
+
+    Pre-market: allowed, flags "next_day" if market closed.
+    """
+    config = HORIZON_CONFIG.get(horizon)
+    if not config:
+        return {"error": f"Unknown horizon '{horizon}'. Valid: {list(HORIZON_CONFIG.keys())}"}
+
+    # Market status check
+    market_open  = _is_market_open()
+    next_day_flag = not market_open
+
+    result = {
+        "ticker":      ticker,
+        "horizon":     horizon,
+        "label":       config["label"],
+        "description": config["description"],
+        "market_open": market_open,
+        "next_day":    next_day_flag,
+    }
+
+    if next_day_flag:
+        result["market_note"] = (
+            "Market is closed — this recommendation is for next trading session. "
+            "Verify price and entry trigger before executing."
+        )
+
+    rec_type = config["type"]
+
+    if rec_type == "options":
+        rec = get_options_for_horizon(ticker, horizon, budget, user_id)
+        result["options_rec"] = rec
+        result["primary_rec"] = "options"
+
+    elif rec_type == "stock":
+        rec = get_stock_for_horizon(ticker, horizon, budget)
+        result["stock_rec"] = rec
+        result["primary_rec"] = "stock"
+
+    elif rec_type == "both":
+        # 3m: return both, let user decide based on conviction
+        options_rec = get_options_for_horizon(ticker, horizon, budget, user_id)
+        stock_rec   = get_stock_for_horizon(ticker, horizon, budget)
+        result["options_rec"] = options_rec
+        result["stock_rec"]   = stock_rec
+
+        # Suggest primary based on which has higher conviction
+        options_conf = options_rec.get("confidence", 0) if options_rec else 0
+        stock_fund   = stock_rec.get("fundamental_score", 0) if stock_rec else 0
+
+        if options_conf >= 65 and stock_fund >= 60:
+            result["primary_rec"]    = "both"
+            result["primary_note"]   = "Both options and stock look strong — options for short profit, stock for compounding"
+        elif options_conf >= 65:
+            result["primary_rec"]    = "options"
+        else:
+            result["primary_rec"]    = "stock"
+
+    return result
+
+
+def scan_for_horizon(
+    horizon: str,
+    budget:  float = 2000,
+    top_n:   int   = 5,
+    user_id: str | None = None,
+) -> dict:
+    """
+    Scan watchlist + portfolio + S&P supplement for horizon recommendations.
+    Returns top N picks filtered by appropriate conviction threshold.
+    """
+    import time
+    from app.recommendations.conviction import MIN_CONVICTION_TO_SURFACE
+
+    config     = HORIZON_CONFIG.get(horizon, HORIZON_CONFIG["1m"])
+    rec_type   = config["type"]
+    t0         = time.time()
+
+    if user_id:
+        tickers = get_stock_universe(user_id)
+    else:
+        tickers = SP500_SUPPLEMENT[:20]   # fallback
+
+    print(f"[HorizonScan] {horizon} — scanning {len(tickers)} tickers...")
+
+    results  = []
+    filtered = []
+
+    for ticker in tickers:
+        try:
+            rec = get_horizon_recommendation(ticker, horizon, budget, user_id)
+
+            # Score check
+            if rec_type in ("options", "both"):
+                options_rec = rec.get("options_rec", {})
+                conf = options_rec.get("confidence", 0) if options_rec else 0
+                min_conf = config["min_conviction"]
+                if conf < min_conf:
+                    filtered.append({
+                        "ticker": ticker,
+                        "reason": f"Options confidence {conf} < {min_conf}"
+                    })
+                    continue
+
+            if rec_type in ("stock", "both"):
+                stock_rec  = rec.get("stock_rec", {})
+                if stock_rec and stock_rec.get("filtered"):
+                    filtered.append({
+                        "ticker": ticker,
+                        "reason": stock_rec.get("reason", "Below threshold")
+                    })
+                    if rec_type == "stock":
+                        continue
+
+            results.append(rec)
+
+        except Exception as e:
+            print(f"[HorizonScan] {ticker} failed: {e}")
+            continue
+
+    # Sort: options by confidence desc, stocks by fundamental_score desc
+    def sort_key(r):
+        if rec_type == "stock":
+            return r.get("stock_rec", {}).get("fundamental_score", 0) if r.get("stock_rec") else 0
+        else:
+            return r.get("options_rec", {}).get("confidence", 0) if r.get("options_rec") else 0
+
+    results.sort(key=sort_key, reverse=True)
+
+    elapsed = round(time.time()-t0, 1)
+    print(f"[HorizonScan] Done in {elapsed}s — {len(results)} passed, {len(filtered)} filtered")
+
+    return {
+        "horizon":       horizon,
+        "label":         config["label"],
+        "recommendations": results[:top_n],
+        "filtered_count":  len(filtered),
+        "total_scanned":   len(tickers),
+        "elapsed":         elapsed,
+        "date":            date.today().isoformat(),
+    }
+
+
+def _is_market_open() -> bool:
+    """Check if US market is currently open."""
+    try:
+        import pytz
+        from datetime import time as dtime
+        et  = pytz.timezone("America/New_York")
+        now = datetime.now(et)
+        if now.weekday() >= 5:
+            return False
+        t = now.time()
+        return dtime(9, 30) <= t <= dtime(16, 0)
+    except Exception:
+        return True   # assume open if can't check

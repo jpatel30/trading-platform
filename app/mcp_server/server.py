@@ -211,7 +211,7 @@ def analyze_ticker(ticker: str, days: int = 300) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# OPTIONS FLOW (W7)
+# OPTIONS FLOW (W7) & STOCK
 # ─────────────────────────────────────────────────────────────────────────────
 
 @mcp.tool()
@@ -341,6 +341,80 @@ def get_congress_trades(ticker: str | None = None) -> list[dict]:
     """Congressional stock trades. ticker=None for all recent trades."""
     from app.options_flow.unusual_whales import get_congress_trades as _get
     return _get(ticker=ticker)
+
+
+@mcp.tool()
+def get_horizon_recommendation(ticker: str, horizon: str = "1m", budget: float = 2000) -> dict:
+    """
+    Unified recommendation for any horizon — options or stock based on timeframe.
+
+    Horizons and what they return:
+        1w  → options 5-7 DTE  (weekly swing)
+        1m  → options 21-35 DTE (monthly — standard)
+        3m  → options 60-90 DTE AND/OR stock thesis
+        6m  → stock primary recommendation
+        1yr → stock fundamental thesis
+
+    Call when user says:
+    - "Give me a 1-week trade on SPY"
+    - "What's the 3-month play on GOOGL?"
+    - "Best 6-month stock pick from my watchlist"
+    - "Give me options for next week on NVDA"
+
+    Pre-market: returns next-day recommendation, flags market closed.
+
+    Args:
+        ticker:  symbol e.g. 'NVDA'
+        horizon: '1w' / '1m' / '3m' / '6m' / '1yr'
+        budget:  amount in dollars
+    """
+    from app.recommendations.horizon_engine import get_horizon_recommendation as _hr
+    return _hr(ticker, horizon, budget, user_id=get_current_user_id())
+
+
+@mcp.tool()
+def scan_for_horizon(horizon: str = "1m", budget: float = 2000, top_n: int = 5) -> dict:
+    """
+    Scan full universe for best picks at a given horizon.
+    Watchlist + portfolio + S&P 500 top 30 — filtered by conviction threshold.
+
+    Call when user says:
+    - "Find me the best 6-month stocks to buy"
+    - "Scan for weekly options plays"
+    - "What are the top 3-month opportunities?"
+    - "Give me your best stock picks for next year"
+
+    Args:
+        horizon: '1w' / '1m' / '3m' / '6m' / '1yr'
+        budget:  per-position budget in dollars
+        top_n:   number of results to return (default 5)
+    """
+    from app.recommendations.horizon_engine import scan_for_horizon as _scan
+    return _scan(horizon, budget, top_n, user_id=get_current_user_id())
+
+
+@mcp.tool()
+def get_portfolio_additions() -> dict:
+    """
+    Find positions in your portfolio worth adding more to.
+
+    Checks all positions where P&L > 20% and verifies:
+    - TA still bullish (not reversing)
+    - Dark pool still accumulating
+    - Earnings not within 14 days
+    - Not dangerously overextended
+
+    Returns candidates with score + suggested addition size.
+
+    Call when user says:
+    - "Should I add more to any positions?"
+    - "Which of my winners should I add to?"
+    - "Is NVDA worth buying more of?"
+    - "Portfolio additions"
+    """
+    from app.recommendations.portfolio_additions import get_portfolio_additions as _pa
+    return _pa(user_id=get_current_user_id())
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -476,6 +550,32 @@ def get_strategy_recommendation(
         min_dte       = min_dte,
         max_dte       = max_dte,
     )
+
+@mcp.tool()
+def get_stock_recommendation(ticker: str, horizon: str = "6m", budget: float = 2000) -> dict:
+    """
+    Stock recommendation for medium/long-term horizons.
+    Uses analyst targets + fundamentals + dark pool accumulation.
+
+    Horizons:
+        3m  → 3-month stock pick with catalyst
+        6m  → 6-month institutional accumulation thesis
+        1yr → 1-year fundamental growth thesis
+
+    Call when user says:
+    - "Give me a 6-month stock pick for NVDA"
+    - "What stocks should I hold for a year?"
+    - "Long-term recommendation for AAPL"
+
+    Args:
+        ticker:  stock symbol e.g. 'NVDA'
+        horizon: '3m' / '6m' / '1yr'
+        budget:  amount to invest in dollars
+    """
+    from app.recommendations.horizon_engine import get_stock_for_horizon
+    import yfinance as yf
+    price = yf.Ticker(ticker).fast_info.last_price
+    return get_stock_for_horizon(ticker, horizon, budget, current_price=price)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

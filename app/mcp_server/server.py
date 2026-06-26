@@ -577,6 +577,21 @@ def get_stock_recommendation(ticker: str, horizon: str = "6m", budget: float = 2
     price = yf.Ticker(ticker).fast_info.last_price
     return get_stock_for_horizon(ticker, horizon, budget, current_price=price)
 
+@mcp.tool()
+def run_backtest() -> dict:
+    """
+    Run all three backtests and show results:
+    1. Cost of ignoring sell signals (ACTIVE — uses your data now)
+    2. Entry quality: did AT_RESISTANCE beat BETWEEN_LEVELS? (needs 5+ trades)
+    3. Conviction gate: did score ≥70 beat <70? (needs 10+ trades)
+
+    Call when user asks:
+    - "How much have I lost by ignoring your sell signals?"
+    - "Run the backtest"
+    - "Show me what would have happened if I acted on your signals"
+    """
+    from app.recommendations.backtester import run_full_backtest
+    return run_full_backtest(get_current_user_id())
 
 # ─────────────────────────────────────────────────────────────────────────────
 # WATCHLIST & SCANNER (W10, W11)
@@ -891,6 +906,35 @@ def get_notification_config() -> dict:
     """Show current notification settings — which channels configured, routing rules."""
     from app.notifications.discord import get_config
     return get_config(get_current_user_id())
+
+@mcp.tool()
+def get_nightly_learning_report() -> dict:
+    """
+    Latest nightly learning summary — what the system learned last night.
+    Shows: sell signal accuracy, conviction weight updates, backtest highlights.
+    """
+    try:
+        from sqlalchemy import text
+        from app.db.session import get_session
+        with get_session() as s:
+            row = s.execute(text("""
+                SELECT ran_at, sell_outcomes_updated,
+                       backtest_summary, learning_summary, weights_recalibrated
+                FROM learning_log
+                WHERE user_id = :uid
+                ORDER BY ran_at DESC LIMIT 1
+            """), {"uid": get_current_user_id()}).fetchone()
+        if not row:
+            return {"message": "No nightly learning runs yet. Runs automatically after market close."}
+        return {
+            "last_ran":              row.ran_at.isoformat(),
+            "sell_outcomes_updated": row.sell_outcomes_updated,
+            "backtest_summary":      row.backtest_summary,
+            "learning_summary":      row.learning_summary,
+            "weights_recalibrated":  row.weights_recalibrated,
+        }
+    except Exception as e:
+        return {"error": str(e)}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PREDICTION TRACKER (W15)

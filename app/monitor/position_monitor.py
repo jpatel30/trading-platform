@@ -603,6 +603,15 @@ class PositionMonitor:
         except Exception as e:
             print(f"[Monitor] Invalidation check failed: {e}")
 
+        # Nightly learning loop — runs after market close once per day
+        try:
+            from app.learning.nightly_loop import run_nightly_loop
+            nightly = run_nightly_loop(self.user_id, positions)
+            if nightly.get("ran"):
+                print(f"[Monitor] Nightly learning completed")
+        except Exception as e:
+            print(f"[Monitor] Nightly loop failed: {e}")
+
         return alerts_fired
 
     def _classify_rule(

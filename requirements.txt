@@ -33,4 +33,11 @@ yfinance>=0.2.40        # Free fallback for basic quotes
 # Dev tools
 pytest>=8.0
 pytest-asyncio>=0.23
-black>=24.0
+black>=24.0fastapi>=0.110.0
+uvicorn>=0.27.0
+python-jose[cryptography]>=3.3.0
+python-multipart>=0.0.9
+fastapi>=0.110.0
+uvicorn>=0.27.0
+python-jose[cryptography]>=3.3.0
+python-multipart>=0.0.9

@@ -141,43 +141,43 @@ async def login_with_invite(req: InviteLoginRequest):
             if not invite:
                 raise HTTPException(status_code=400, detail="Invalid or expired invite code")
 
-            # Check if user already exists for this invite
+            # Check if user already exists by email first
+            invite_email = invite.email or f"{req.invite_code.lower()}@stockbros.app"
             existing = s.execute(text("""
                 SELECT id, display_name, email FROM users
-                WHERE invited_by = :invited_by
-                LIMIT 1
-            """), {"invited_by": invite.invited_by}).fetchone()
+                WHERE email = :email OR invited_by = :invited_by
+                ORDER BY created_at LIMIT 1
+            """), {"email": invite_email, "invited_by": invite.invited_by}).fetchone()
 
             if existing:
+                # User already exists — just log them in
                 user_id      = str(existing.id)
                 display_name = existing.display_name
                 email        = existing.email
             else:
-                # Create new user
+                # New user — create account
                 display_name = req.display_name or f"Trader_{req.invite_code[:6]}"
-                # Use invite email — users.email is NOT NULL
-                user_email = invite.email or f"{req.invite_code.lower()}@stockbros.app"
                 row = s.execute(text("""
                     INSERT INTO users (display_name, email, invited_by, is_active)
                     VALUES (:name, :email, :invited_by, TRUE)
                     RETURNING id, display_name
-                """), {"name": display_name, "email": user_email,
+                """), {"name": display_name, "email": invite_email,
                        "invited_by": invite.invited_by}).fetchone()
                 user_id = str(row.id)
-                email   = user_email
+                email   = invite_email
 
-                # Create default user_profile
+                # Default profile
                 s.execute(text("""
                     INSERT INTO user_profiles (user_id, risk_tolerance)
                     VALUES (:uid, 'moderate')
                     ON CONFLICT DO NOTHING
                 """), {"uid": user_id})
 
-                # Mark invite as accepted
-                s.execute(text("""
-                    UPDATE invites SET status='accepted', accepted_at=now()
-                    WHERE id = :id
-                """), {"id": invite.id})
+            # Mark invite accepted
+            s.execute(text("""
+                UPDATE invites SET status='accepted', accepted_at=now()
+                WHERE id = :id
+            """), {"id": invite.id})
 
         token = create_token(user_id, email or "")
         return LoginResponse(
@@ -296,6 +296,8 @@ async def get_portfolio(
             "source":    "live",
         }
     except Exception as e:
+        import traceback
+        print(f"[Portfolio API Error] {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

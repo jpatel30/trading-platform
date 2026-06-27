@@ -100,19 +100,26 @@ def score_options_flow(signal_data: dict, direction: str) -> tuple[float, str]:
     if flow_score == 0 and dp_score == 0:
         return 0.5, "No live flow data (weekend/holiday) — neutral"
     combined = (flow_score + dp_score) / 2
+
+    # HARD BLOCK: strong flow directly contradicting direction
+    # e.g. BULLISH flow ≥70 + BEARISH direction = do not surface
+    if direction == "BEARISH" and combined >= 70:
+        return 0.0, f"HARD BLOCK: Flow strongly BULLISH ({combined:.0f}) contradicts bearish direction — skip this pick"
+    if direction == "BULLISH" and combined <= 30:
+        return 0.0, f"HARD BLOCK: Flow strongly BEARISH ({100-combined:.0f}) contradicts bullish direction — skip this pick"
+
     if direction == "BEARISH":
-        # High put flow = confirms bearish
-        if combined >= 70:
+        if combined <= 35:
             return 1.0, f"Strong bearish flow confirmed: dp={dp_score} flow={flow_score}"
-        if combined >= 50:
+        if combined <= 50:
             return 0.7, f"Moderate bearish flow: dp={dp_score} flow={flow_score}"
-        return 0.3, f"Weak/contradicting flow: dp={dp_score} flow={flow_score}"
+        return 0.3, f"Weak flow alignment: dp={dp_score} flow={flow_score}"
     else:
-        if combined >= 70:
+        if combined >= 65:
             return 1.0, f"Strong bullish flow confirmed: dp={dp_score} flow={flow_score}"
         if combined >= 50:
             return 0.7, f"Moderate bullish flow: dp={dp_score} flow={flow_score}"
-        return 0.3, f"Weak/contradicting flow: dp={dp_score} flow={flow_score}"
+        return 0.3, f"Weak flow alignment: dp={dp_score} flow={flow_score}"
 
 
 def score_vix(vix_ctx: dict, direction: str) -> tuple[float, str]:

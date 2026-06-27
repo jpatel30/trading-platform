@@ -417,14 +417,38 @@ def run_daily_recommendations(
 
     print(f"[DailyRec] Running daily recommendations for user {user_id[:8]}...")
 
-    # Step 1: Scanner top picks (more than we need — we'll filter)
-    tickers   = get_scan_universe(user_id=user_id)
-    picks     = quick_scan(tickers, user_id=user_id, top_n=15)  # get 15 to filter down
+    # Step 1: Get universe — exclude portfolio positions from BUY candidates
+    # (don't recommend buying what user already owns as a new entry)
+    tickers = get_scan_universe(user_id=user_id)
 
-    if not picks:
+    # Remove tickers already in portfolio
+    try:
+        from app.broker.webull_connector import WebullConnector
+        positions     = WebullConnector(user_id).get_positions()
+        portfolio_syms = {p["symbol"] for p in positions}
+        tickers_filtered = [t for t in tickers if t not in portfolio_syms]
+        removed = len(tickers) - len(tickers_filtered)
+        if removed > 0:
+            print(f"[DailyRec] Removed {removed} portfolio tickers from buy universe")
+        tickers = tickers_filtered
+    except Exception as e:
+        print(f"[DailyRec] Portfolio filter failed: {e} — using full universe")
+
+    # Remove market proxies unless specific catalyst
+    MARKET_PROXIES = {"SPY","QQQ","IWM","DIA","VXX","UVXY","SQQQ","TQQQ","SPXU"}
+    tickers = [t for t in tickers if t not in MARKET_PROXIES]
+
+    picks = quick_scan(tickers, user_id=user_id, top_n=15)
+
+    # Bug 3: No-signal day — never force a recommendation
+    if not picks or len(picks) < 3:
         return {
             "recommendations": [],
-            "message":         "No converging signals found today.",
+            "message":         (
+                "Scanner returned fewer than 3 signals today — "
+                "insufficient conviction to recommend. "
+                "Wait for better market conditions (typically Monday AM)."
+            ),
             "elapsed":         round(time.time()-t0, 1),
         }
 

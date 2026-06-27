@@ -526,6 +526,10 @@ def get_strategy_recommendation(
 
     ⚠️ Educational analysis only. Not financial advice.
 
+    ROUTING NOTE: Use this for single-ticker deep dive ONLY.
+    For daily picks with conviction gate + portfolio filter,
+    call get_daily_recommendations() instead.
+
     CRITICAL: After showing this recommendation, ALWAYS end with:
     "Did you execute this trade? Reply YES with the price you paid per
     contract and number of contracts, and I will log it and start
@@ -679,6 +683,9 @@ def get_scan_universe(
 @mcp.tool()
 def scan_watchlist(top_n: int = 5) -> dict:
     """
+    ROUTING NOTE: This returns raw scanner picks WITHOUT conviction gate
+    or portfolio filter. For filtered daily recommendations use
+    get_daily_recommendations() which applies the full quality pipeline.
     DAILY SCAN — Two-Tier Convergence Scanner on full 126-ticker watchlist.
 
     Tier 1 (~30s): Scores ALL 126 tickers on price momentum + options flow

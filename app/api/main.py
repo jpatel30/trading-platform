@@ -405,7 +405,10 @@ async def get_active_bets_api(user_id: str = Depends(get_current_user)):
 @app.get("/api/recommendations/daily", tags=["Recommendations"])
 async def get_daily_recs(
     force_refresh: bool = False,
-    budget: float = 2000.0,
+    budget:   float = 2000.0,
+    sector:   str | None = None,
+    cap_size: str | None = None,
+    catalyst: str | None = None,
     user_id: str = Depends(get_current_user)
 ):
     try:
@@ -430,23 +433,27 @@ async def get_daily_recs(
             }
         # User clicked Scan — use smart engine for best results
         try:
-            from app.recommendations.smart_engine import run_smart_recommendations
+            from app.recommendations.rescan_engine import rescan_with_validation
             from app.scanner.quick_scan import quick_scan
             from app.scanner.universe import get_scan_universe
-            picks  = quick_scan(get_scan_universe(user_id=user_id), user_id=user_id, top_n=15)
-            result = run_smart_recommendations(user_id, budget=budget, pre_scanned=picks)
-            # Format options as daily_recommendations format for dashboard
-            recs = []
-            for r in result.get("options", []):
-                recs.append({**r, "rec_type": "options",
-                             "ticker": r.get("ticker",""),
-                             "conviction_score": r.get("confidence",65),
-                             "conviction_tier": "HIGH" if r.get("confidence",0)>=75 else "MODERATE"})
+
+            # Use filtered universe if criteria provided, else full watchlist
+            if sector and cap_size:
+                picks = None  # rescan_with_validation handles it
+            else:
+                picks = quick_scan(get_scan_universe(user_id=user_id), user_id=user_id, top_n=15)
+
+            result = rescan_with_validation(
+                user_id=user_id, budget=budget,
+                pre_scanned=picks,
+                sector=sector, cap_size=cap_size, catalyst=catalyst,
+            )
+            recs = result.get("picks", [])
             return {
                 "recommendations": recs,
                 "stocks":          result.get("stocks", []),
                 "market_view":     result.get("market_view",""),
-                "source":          "smart_engine",
+                "source":          result.get("source","rescan"),
                 "count":           len(recs),
             }
         except Exception as e:

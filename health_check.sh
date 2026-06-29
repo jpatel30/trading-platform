@@ -55,7 +55,10 @@ try:
     from datetime import datetime, timedelta
     t0   = time.time()
     data = get_grouped_daily((datetime.now()-timedelta(days=1)).strftime("%Y-%m-%d"))
-    print(f"  {'✅' if len(data or [])>100 else '⚠️ '} Polygon   — {len(data or [])} tickers | {time.time()-t0:.2f}s")
+    ct = len(data or [])
+    label = '✅' if ct > 100 else '⚠️ '
+    note  = 'market closed (weekend/holiday)' if ct == 0 else f'{ct} tickers'
+    print(f'  {label} Polygon   — {note} | {time.time()-t0:.2f}s')
 except Exception as e:
     print(f"  ❌ Polygon   — {e}"); errors.append("polygon")
 

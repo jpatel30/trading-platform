@@ -240,6 +240,51 @@ async def health():
     }
 
 
+@app.get("/api/market/quote", tags=["Market"])
+async def get_quote_detail(ticker: str, user_id: str = Depends(get_current_user)):
+    try:
+        from app.options_flow.unusual_whales import get_stock_state
+        s = get_stock_state(ticker.upper())
+        return s or {}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/market/ticker-signal", tags=["Market"])
+async def get_ticker_signal_detail(ticker: str, user_id: str = Depends(get_current_user)):
+    try:
+        from app.options_flow.unusual_whales import (
+            get_flow_alerts, get_dark_pool_ticker, get_iv_rank
+        )
+        ticker = ticker.upper()
+        flow   = get_flow_alerts(ticker=ticker, limit=20) or []
+        dp     = get_dark_pool_ticker(ticker, limit=20)   or []
+        iv     = get_iv_rank(ticker)
+
+        bull = sum(1 for a in flow if a.get("sentiment") in ("BULLISH","CALL"))
+        bear = sum(1 for a in flow if a.get("sentiment") in ("BEARISH","PUT"))
+        tot  = bull + bear
+        dp_buy  = sum(1 for d in dp if d.get("side") in ("BUY","A"))
+        dp_sell = sum(1 for d in dp if d.get("side") in ("SELL","B"))
+        dp_tot  = dp_buy + dp_sell
+
+        flow_score = round((bull-bear)/tot*100, 1) if tot else 0
+        dp_score   = round((dp_buy-dp_sell)/dp_tot*100, 1) if dp_tot else 0
+        direction  = "BULLISH" if (flow_score+dp_score) > 10 else "BEARISH" if (flow_score+dp_score) < -10 else "NEUTRAL"
+
+        return {
+            "ticker":      ticker,
+            "direction":   direction,
+            "flow_score":  flow_score,
+            "dp_score":    dp_score,
+            "iv_rank":     iv.get("iv_rank") if iv else None,
+            "sweeps":      sum(1 for a in flow if a.get("is_sweep")),
+            "alert_count": tot,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/api/market/status", tags=["Market"])
 async def market_status():
     from app.scanner.quick_scan import get_last_trading_date

@@ -405,10 +405,12 @@ async def get_active_bets_api(user_id: str = Depends(get_current_user)):
 @app.get("/api/recommendations/daily", tags=["Recommendations"])
 async def get_daily_recs(
     force_refresh: bool = False,
-    budget:   float = 2000.0,
-    sector:   str | None = None,
-    cap_size: str | None = None,
-    catalyst: str | None = None,
+    budget:    float = 2000.0,
+    scan_type: str   = "options",
+    horizon:   str   = "1m",
+    sector:    str | None = None,
+    cap_size:  str | None = None,
+    catalyst:  str | None = None,
     user_id: str = Depends(get_current_user)
 ):
     try:
@@ -433,13 +435,56 @@ async def get_daily_recs(
             }
         # User clicked Scan — use smart engine for best results
         try:
+            # ── STOCK scan ────────────────────────────────────────────────
+            if scan_type == "stocks":
+                import yfinance as yf
+                from app.recommendations.horizon_engine import get_stock_for_horizon
+                from app.scanner.quick_scan import quick_scan
+                from app.scanner.universe import get_scan_universe
+
+                tickers  = get_scan_universe(user_id=user_id)
+                picks    = quick_scan(tickers, user_id=user_id, top_n=20)
+
+                # Filter to liquid stocks only (options not relevant for stock scan)
+                stock_picks = [p for p in picks
+                               if p.get("price", 0) >= 5
+                               and p.get("ticker") not in {"SPY","QQQ","IWM","GLD","SLV"}]
+
+                results = []
+                seen    = set()
+                for pick in stock_picks[:10]:
+                    ticker = pick["ticker"]
+                    if ticker in seen:
+                        continue
+                    seen.add(ticker)
+                    try:
+                        price = yf.Ticker(ticker).fast_info.last_price or 0
+                        if not price:
+                            continue
+                        rec = get_stock_for_horizon(ticker, horizon, budget, current_price=price)
+                        if rec and not rec.get("filtered"):
+                            rec["status"] = "NEW"
+                            results.append(rec)
+                        if len(results) >= 5:
+                            break
+                    except Exception:
+                        continue
+
+                return {
+                    "recommendations": [],
+                    "stocks":          results,
+                    "market_view":     f"Top {len(results)} stock picks for {horizon} horizon",
+                    "source":          "stock_scan",
+                    "count":           len(results),
+                }
+
+            # ── OPTIONS scan (default) ────────────────────────────────────────
             from app.recommendations.rescan_engine import rescan_with_validation
             from app.scanner.quick_scan import quick_scan
             from app.scanner.universe import get_scan_universe
 
-            # Use filtered universe if criteria provided, else full watchlist
             if sector and cap_size:
-                picks = None  # rescan_with_validation handles it
+                picks = None
             else:
                 picks = quick_scan(get_scan_universe(user_id=user_id), user_id=user_id, top_n=15)
 
@@ -451,7 +496,7 @@ async def get_daily_recs(
             recs = result.get("picks", [])
             return {
                 "recommendations": recs,
-                "stocks":          result.get("stocks", []),
+                "stocks":          [],
                 "market_view":     result.get("market_view",""),
                 "source":          result.get("source","rescan"),
                 "count":           len(recs),

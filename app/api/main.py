@@ -613,6 +613,64 @@ async def backtest(user_id: str = Depends(get_current_user)):
 # Execution Tracking
 # ─────────────────────────────────────────────────────────────────────────────
 
+@app.get("/api/portfolio/check-fills", tags=["Portfolio"])
+async def check_fills(user_id: str = Depends(get_current_user)):
+    """
+    Auto-detect if user filled a recommendation.
+    Compare current positions vs today's active recommendations.
+    Called every 30s after scan for 30 min.
+    """
+    try:
+        from sqlalchemy import text
+        from app.db.session import get_session
+        from app.broker.factory import get_broker
+        from datetime import date
+
+        broker    = get_broker(user_id)
+        positions = broker.get_positions() or []
+        pos_symbols = {p.get("symbol","") for p in positions}
+
+        with get_session() as s:
+            recs = s.execute(text("""
+                SELECT ticker, direction, strategy, expiry, conviction_score
+                FROM daily_recommendations
+                WHERE user_id=:uid AND date=CURRENT_DATE AND status='ACTIVE'
+            """), {"uid": user_id}).fetchall()
+
+        matches = []
+        for rec in recs:
+            ticker = rec.ticker
+            if ticker in pos_symbols:
+                # Check if already tracked
+                with get_session() as s:
+                    tracked = s.execute(text("""
+                        SELECT id FROM tracked_positions
+                        WHERE user_id=:uid AND ticker=:t
+                        AND created_at > now() - interval '1 day'
+                    """), {"uid": user_id, "t": ticker}).fetchone()
+
+                if not tracked:
+                    # Find position details
+                    pos = next((p for p in positions if p.get("symbol")==ticker), {})
+                    matches.append({
+                        "ticker":    ticker,
+                        "direction": rec.direction,
+                        "strategy":  rec.strategy,
+                        "expiry":    rec.expiry,
+                        "qty":       pos.get("qty", 0),
+                        "price":     pos.get("last_price", 0),
+                        "auto_detected": True,
+                    })
+
+        return {
+            "new_fills": matches,
+            "positions_count": len(positions),
+            "recs_count": len(recs),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/api/execution/confirm", tags=["Execution"])
 async def confirm_exec(
     req: ConfirmExecutionRequest,

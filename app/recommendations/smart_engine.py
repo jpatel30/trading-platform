@@ -116,6 +116,17 @@ def _enrich_ticker(
     except Exception:
         result["news"] = []
 
+    # Live price from UW (overrides stale scanner price from Polygon grouped_daily)
+    try:
+        from app.options_flow.unusual_whales import get_stock_state
+        state = get_stock_state(ticker)
+        if state and state.get("price"):
+            result["price"]      = float(state["price"])
+            result["live_price"] = True
+            result["market_time"] = state.get("market_time", "regular")
+    except Exception:
+        pass
+
     # TA from UW bars
     try:
         bars = get_ohlc(ticker, "1d", limit=60)
@@ -540,6 +551,52 @@ def run_smart_recommendations(
                 pass
     except Exception as e:
         print(f"[SmartEngine] Stock recs failed: {e}")
+
+    # Store option recs to daily_recommendations
+    market_view = llm_result.get("market_view", "")
+    for rec in final:
+        try:
+            from app.recommendations.daily_engine import _upsert_recommendation
+            legs = rec.get("legs", [])
+            _upsert_recommendation(user_id, {
+                "ticker":           rec["ticker"],
+                "horizon":          rec.get("horizon", "17d"),
+                "direction":        rec["direction"],
+                "conviction_score": rec.get("confidence", 65),
+                "conviction_tier":  "HIGH" if rec.get("confidence",0)>=75
+                                    else "MODERATE" if rec.get("confidence",0)>=65
+                                    else "WATCH",
+                "act_now":          rec.get("confidence", 0) >= 70,
+                "position_size_guidance": "standard",
+                "thesis":           rec.get("reasoning", ""),
+                "entry_zone_low":   abs(rec.get("entry_debit", 0)),
+                "entry_zone_high":  abs(rec.get("entry_debit", 0)) * 1.05,
+                "entry_trigger":    "AT_MARKET",
+                "target_price":     0,
+                "target_pct":       rec.get("max_profit_per_contract", 0) /
+                                    max(abs(rec.get("max_loss_per_contract", 100)), 1) * 100,
+                "stop_price":       0,
+                "stop_pct":         -40.0,
+                "timeframe":        f"{rec.get('dte', 17)} days",
+                "invalidation_conditions": rec.get("key_risk", ""),
+                "strategy":         rec.get("strategy", ""),
+                "expiry":           rec.get("expiry", ""),
+                "dte":              rec.get("dte", 17),
+                "legs":             legs,
+                "entry_debit":      rec.get("entry_debit", 0),
+                "total_cost":       rec.get("total_cost", 0),
+                "max_profit":       rec.get("max_profit_per_contract", 0),
+                "max_loss":         rec.get("max_loss_per_contract", 0),
+                "risk_reward":      rec.get("risk_reward", 0),
+                "webull_instructions": rec.get("webull_instructions", ""),
+                "key_news":         rec.get("catalyst", "NONE"),
+                "warnings":         [],
+                "conviction_breakdown": {},
+                "signal_data":      {"market_view": market_view},
+            })
+            print(f"[SmartEngine] Stored rec: {rec['ticker']}")
+        except Exception as e:
+            print(f"[SmartEngine] Store failed for {rec.get('ticker','?')}: {e}")
 
     total_time = round(time.time()-t_total, 1)
     print(f"\n[SmartEngine] COMPLETE in {total_time}s — "

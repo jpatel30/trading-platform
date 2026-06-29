@@ -225,6 +225,18 @@ def _get_batch_prices(tickers: list[str], user_id: str | None = None) -> dict[st
         except Exception:
             pass
 
+        # Recalculate change_pct using live price vs prev_close
+        updated = 0
+        for sym, data in result.items():
+            live = data.get("live_price")
+            prev = data.get("prev_close") or data.get("price")
+            if live and prev and prev > 0:
+                data["price"]      = live
+                data["change_pct"] = round((live - prev) / prev * 100, 2)
+                updated += 1
+        if updated:
+            print(f"[Quick Scan] Live change_pct updated for {updated} tickers")
+
     print(f"[Quick Scan] Prices: {len(result)}/{len(tickers)} tickers resolved")
     return result
     """
@@ -579,7 +591,7 @@ def quick_scan(
     # On weekends/holidays, lower thresholds — UW flow is stale, momentum is the key signal
     market_open      = _is_market_open()
     mom_threshold    = 1.5 if market_open else 0.5
-    min_convergence  = min_convergence if market_open else 1
+    min_convergence  = 1  # 1 signal sufficient — convergence improves quality but not required
 
     # 3. Score each ticker
     scored = []

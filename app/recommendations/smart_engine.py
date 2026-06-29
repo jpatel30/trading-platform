@@ -337,6 +337,20 @@ def _execute_smart_rec(rec: dict, budget: float, user_id: str | None) -> dict | 
     if not spot or not buy_str:
         return None
 
+    # Validate and correct strike order — LLM sometimes inverts them
+    if "DEBIT_CALL_SPREAD" in strategy and buy_str > sell_str:
+        buy_str, sell_str = sell_str, buy_str
+        print(f"[SmartMath] Auto-corrected CALL spread strikes: BUY ${buy_str} SELL ${sell_str}")
+    elif "DEBIT_PUT_SPREAD" in strategy and buy_str < sell_str:
+        buy_str, sell_str = sell_str, buy_str
+        print(f"[SmartMath] Auto-corrected PUT spread strikes: BUY ${buy_str} SELL ${sell_str}")
+    elif "CREDIT_CALL_SPREAD" in strategy and buy_str < sell_str:
+        buy_str, sell_str = sell_str, buy_str
+        print(f"[SmartMath] Auto-corrected CREDIT CALL strikes: BUY ${buy_str} SELL ${sell_str}")
+    elif "CREDIT_PUT_SPREAD" in strategy and buy_str > sell_str:
+        buy_str, sell_str = sell_str, buy_str
+        print(f"[SmartMath] Auto-corrected CREDIT PUT strikes: BUY ${buy_str} SELL ${sell_str}")
+
     # Determine leg types from strategy
     is_put    = "PUT" in strategy
     leg_type  = "PUT" if is_put else "CALL"

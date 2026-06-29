@@ -41,6 +41,15 @@ def confirm_execution(
 
         with get_session() as s:
 
+            # Guard: one tracked position per symbol per day
+            existing = s.execute(text("""
+                SELECT id FROM tracked_positions
+                WHERE user_id=:uid AND symbol=:sym
+                AND entry_date=CURRENT_DATE AND is_active=TRUE
+            """), {"uid": user_id, "sym": symbol}).fetchone()
+            if existing:
+                return {"status": "already_tracked", "id": str(existing.id)}
+
             # 1. Find existing rec for today at this price (any status)
             if not recommendation_id:
                 row = s.execute(text("""

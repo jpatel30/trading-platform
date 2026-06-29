@@ -650,15 +650,23 @@ async def check_fills(user_id: str = Depends(get_current_user)):
                     """), {"uid": user_id, "t": ticker}).fetchone()
 
                 if not tracked:
-                    # Find position details
                     pos = next((p for p in positions if p.get("symbol")==ticker), {})
+                    # Auto-confirm with real price (not 0) to match user entry
+                    entry_price = float(pos.get("unit_cost") or pos.get("last_price") or 0)
+                    qty         = int(pos.get("qty") or 1)
+                    try:
+                        from app.learning.prediction_tracker import confirm_execution
+                        confirm_execution(user_id, ticker, entry_price, qty,
+                                         recommendation_id=None)
+                    except Exception:
+                        pass  # already tracked
                     matches.append({
-                        "ticker":    ticker,
-                        "direction": rec.direction,
-                        "strategy":  rec.strategy,
-                        "expiry":    rec.expiry,
-                        "qty":       pos.get("qty", 0),
-                        "price":     pos.get("last_price", 0),
+                        "ticker":        ticker,
+                        "direction":     rec.direction,
+                        "strategy":      rec.strategy,
+                        "expiry":        rec.expiry,
+                        "qty":           qty,
+                        "price":         entry_price,
                         "auto_detected": True,
                     })
 

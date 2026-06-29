@@ -142,7 +142,7 @@ def _upsert_recommendation(user_id: str, data: dict) -> str | None:
         from sqlalchemy import text
         from app.db.session import get_session
         with get_session() as s:
-            row = s.execute(text("""
+            result = s.execute(text("""
                 INSERT INTO daily_recommendations (
                     user_id, ticker, date, horizon,
                     direction, conviction_score, conviction_tier,
@@ -209,7 +209,8 @@ def _upsert_recommendation(user_id: str, data: dict) -> str | None:
                 "signal_data":        json.dumps(data.get("signal_data", {})),
                 "warnings":           json.dumps(data.get("warnings", [])),
             })
-            return str(row.id) if row else None
+            row = result.fetchone()
+        return str(row.id) if row else None
     except Exception as e:
         print(f"[DailyRec] Store failed for {data.get('ticker')}: {e}")
         return None
@@ -387,7 +388,7 @@ def run_daily_recommendations(
     from app.options_flow.unusual_whales import get_signal_package
     from app.options_flow.signals import score_signal_package
     from app.strategy.engine import build_recommendation
-    from app.market_data.polygon_client import get_bars
+    from app.market_data.uw_market_data import get_bars
     from app.technical_analysis.engine import get_technical_profile
     from datetime import timedelta
     import time

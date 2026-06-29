@@ -196,6 +196,25 @@ def calculate_conviction(
     """
     w = weights or DEFAULT_WEIGHTS
 
+    # Enrich signal_data with new UW endpoints if ticker available
+    ticker = signal_data.get("ticker", "")
+    if ticker and not signal_data.get("_uw_enriched"):
+        try:
+            from app.options_flow.unusual_whales import (
+                get_net_premium_ticks, get_greek_flow, get_institutional_ownership
+            )
+            npm = get_net_premium_ticks(ticker)
+            gf  = get_greek_flow(ticker)
+            io  = get_institutional_ownership(ticker)
+            signal_data["net_premium_direction"] = npm.get("direction", "NEUTRAL")
+            signal_data["net_premium_score"]     = npm.get("score", 50)
+            signal_data["greek_flow_direction"]  = gf.get("direction", "NEUTRAL")
+            signal_data["greek_flow_score"]      = gf.get("score", 50)
+            signal_data["institutional_score"]   = io.get("score", 50)
+            signal_data["_uw_enriched"]          = True
+        except Exception:
+            pass
+
     # Score each criterion (0.0 to 1.0)
     scores = {
         "entry_trigger": score_entry_trigger(price_ctx, direction),
@@ -211,6 +230,19 @@ def calculate_conviction(
         scores[k][0] * w.get(k, 0)
         for k in scores
     )
+
+    # UW bonus signals (additive, max +10 pts total)
+    uw_bonus = 0
+    net_prem_dir = signal_data.get("net_premium_direction", "NEUTRAL")
+    greek_dir    = signal_data.get("greek_flow_direction",  "NEUTRAL")
+    inst_score   = signal_data.get("institutional_score",   50)
+    if net_prem_dir == direction[:7]:          # BULLISH/BEARISH match
+        uw_bonus += 5
+    if greek_dir == direction[:7]:
+        uw_bonus += 3
+    if inst_score >= 70:
+        uw_bonus += 2
+    raw_score += uw_bonus
 
     # LLM confidence modifier
     llm_mod   = get_llm_modifier(llm_confidence)

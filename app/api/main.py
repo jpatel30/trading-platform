@@ -264,36 +264,43 @@ async def get_portfolio(
         from app.monitor.position_monitor import get_cached_portfolio
 
         # Use cache for instant response (updated every 15-30 min by monitor)
+        # Get positions + balances (cache or live)
+        positions, balances, source = [], {}, "empty"
+
         if not live:
             cache = get_cached_portfolio(user_id)
             if cache and not cache.get("is_stale"):
                 positions = cache["positions"]
                 balances  = cache.get("balances") or {}
-                pnl       = get_portfolio_pnl_summary(positions, None)
-                bets      = get_active_bets(positions, user_id=user_id)
-                return {
-                    "positions": positions,
-                    "balances":  balances,
-                    "pnl":       pnl,
-                    "bets":      bets,
-                    "source":    "cache",
-                    "cached_at": cache.get("cached_at"),
-                    "age_minutes": cache.get("age_minutes"),
-                }
+                source    = "cache"
 
-        # Live fetch from Webull
-        from app.broker.factory import get_broker
-        broker    = get_broker(user_id)
-        positions = broker.get_positions()
-        balances  = broker.get_balances()
-        pnl       = get_portfolio_pnl_summary(positions, None)
-        bets      = get_active_bets(positions, user_id=user_id)
+        if not positions:
+            from app.broker.factory import get_broker
+            broker    = get_broker(user_id)
+            positions = broker.get_positions() or []
+            balances  = broker.get_balances() or {}
+            source    = "live"
+
+        # Extract correct values from Webull nested structure
+        acct      = (balances.get("account_currency_assets") or [{}])[0]
+        net_liq   = float(acct.get("net_liquidation_value") or balances.get("total_market_value") or 0)
+        cash      = float(balances.get("total_cash_balance") or acct.get("cash_balance") or 0)
+        pos_value = float(balances.get("total_market_value") or acct.get("positions_market_value") or 0)
+
+        pnl  = get_portfolio_pnl_summary(positions, balances) if positions else {}
+        bets = get_active_bets(positions, user_id=user_id) if positions else []
+
+        pnl["net_liq"]         = round(net_liq, 2)
+        pnl["cash"]            = round(cash, 2)
+        pnl["positions_value"] = round(pos_value, 2)
+        pnl["buying_power"]    = round(cash, 2)
+
         return {
             "positions": positions,
             "balances":  balances,
             "pnl":       pnl,
             "bets":      bets,
-            "source":    "live",
+            "source":    source,
         }
     except Exception as e:
         import traceback

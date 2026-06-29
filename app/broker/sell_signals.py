@@ -60,7 +60,7 @@ def _get_ta_signal(ticker: str) -> str:
 
     try:
         import time as _t
-        from app.market_data.polygon_client import get_bars
+        from app.market_data.uw_market_data import get_bars
 
         elapsed = _t.time() - _ta_last_call
         if elapsed < 12:

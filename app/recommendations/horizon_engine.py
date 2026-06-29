@@ -33,6 +33,15 @@ HORIZON_CONFIG = {
         "label":          "1 Week",
         "description":    "Short-term swing trade — options expiring this week or next",
     },
+    "2w":  {
+        "type":           "options",
+        "dte_min":        10,
+        "dte_max":        16,
+        "min_conviction": 72,
+        "stop_pct":       -9,
+        "label":          "2 Week",
+        "description":    "Bi-weekly swing trade — 2-week options",
+    },
     "1m":  {
         "type":           "options",
         "dte_min":        21,
@@ -126,7 +135,7 @@ def get_options_for_horizon(
     from app.strategy.engine import build_recommendation
     from app.options_flow.unusual_whales import get_signal_package
     from app.options_flow.signals import score_signal_package
-    from app.market_data.polygon_client import get_bars
+    from app.market_data.uw_market_data import get_bars
     from app.technical_analysis.engine import get_technical_profile
 
     config    = HORIZON_CONFIG.get(horizon, HORIZON_CONFIG["1m"])
@@ -249,6 +258,27 @@ def get_stock_for_horizon(
         ticker, horizon, config, fundamentals, dp, fund_score,
         current_price, target_price, target_pct, momentum
     )
+
+    # LLM enrichment — generate concise investment thesis
+    try:
+        from app.llm.service import _call_ollama, is_ollama_available
+        if is_ollama_available():
+            prompt = (
+                f"Write a 2-sentence investment thesis for {ticker} {horizon} stock pick. "
+                f"Facts: price ${current_price:.2f}, analyst target ${target_price:.2f} "
+                f"({target_pct:+.1f}%), revenue growth {(fundamentals.get('revenue_growth') or 0)*100:.0f}%, "
+                f"PEG {fundamentals.get('peg_ratio') or 'N/A'}, "
+                f"margins {(fundamentals.get('profit_margins') or 0)*100:.0f}%, "
+                f"analyst rec: {fundamentals.get('analyst_recommendation','N/A')}. "
+                f"Be specific and actionable."
+            )
+            llm_thesis = _call_ollama(prompt=prompt,
+                system="Expert stock analyst. 2 sentences max. No disclaimers.",
+                max_tokens=100)
+            if llm_thesis and len(llm_thesis) > 20:
+                thesis = llm_thesis.strip()
+    except Exception:
+        pass  # keep original thesis if LLM fails
 
     return {
         "ticker":            ticker,

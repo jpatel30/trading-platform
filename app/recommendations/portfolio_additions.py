@@ -41,7 +41,7 @@ def get_portfolio_additions(
         not_ready:  positions with good P&L but failing other criteria
     """
     from app.broker.webull_connector import WebullConnector
-    from app.market_data.polygon_client import get_bars
+    from app.market_data.uw_market_data import get_bars
     from app.technical_analysis.engine import get_technical_profile
     from app.recommendations.fundamentals import get_dp_accumulation_score
 
@@ -124,7 +124,7 @@ def _score_addition_candidate(
     cost: float, qty: float, price: float, user_id: str
 ) -> tuple[int, dict]:
     """Score a position as candidate for adding more."""
-    from app.market_data.polygon_client import get_bars
+    from app.market_data.uw_market_data import get_bars
     from app.technical_analysis.engine import get_technical_profile
     from app.recommendations.fundamentals import get_dp_accumulation_score
     from app.options_flow.unusual_whales import get_earnings_premarket, get_earnings_afterhours

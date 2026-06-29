@@ -591,3 +591,226 @@ def get_signal_package(ticker: str, target_expiry: str | None = None) -> dict:
         "congress_trades": get_congress_trades(ticker=ticker, limit=5),
         "market_tide": get_market_tide(),
     }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# UW Market Data
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_ohlc(ticker: str, candle_size: str = "1d", limit: int = 300) -> list[dict]:
+    """
+    OHLC bars from UW — returns Polygon-compatible format.
+    UW returns a list directly (not {"data": [...]}).
+    market_time values: "r"=regular, "pr"=premarket, "po"=postmarket
+    """
+    bars = _get(f"/api/stock/{ticker.upper()}/ohlc/{candle_size}", {"limit": limit})
+    if not bars or not isinstance(bars, list):
+        return []
+    import datetime as _dt
+    result = []
+    for b in bars:
+        try:
+            # Only regular session bars
+            if b.get("market_time") != "r":
+                continue
+            date_str = b.get("date", "")
+            ts = int(_dt.datetime.strptime(
+                date_str[:10], "%Y-%m-%d").timestamp() * 1000) if date_str else 0
+            result.append({
+                "c":  float(b.get("close", 0) or 0),
+                "h":  float(b.get("high",  0) or 0),
+                "l":  float(b.get("low",   0) or 0),
+                "o":  float(b.get("open",  0) or 0),
+                "v":  int(b.get("total_volume", 0) or b.get("volume", 0) or 0),
+                "t":  ts,
+                "vw": float(b.get("close", 0) or 0),
+            })
+        except Exception:
+            continue
+    return sorted(result, key=lambda x: x["t"])
+
+
+def get_stock_state(ticker: str) -> dict | None:
+    """
+    Live stock price from UW including pre/post market.
+    UW returns a list with one item for stock-state.
+    """
+    data = _get(f"/api/stock/{ticker.upper()}/stock-state")
+    # Handle both list and dict responses
+    if isinstance(data, list):
+        d = data[0] if data else {}
+    elif isinstance(data, dict):
+        d = data.get("data", data)
+    else:
+        return None
+    if not d:
+        return None
+    return {
+        "price":       float(d.get("close",      0) or 0),
+        "close":       float(d.get("close",      0) or 0),
+        "prev_close":  float(d.get("prev_close", 0) or 0),
+        "high":        float(d.get("high",       0) or 0),
+        "low":         float(d.get("low",        0) or 0),
+        "open":        float(d.get("open",       0) or 0),
+        "volume":      int(d.get("total_volume", 0) or d.get("volume", 0) or 0),
+        "market_time": d.get("market_time", "regular"),
+        "tape_time":   d.get("tape_time", ""),
+    }
+
+
+def get_iv_rank(ticker: str) -> dict | None:
+    """
+    Real 1-year IV rank from UW.
+    UW returns a list of daily IV rank records.
+    """
+    rows = _get(f"/api/stock/{ticker.upper()}/iv-rank")
+    if not rows or not isinstance(rows, list):
+        return None
+    latest = rows[-1] if rows else {}
+    return {
+        "iv_rank":    float(latest.get("iv_rank_1y", 50) or 50),
+        "iv_current": float(latest.get("volatility",  0) or 0),
+        "close":      float(latest.get("close",       0) or 0),
+        "date":       latest.get("date", ""),
+        "source":     "uw_1y",
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NEW UW INTEGRATIONS (paid plan — 200 confirmed)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_institutional_ownership(ticker: str) -> dict:
+    """
+    Institutional ownership for ticker.
+    Returns top institutions, total value, and ownership concentration.
+    Used in conviction scoring: high institutional ownership = stable thesis.
+    """
+    data = _get(f"/api/institution/{ticker.upper()}/ownership")
+    if not data or not isinstance(data, list):
+        return {"error": "No data", "score": 50}
+
+    total_value    = sum(float(d.get("value", 0) or 0) for d in data)
+    institution_ct = len(data)
+    top_holders    = [d.get("name", "") for d in data[:5]]
+
+    # Score 0-100: more institutions + higher value = higher score
+    score = min(100, int(institution_ct / 2) + (30 if total_value > 1e11 else 15 if total_value > 1e10 else 5))
+
+    return {
+        "institution_count": institution_ct,
+        "total_value":       total_value,
+        "top_holders":       top_holders,
+        "score":             score,
+        "note":              f"{institution_ct} institutions, top: {', '.join(top_holders[:2])}",
+    }
+
+
+def get_greek_flow(ticker: str) -> dict:
+    """
+    Greek flow — call vs put gamma/delta direction signal.
+    Returns net call vs put direction from greek flow data.
+    """
+    data = _get(f"/api/stock/{ticker.upper()}/greek-flow")
+    if not data or not isinstance(data, dict):
+        return {"direction": "NEUTRAL", "score": 50}
+    rows = data.get("data", [])
+    if not rows:
+        return {"direction": "NEUTRAL", "score": 50}
+
+    # Sum recent call vs put transactions
+    call_txn = sum(int(r.get("call_transactions", 0) or 0) for r in rows[-5:])
+    put_txn  = sum(int(r.get("put_transactions",  0) or 0) for r in rows[-5:])
+    total    = call_txn + put_txn
+
+    if total == 0:
+        return {"direction": "NEUTRAL", "score": 50}
+
+    call_ratio = call_txn / total
+    if call_ratio >= 0.65:
+        direction, score = "BULLISH", round(call_ratio * 100)
+    elif call_ratio <= 0.35:
+        direction, score = "BEARISH", round((1 - call_ratio) * 100)
+    else:
+        direction, score = "NEUTRAL", 50
+
+    return {
+        "direction":    direction,
+        "score":        score,
+        "call_txn":     call_txn,
+        "put_txn":      put_txn,
+        "call_ratio":   round(call_ratio, 2),
+        "note":         f"Greek flow: {direction} ({call_ratio:.0%} calls)",
+    }
+
+
+def get_net_premium_ticks(ticker: str) -> dict:
+    """
+    Net premium ticks — call vs put net premium today.
+    Most reliable intraday direction signal.
+    call_premium > put_premium = bullish institutional positioning.
+    """
+    data = _get(f"/api/stock/{ticker.upper()}/net-prem-ticks")
+    if not data or not isinstance(data, dict):
+        return {"direction": "NEUTRAL", "score": 50}
+    rows = data.get("data", [])
+    if not rows:
+        return {"direction": "NEUTRAL", "score": 50}
+
+    latest = rows[-1] if rows else {}
+    call_vol   = float(latest.get("call_volume",     0) or 0)
+    put_vol    = float(latest.get("put_volume",      0) or 0)
+    call_prem  = float(latest.get("call_premium",    0) or 0)
+    put_prem   = float(latest.get("put_premium",     0) or 0)
+
+    total_prem = call_prem + put_prem
+    if total_prem == 0:
+        return {"direction": "NEUTRAL", "score": 50}
+
+    call_ratio = call_prem / total_prem
+    if call_ratio >= 0.60:
+        direction, score = "BULLISH", round(call_ratio * 100)
+    elif call_ratio <= 0.40:
+        direction, score = "BEARISH", round((1 - call_ratio) * 100)
+    else:
+        direction, score = "NEUTRAL", 50
+
+    return {
+        "direction":   direction,
+        "score":       score,
+        "call_premium": call_prem,
+        "put_premium":  put_prem,
+        "call_ratio":   round(call_ratio, 2),
+        "note":         f"Net premium: {direction} (calls {call_ratio:.0%} of total)",
+    }
+
+
+def get_etf_sector_flow(etf: str) -> dict:
+    """
+    ETF in/outflow — money moving in or out of sector.
+    Positive change = money flowing in (sector bullish).
+    Used for sector-level conviction in recommendations.
+    """
+    data = _get(f"/api/etfs/{etf.upper()}/in-outflow")
+    if not data or not isinstance(data, dict):
+        return {"direction": "NEUTRAL", "net_flow": 0}
+    rows = data.get("data", [])
+    if not rows:
+        return {"direction": "NEUTRAL", "net_flow": 0}
+
+    # Sum last 5 days
+    recent   = rows[-5:]
+    net_flow = sum(float(r.get("change", 0) or 0) for r in recent)
+
+    if net_flow > 5_000_000:
+        direction = "BULLISH"
+    elif net_flow < -5_000_000:
+        direction = "BEARISH"
+    else:
+        direction = "NEUTRAL"
+
+    return {
+        "direction": direction,
+        "net_flow":  net_flow,
+        "etf":       etf.upper(),
+        "note":      f"{etf} flow: {direction} (${net_flow:,.0f} net 5d)",
+    }

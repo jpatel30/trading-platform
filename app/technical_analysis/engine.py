@@ -14,7 +14,7 @@ Indicators computed:
     Summary:    Trend direction, signal (BUY/SELL/NEUTRAL), strength score 0-100
 
 Usage:
-    from app.market_data.polygon_client import get_bars
+    from app.market_data.uw_market_data import get_bars
     from app.technical_analysis.engine import get_technical_profile
 
     bars = get_bars('NVDA', 1, 'day', '2025-09-01', '2026-06-13')
@@ -25,7 +25,14 @@ import ta
 
 
 def _to_df(bars: list[dict]) -> pd.DataFrame:
-    """Convert OHLCV bar list to a clean DataFrame."""
+    """Convert OHLCV bar list to a clean DataFrame.
+    Handles both Polygon format (open/high/low/close) and
+    UW format (o/h/l/c) automatically.
+    """
+    # Normalize UW short-key format to standard long-key format
+    KEY_MAP = {"o": "open", "h": "high", "l": "low", "c": "close", "v": "volume", "vw": "vwap"}
+    if bars and "c" in bars[0] and "close" not in bars[0]:
+        bars = [{KEY_MAP.get(k, k): v for k, v in b.items()} for b in bars]
     df = pd.DataFrame(bars)
     for col in ["open", "high", "low", "close", "volume"]:
         if col in df.columns:

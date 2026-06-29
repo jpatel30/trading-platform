@@ -446,7 +446,7 @@ def _get_batch_prices(tickers: list[str], user_id: str | None = None) -> dict[st
     missing = [t for t in tickers if t not in result]
     if missing:
         try:
-            from app.market_data.polygon_client import get_previous_close
+            from app.market_data.uw_market_data import get_previous_close
             for ticker in missing:
                 try:
                     q = get_previous_close(ticker)
@@ -495,69 +495,50 @@ def _get_batch_prices(tickers: list[str], user_id: str | None = None) -> dict[st
 
 def _get_uw_flow_signals(tickers: list[str]) -> dict[str, dict]:
     """
-    Get UW flow alerts + dark pool for all tickers.
-    Returns {ticker: {flow_score, dark_pool_score, direction, details}}
+    Batch fetch ALL flow + dark pool in 2 UW calls instead of 254.
+    Was: 127 tickers x 2 calls each = 254 calls, exhausted rate limit.
+    Now: 2 batch calls, group by ticker in Python.
     """
-    from app.options_flow.unusual_whales import (
-        get_flow_alerts, get_dark_pool_ticker
-    )
-
+    from app.options_flow.unusual_whales import get_flow_alerts, get_dark_pool_recent
+    try:
+        all_flow = get_flow_alerts(limit=500) or []
+        all_dp   = get_dark_pool_recent(limit=500) or []
+    except Exception as e:
+        print(f"[UW Batch] Failed: {e}")
+        return {}
+    flow_by = {}
+    for a in all_flow:
+        flow_by.setdefault(a.get("ticker",""), []).append(a)
+    dp_by = {}
+    for d in all_dp:
+        dp_by.setdefault(d.get("ticker",""), []).append(d)
+    print(f"[UW Batch] {len(all_flow)} flow alerts across {len(flow_by)} tickers | "
+          f"{len(all_dp)} dp prints across {len(dp_by)} tickers")
     result = {}
-
-    def _score_ticker(ticker):
-        try:
-            # Flow alerts (sweeps, unusual activity)
-            alerts    = get_flow_alerts(ticker=ticker, limit=10)
-            bull_flow = sum(1 for a in alerts if a.get("sentiment") in ("BULLISH", "CALL"))
-            bear_flow = sum(1 for a in alerts if a.get("sentiment") in ("BEARISH", "PUT"))
-            total_flow = bull_flow + bear_flow
-
-            # Dark pool (institutional block trades)
-            dp        = get_dark_pool_ticker(ticker, limit=10)
-            dp_buy    = sum(1 for d in dp if d.get("side") in ("BUY", "A"))
-            dp_sell   = sum(1 for d in dp if d.get("side") in ("SELL", "B"))
-            dp_total  = dp_buy + dp_sell
-
-            if total_flow == 0 and dp_total == 0:
-                return ticker, None
-
-            # Flow direction score (-100 to +100)
-            flow_score = 0
-            if total_flow > 0:
-                flow_score = ((bull_flow - bear_flow) / total_flow) * 100
-
-            dp_score = 0
-            if dp_total > 0:
-                dp_score = ((dp_buy - dp_sell) / dp_total) * 100
-
-            direction = "BULLISH" if (flow_score + dp_score) > 0 else "BEARISH"
-
-            return ticker, {
-                "flow_score":    round(flow_score, 1),
-                "dp_score":      round(dp_score, 1),
-                "direction":     direction,
-                "alert_count":   total_flow,
-                "dp_count":      dp_total,
-                "bull_flow":     bull_flow,
-                "bear_flow":     bear_flow,
-                "sweeps":        len([a for a in alerts if a.get("is_sweep")]),
-            }
-        except Exception:
-            return ticker, None
-
-    # Parallel fetch (UW rate limit: 120 req/min — max 30 parallel)
-    with ThreadPoolExecutor(max_workers=5) as ex:  # 5 workers avoids OS file limit
-        futures = {ex.submit(_score_ticker, t): t for t in tickers}
-        for future in as_completed(futures, timeout=30):
-            try:
-                ticker, data = future.result()
-                if data:
-                    result[ticker] = data
-            except Exception:
-                pass
-
+    for ticker in tickers:
+        alerts    = flow_by.get(ticker, [])
+        dp        = dp_by.get(ticker, [])
+        if not alerts and not dp:
+            continue
+        bull_flow  = sum(1 for a in alerts if a.get("sentiment") in ("BULLISH","CALL"))
+        bear_flow  = sum(1 for a in alerts if a.get("sentiment") in ("BEARISH","PUT"))
+        total_flow = bull_flow + bear_flow
+        dp_buy     = sum(1 for d in dp if d.get("side") in ("BUY","A"))
+        dp_sell    = sum(1 for d in dp if d.get("side") in ("SELL","B"))
+        dp_total   = dp_buy + dp_sell
+        flow_score = round((bull_flow-bear_flow)/total_flow*100, 1) if total_flow else 0
+        dp_score   = round((dp_buy-dp_sell)/dp_total*100, 1)        if dp_total   else 0
+        result[ticker] = {
+            "flow_score":  flow_score,
+            "dp_score":    dp_score,
+            "direction":   "BULLISH" if (flow_score+dp_score) > 0 else "BEARISH",
+            "alert_count": total_flow,
+            "dp_count":    dp_total,
+            "bull_flow":   bull_flow,
+            "bear_flow":   bear_flow,
+            "sweeps":      sum(1 for a in alerts if a.get("is_sweep")),
+        }
     return result
-
 
 def quick_scan(
     tickers: list[str],
@@ -687,7 +668,7 @@ def _build_full_data_package(
     TA:          Technical indicators from our engine
     """
     from datetime import datetime, timedelta
-    from app.market_data.polygon_client import get_bars, get_previous_close
+    from app.market_data.uw_market_data import get_bars, get_previous_close
     from app.technical_analysis.engine import get_technical_profile
     from app.options_flow.unusual_whales import (
         get_flow_alerts, get_dark_pool_ticker, get_greek_exposure,

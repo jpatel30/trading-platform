@@ -34,7 +34,7 @@ def _build_price_context(ticker: str) -> dict:
     Returns: trend, % from 52w high/low, S/R levels, momentum.
     """
     try:
-        from app.market_data.polygon_client import get_bars
+        from app.market_data.uw_market_data import get_bars
 
         from_date = (datetime.now() - timedelta(days=200)).strftime("%Y-%m-%d")
         to_date   = datetime.now().strftime("%Y-%m-%d")
@@ -537,7 +537,7 @@ def _build_sector_context(ticker: str) -> dict:
     Shows whether the sector is leading or lagging the market.
     """
     try:
-        from app.market_data.polygon_client import get_previous_close
+        from app.market_data.uw_market_data import get_previous_close
 
         sector_etf = SECTOR_MAP.get(ticker.upper(), "QQQ")
 

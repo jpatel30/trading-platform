@@ -242,7 +242,7 @@ try:
     from sqlalchemy import text
     from app.db.session import get_session
     with get_session() as s:
-        cfg = s.execute(text("SELECT webhook_url FROM notification_config LIMIT 1")).fetchone()
+        cfg = s.execute(text("SELECT discord_webhook FROM notification_config LIMIT 1")).fetchone()
     checks.append(("Discord", bool(cfg), "webhook configured" if cfg else "NOT configured"))
 except Exception as e:
     checks.append(("Discord", False, str(e)))

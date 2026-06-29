@@ -402,6 +402,32 @@ async def get_rec_history(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/api/recommendations/stocks", tags=["Recommendations"])
+async def get_stock_recs(
+    budget: float = 5000.0,
+    user_id: str = Depends(get_current_user)
+):
+    try:
+        import yfinance as yf
+        from app.recommendations.horizon_engine import get_stock_for_horizon
+        candidates = ["NVDA", "AAPL", "MSFT"]
+        results = []
+        for ticker in candidates:
+            for horizon in ["3m", "6m", "1yr"]:
+                try:
+                    price = yf.Ticker(ticker).fast_info.last_price or 0
+                    if not price: continue
+                    rec = get_stock_for_horizon(ticker, horizon, budget, current_price=price)
+                    if rec and not rec.get("filtered"):
+                        results.append(rec)
+                        break
+                except Exception:
+                    continue
+        return {"stocks": results}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/api/recommendations/horizon", tags=["Recommendations"])
 async def get_horizon_rec(
     req: HorizonRecRequest,

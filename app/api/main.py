@@ -295,12 +295,33 @@ async def get_portfolio(
         pnl["positions_value"] = round(pos_value, 2)
         pnl["buying_power"]    = round(cash, 2)
 
+        # Merge type + option fields from pnl.positions into bets
+        pnl_pos = pnl.get("positions", [])
+        type_map = {}
+        for p in pnl_pos:
+            key = (p.get("symbol"), round(float(p.get("qty",0)),0))
+            type_map[key] = {
+                "type":       p.get("type", "STOCK"),
+                "unit_cost":  p.get("unit_cost"),
+                "last_price": p.get("last_price"),
+            }
+        for bet in bets:
+            sym  = bet.get("symbol","")
+            qty  = round(float(bet.get("qty",0)),0)
+            info = type_map.get((sym, qty), {})
+            if "type" not in bet or not bet.get("type"):
+                bet["type"] = info.get("type","STOCK")
+            if not bet.get("unit_cost") and info.get("unit_cost"):
+                bet["unit_cost"]  = info["unit_cost"]
+            if not bet.get("last_price") and info.get("last_price"):
+                bet["last_price"] = info["last_price"]
+
         return {
-            "positions": positions,
-            "balances":  balances,
-            "pnl":       pnl,
-            "bets":      bets,
-            "source":    source,
+            "positions":     pnl_pos,  # typed positions for frontend
+            "balances":      balances,
+            "pnl":           pnl,
+            "bets":          bets,
+            "source":        source,
         }
     except Exception as e:
         import traceback
@@ -347,7 +368,7 @@ async def get_daily_recs(
         )
         # Always check cache first — instant response
         cached = get_active_recommendations(user_id)
-        if cached:
+        if cached and not force_refresh:
             return {
                 "recommendations": cached,
                 "source":          "cached",
@@ -358,11 +379,33 @@ async def get_daily_recs(
             return {
                 "recommendations": [],
                 "source":          "empty",
-                "message":         "No recommendations yet today. Click Scan to generate.",
+                "message":         "No picks yet today. Click Scan to generate.",
                 "needs_scan":      True,
             }
-        # User explicitly clicked Scan — run full analysis
-        return run_daily_recommendations(user_id, force_refresh=True)
+        # User clicked Scan — use smart engine for best results
+        try:
+            from app.recommendations.smart_engine import run_smart_recommendations
+            from app.scanner.quick_scan import quick_scan
+            from app.scanner.universe import get_scan_universe
+            picks  = quick_scan(get_scan_universe(user_id=user_id), user_id=user_id, top_n=15)
+            result = run_smart_recommendations(user_id, budget=2000, pre_scanned=picks)
+            # Format options as daily_recommendations format for dashboard
+            recs = []
+            for r in result.get("options", []):
+                recs.append({**r, "rec_type": "options",
+                             "ticker": r.get("ticker",""),
+                             "conviction_score": r.get("confidence",65),
+                             "conviction_tier": "HIGH" if r.get("confidence",0)>=75 else "MODERATE"})
+            return {
+                "recommendations": recs,
+                "stocks":          result.get("stocks", []),
+                "market_view":     result.get("market_view",""),
+                "source":          "smart_engine",
+                "count":           len(recs),
+            }
+        except Exception as e:
+            print(f"[API] Smart engine failed: {e}, falling back")
+            return run_daily_recommendations(user_id, force_refresh=True)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

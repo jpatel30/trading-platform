@@ -589,7 +589,8 @@ def quick_scan(
     flow = _get_uw_flow_signals(tickers)
 
     # On weekends/holidays, lower thresholds — UW flow is stale, momentum is the key signal
-    market_open      = _is_market_open()
+    _session         = _get_last_trading_session()
+    market_open      = _is_market_open() or "After-hours" in _session
     mom_threshold    = 1.5 if market_open else 0.5
     min_convergence  = 1  # 1 signal sufficient — convergence improves quality but not required
 

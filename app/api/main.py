@@ -405,6 +405,7 @@ async def get_active_bets_api(user_id: str = Depends(get_current_user)):
 @app.get("/api/recommendations/daily", tags=["Recommendations"])
 async def get_daily_recs(
     force_refresh: bool = False,
+    budget: float = 2000.0,
     user_id: str = Depends(get_current_user)
 ):
     try:
@@ -433,7 +434,7 @@ async def get_daily_recs(
             from app.scanner.quick_scan import quick_scan
             from app.scanner.universe import get_scan_universe
             picks  = quick_scan(get_scan_universe(user_id=user_id), user_id=user_id, top_n=15)
-            result = run_smart_recommendations(user_id, budget=2000, pre_scanned=picks)
+            result = run_smart_recommendations(user_id, budget=budget, pre_scanned=picks)
             # Format options as daily_recommendations format for dashboard
             recs = []
             for r in result.get("options", []):

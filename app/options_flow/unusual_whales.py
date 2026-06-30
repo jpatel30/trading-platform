@@ -475,17 +475,15 @@ def get_news_headlines(ticker: str | None = None, limit: int = 20) -> list[dict]
     if cached:
         return cached
 
-    data = _get("/api/news/headlines")
-    if isinstance(data, list):
-        if ticker:
-            data = [
-                d for d in data
-                if ticker.upper() in [t.upper() for t in (d.get("tickers") or [])]
-            ]
-        data = data[:limit]
+    # Server-side ticker filtering — more reliable than client-side
+    params = {"limit": min(limit, 100)}
+    if ticker:
+        params["ticker"] = ticker.upper()
+    data = _get("/api/news/headlines", params)
+    data = data[:limit] if isinstance(data, list) else []
 
     _cache_set(key, data, "news")
-    return data if isinstance(data, list) else []
+    return data
 
 
 def get_congress_trades(ticker: str | None = None, limit: int = 20) -> list[dict]:

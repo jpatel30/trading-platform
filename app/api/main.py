@@ -285,6 +285,23 @@ async def get_ticker_signal_detail(ticker: str, user_id: str = Depends(get_curre
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/api/market/news", tags=["Market"])
+async def get_ticker_news(ticker: str, user_id: str = Depends(get_current_user)):
+    try:
+        from app.options_flow.unusual_whales import get_news_headlines
+        news = get_news_headlines(ticker=ticker.upper(), limit=10) or []
+        return [
+            {
+                "headline": n.get("headline") or n.get("title") or "",
+                "source":   n.get("source", ""),
+                "created_at": n.get("created_at", ""),
+            }
+            for n in news
+        ]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/api/market/status", tags=["Market"])
 async def market_status():
     from app.scanner.quick_scan import get_last_trading_date

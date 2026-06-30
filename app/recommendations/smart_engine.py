@@ -351,6 +351,33 @@ def _execute_smart_rec(rec: dict, budget: float, user_id: str | None) -> dict | 
         buy_str, sell_str = sell_str, buy_str
         print(f"[SmartMath] Auto-corrected CREDIT PUT strikes: BUY ${buy_str} SELL ${sell_str}")
 
+    # Snap to REAL listed strikes — LLM sometimes invents strikes that don't exist
+    # (e.g. $80.5 when only $80/$81/$82 are actually listed)
+    try:
+        from app.options_flow.unusual_whales import get_option_contracts
+        real_contracts = get_option_contracts(ticker, expiry=expiry, limit=200)
+        real_strikes = set()
+        for c in real_contracts:
+            sym = c.get("option_symbol", "")
+            for marker in ("C", "P"):
+                idx = sym.rfind(marker)
+                if idx > 0 and sym[idx+1:].isdigit() and len(sym[idx+1:]) == 8:
+                    real_strikes.add(round(int(sym[idx+1:]) / 1000.0, 2))
+        if real_strikes:
+            orig_buy, orig_sell = buy_str, sell_str
+            buy_str  = min(real_strikes, key=lambda s: abs(s - buy_str))
+            sell_str = min(real_strikes, key=lambda s: abs(s - sell_str))
+            if buy_str == sell_str:
+                # collision after snapping — pick next nearest distinct strike
+                remaining = sorted(real_strikes - {buy_str})
+                if remaining:
+                    sell_str = min(remaining, key=lambda s: abs(s - orig_sell))
+            if (buy_str, sell_str) != (orig_buy, orig_sell):
+                print(f"[SmartMath] Snapped to real strikes: "
+                      f"BUY ${orig_buy}→${buy_str} SELL ${orig_sell}→${sell_str}")
+    except Exception as e:
+        print(f"[SmartMath] Strike validation skipped: {e}")
+
     # Determine leg types from strategy
     is_put    = "PUT" in strategy
     leg_type  = "PUT" if is_put else "CALL"

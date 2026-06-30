@@ -32,24 +32,44 @@ def get_current_option_value(ticker: str, legs: list[dict]) -> float | None:
             return None
 
         # Build lookup: (strike, type_letter) -> mid price
+        # UW returns option_symbol like "AFRM260717C00085000" (no separate strike/type fields)
+        # Format: TICKER + YYMMDD + C/P + strike*1000 (8 digits)
         contract_map = {}
         for c in contracts:
-            strike   = float(c.get("strike", 0) or 0)
-            opt_type = (c.get("option_type") or c.get("type", "")).upper()
-            bid = float(c.get("bid", 0) or 0)
-            ask = float(c.get("ask", 0) or 0)
+            sym = c.get("option_symbol", "")
+            bid = float(c.get("nbbo_bid", 0) or c.get("bid", 0) or 0)
+            ask = float(c.get("nbbo_ask", 0) or c.get("ask", 0) or 0)
             mid = (bid + ask) / 2 if (bid and ask) else float(c.get("mid", 0) or 0)
-            if strike and opt_type and mid:
-                contract_map[(strike, opt_type[0])] = mid
+            if not sym or not mid:
+                continue
+            try:
+                # Find C or P marker, strike is the 8 digits after it
+                for marker in ("C", "P"):
+                    idx = sym.rfind(marker)
+                    if idx > 0 and sym[idx+1:].isdigit() and len(sym[idx+1:]) == 8:
+                        strike = int(sym[idx+1:]) / 1000.0
+                        contract_map[(strike, marker)] = mid
+                        break
+            except Exception:
+                continue
+
+        # Match legs with small tolerance for float precision
+        def _find_match(strike, type_key):
+            if (strike, type_key) in contract_map:
+                return contract_map[(strike, type_key)]
+            for (s, t), m in contract_map.items():
+                if t == type_key and abs(s - strike) < 0.01:
+                    return m
+            return None
 
         total_value = 0.0
         matched     = 0
         for leg in legs:
-            strike   = float(leg.get("strike", 0) or 0)
+            strike   = round(float(leg.get("strike", 0) or 0), 2)
             type_key = (leg.get("type", "")).upper()[:1]
             action   = leg.get("action", "")
 
-            current_mid = contract_map.get((strike, type_key))
+            current_mid = _find_match(strike, type_key)
             if current_mid is None:
                 continue
             matched += 1

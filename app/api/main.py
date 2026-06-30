@@ -632,7 +632,7 @@ async def get_history_grouped(
         with get_session() as s:
             rows = s.execute(text("""
                 SELECT id, ticker, direction, strategy, horizon, expiry,
-                       conviction_score, conviction_tier, thesis,
+                       conviction_score, conviction_tier, thesis, legs,
                        entry_debit, entry_zone_low, entry_zone_high,
                        current_value, current_pnl_dollars, current_pnl_pct,
                        mark_type, last_marked_at, status, date, created_at
@@ -654,6 +654,7 @@ async def get_history_grouped(
                 "conviction_score": r.conviction_score,
                 "conviction_tier": r.conviction_tier,
                 "thesis":          r.thesis,
+                "legs":            r.legs or [],
                 "entry_value":     float(r.entry_debit or r.entry_zone_low or 0),
                 "current_value":   float(r.current_value) if r.current_value is not None else None,
                 "pnl_dollars":     float(r.current_pnl_dollars) if r.current_pnl_dollars is not None else None,

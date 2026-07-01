@@ -340,38 +340,54 @@ async def get_portfolio(
             from app.broker.factory import get_broker
             broker    = get_broker(user_id)
             positions = broker.get_positions() or []
-            balances  = broker.get_balance()   or {}
+            balances  = broker.get_balances() or {}
             source    = "live"
 
-        # Build full response
-        pnl  = get_portfolio_pnl_summary(positions, balances) if positions else {}
-        bets = get_active_bets(positions, user_id=user_id)    if positions else []
+        # Extract correct values from Webull nested structure
+        acct      = (balances.get("account_currency_assets") or [{}])[0]
+        net_liq   = float(acct.get("net_liquidation_value") or balances.get("total_market_value") or 0)
+        cash      = float(balances.get("total_cash_balance") or acct.get("cash_balance") or 0)
+        pos_value = float(balances.get("total_market_value") or acct.get("positions_market_value") or 0)
 
-        net_liq   = float((balances.get("account_currency_assets") or [{}])[0].get("net_liquidation_value") or 0)
-        cash      = float(balances.get("total_cash_balance") or 0)
-        pos_value = float((balances.get("account_currency_assets") or [{}])[0].get("stock_value") or 0)
+        pnl  = get_portfolio_pnl_summary(positions, balances) if positions else {}
+        bets = get_active_bets(positions, user_id=user_id) if positions else []
 
         pnl["net_liq"]         = round(net_liq, 2)
         pnl["cash"]            = round(cash, 2)
         pnl["positions_value"] = round(pos_value, 2)
+        pnl["buying_power"]    = round(cash, 2)
 
-        # Merge type from pnl.positions into bets
-        pnl_pos  = pnl.get("positions", [])
-        type_map = {(p.get("symbol"), round(float(p.get("qty",0)),0)): p.get("type","STOCK") for p in pnl_pos}
+        # Merge type + option fields from pnl.positions into bets
+        pnl_pos = pnl.get("positions", [])
+        type_map = {}
+        for p in pnl_pos:
+            key = (p.get("symbol"), round(float(p.get("qty",0)),0))
+            type_map[key] = {
+                "type":       p.get("type", "STOCK"),
+                "unit_cost":  p.get("unit_cost"),
+                "last_price": p.get("last_price"),
+            }
         for bet in bets:
-            sym = bet.get("symbol","")
-            qty = round(float(bet.get("qty",0)),0)
-            if not bet.get("type"):
-                bet["type"] = type_map.get((sym, qty), "STOCK")
+            sym  = bet.get("symbol","")
+            qty  = round(float(bet.get("qty",0)),0)
+            info = type_map.get((sym, qty), {})
+            if "type" not in bet or not bet.get("type"):
+                bet["type"] = info.get("type","STOCK")
+            if not bet.get("unit_cost") and info.get("unit_cost"):
+                bet["unit_cost"]  = info["unit_cost"]
+            if not bet.get("last_price") and info.get("last_price"):
+                bet["last_price"] = info["last_price"]
 
         return {
-            "positions": pnl_pos,
-            "balances":  balances,
-            "pnl":       pnl,
-            "bets":      bets,
-            "source":    source,
+            "positions":     pnl_pos,  # typed positions for frontend
+            "balances":      balances,
+            "pnl":           pnl,
+            "bets":          bets,
+            "source":        source,
         }
     except Exception as e:
+        import traceback
+        print(f"[Portfolio API Error] {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

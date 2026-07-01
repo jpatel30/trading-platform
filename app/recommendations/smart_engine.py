@@ -283,7 +283,7 @@ Respond with valid JSON only — no text before or after."""
             "system": system,
             "stream": False,
             "options": {
-                "num_predict": 5000,
+                "num_predict": 10000,
                 "temperature": 0.05,
                 "top_p":       0.9,
                 "num_ctx":     8192,

@@ -140,22 +140,21 @@ STRIKE RULES:
 - Debit put spread: buy_strike HIGHER than sell_strike (e.g. buy $61P sell $58P)
 - Max 5% OTM from current price — no further
 
-Respond in valid JSON only:
+Respond in valid JSON only — be concise, max 20 words per text field:
 {{
-  "market_view": "one sentence on current market bias",
+  "market_view": "brief market bias",
   "picks": [
     {{
       "ticker": "AFRM",
       "status": "INTACT",
-      "status_reason": "2% dip is noise, RSI still 66, flow unchanged",
+      "status_reason": "brief reason",
       "direction": "BULLISH",
       "strategy": "DEBIT_CALL_SPREAD",
       "expiry": "2026-07-17",
       "buy_strike": 63.0,
       "sell_strike": 66.0,
-      "reasoning": "Breaking resistance with bullish flow",
-      "key_risk": "Close below $61",
-      "catalyst": "Momentum + bullish dark pool",
+      "reasoning": "brief thesis",
+      "key_risk": "brief risk",
       "confidence": 78
     }}
   ]

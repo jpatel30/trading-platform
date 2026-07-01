@@ -339,20 +339,38 @@ async def get_portfolio(
         if not positions:
             from app.broker.factory import get_broker
             broker    = get_broker(user_id)
-            try:
-                positions = broker.get_positions() or []
-            except Exception as pos_err:
-                if "429" in str(pos_err) or "TOO_MANY" in str(pos_err):
-                    print("[Portfolio] Webull 429 — using cached portfolio")
-                    from sqlalchemy import text as _t
-                    from app.db.session import get_session as _gs
-                    with _gs() as _s:
-                        _c = _s.execute(_t("SELECT positions, balances FROM portfolio_cache WHERE user_id=:uid"), {"uid": user_id}).fetchone()
-                    if _c:
-                        return {"positions": _c.positions or [], "balances": _c.balances or {}, "pnl": {}, "bets": [], "source": "cache_429"}
-                raise
-        positions = broker.get_positions()
-        return get_portfolio_pnl_summary(positions, None)
+            positions = broker.get_positions() or []
+            balances  = broker.get_balance()   or {}
+            source    = "live"
+
+        # Build full response
+        pnl  = get_portfolio_pnl_summary(positions, balances) if positions else {}
+        bets = get_active_bets(positions, user_id=user_id)    if positions else []
+
+        net_liq   = float((balances.get("account_currency_assets") or [{}])[0].get("net_liquidation_value") or 0)
+        cash      = float(balances.get("total_cash_balance") or 0)
+        pos_value = float((balances.get("account_currency_assets") or [{}])[0].get("stock_value") or 0)
+
+        pnl["net_liq"]         = round(net_liq, 2)
+        pnl["cash"]            = round(cash, 2)
+        pnl["positions_value"] = round(pos_value, 2)
+
+        # Merge type from pnl.positions into bets
+        pnl_pos  = pnl.get("positions", [])
+        type_map = {(p.get("symbol"), round(float(p.get("qty",0)),0)): p.get("type","STOCK") for p in pnl_pos}
+        for bet in bets:
+            sym = bet.get("symbol","")
+            qty = round(float(bet.get("qty",0)),0)
+            if not bet.get("type"):
+                bet["type"] = type_map.get((sym, qty), "STOCK")
+
+        return {
+            "positions": pnl_pos,
+            "balances":  balances,
+            "pnl":       pnl,
+            "bets":      bets,
+            "source":    source,
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

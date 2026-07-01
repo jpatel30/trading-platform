@@ -283,7 +283,7 @@ Respond with valid JSON only — no text before or after."""
             "system": system,
             "stream": False,
             "options": {
-                "num_predict": 1200,
+                "num_predict": 3000,
                 "temperature": 0.05,
                 "top_p":       0.9,
                 "num_ctx":     8192,
@@ -463,7 +463,7 @@ def run_smart_recommendations(
     earnings_post = get_earnings_afterhours() or []
     earnings_map  = _build_earnings_map(earnings_pre, earnings_post)
     all_flow      = get_flow_alerts(limit=500)       or []
-    all_dp        = get_dark_pool_recent(limit=500)  or []
+    all_dp        = get_dark_pool_recent(limit=200)  or []
 
     flow_by = {}
     for a in all_flow:

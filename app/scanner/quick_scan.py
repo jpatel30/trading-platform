@@ -514,7 +514,7 @@ def _get_uw_flow_signals(tickers: list[str]) -> dict[str, dict]:
     from app.options_flow.unusual_whales import get_flow_alerts, get_dark_pool_recent
     try:
         all_flow = get_flow_alerts(limit=500) or []
-        all_dp   = get_dark_pool_recent(limit=500) or []
+        all_dp   = get_dark_pool_recent(limit=200) or []
     except Exception as e:
         print(f"[UW Batch] Failed: {e}")
         return {}

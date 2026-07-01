@@ -339,7 +339,36 @@ async def get_portfolio(
         if not positions:
             from app.broker.factory import get_broker
             broker    = get_broker(user_id)
-            positions = broker.get_positions() or []
+            try:
+                positions = broker.get_positions() or []
+            except Exception as pos_err:
+                if "429" in str(pos_err) or "TOO_MANY" in str(pos_err):
+                    print("[Portfolio] Webull 429 — using cached portfolio")
+                    from sqlalchemy import text as _t
+                    from app.db.session import get_session as _gs
+                    with _gs() as _s:
+                        _c = _s.execute(_t("SELECT positions, balances FROM portfolio_cache WHERE user_id=:uid"), {"uid": user_id}).fetchone()
+                    if _c:
+                        return {"positions": _c.positions or [], "balances": _c.balances or {}, "pnl": {}, "bets": [], "source": "cache_429"}
+                raise
+            if "429" in str(pos_err) or "TOO_MANY" in str(pos_err):
+                # Rate limited — fall back to cached portfolio
+                print(f"[Portfolio] Webull 429 — using cached portfolio")
+                from sqlalchemy import text
+                from app.db.session import get_session
+                with get_session() as s:
+                    cached = s.execute(text(
+                        "SELECT positions, balances FROM portfolio_cache WHERE user_id=:uid"
+                    ), {"uid": user_id}).fetchone()
+                if cached:
+                    return {
+                        "positions": cached.positions or [],
+                        "balances":  cached.balances or {},
+                        "pnl":       {},
+                        "bets":      [],
+                        "source":    "cache_429",
+                    }
+            raise
             balances  = broker.get_balances() or {}
             source    = "live"
 
@@ -880,7 +909,27 @@ async def check_fills(user_id: str = Depends(get_current_user)):
         from datetime import date
 
         broker    = get_broker(user_id)
-        positions = broker.get_positions() or []
+        try:
+            positions = broker.get_positions() or []
+        except Exception as pos_err:
+            if "429" in str(pos_err) or "TOO_MANY" in str(pos_err):
+                # Rate limited — fall back to cached portfolio
+                print(f"[Portfolio] Webull 429 — using cached portfolio")
+                from sqlalchemy import text
+                from app.db.session import get_session
+                with get_session() as s:
+                    cached = s.execute(text(
+                        "SELECT positions, balances FROM portfolio_cache WHERE user_id=:uid"
+                    ), {"uid": user_id}).fetchone()
+                if cached:
+                    return {
+                        "positions": cached.positions or [],
+                        "balances":  cached.balances or {},
+                        "pnl":       {},
+                        "bets":      [],
+                        "source":    "cache_429",
+                    }
+            raise
         pos_symbols = {p.get("symbol","") for p in positions}
 
         with get_session() as s:

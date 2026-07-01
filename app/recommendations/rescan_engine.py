@@ -211,8 +211,8 @@ def rescan_with_validation(
     earnings_post = get_earnings_afterhours() or []
     earnings_map  = _build_earnings_map(earnings_pre, earnings_post)
 
-    all_flow = get_flow_alerts(limit=500)     or []
-    all_dp   = get_dark_pool_recent(limit=500) or []
+    all_flow = get_flow_alerts(limit=500)        or []
+    all_dp   = get_dark_pool_recent(limit=200)   or []   # max 200 for dp
     flow_by  = {}
     for a in all_flow: flow_by.setdefault(a.get("ticker",""), []).append(a)
     dp_by = {}
@@ -233,6 +233,41 @@ def rescan_with_validation(
         sells = sum(1 for d in prints if d.get("side") in ("SELL","B"))
         tot   = buys + sells
         batch_dp[ticker] = {"dp_score": round((buys-sells)/tot*100,1) if tot else 0}
+
+    # Alphabetical rotation — full 127-ticker UW coverage across 3 scans
+    from datetime import datetime as _dt
+    wl_sorted      = sorted(set(tickers))
+    batch_idx      = (_dt.now().minute // 20) % 3
+    rotation_slice = wl_sorted[batch_idx*43:(batch_idx+1)*43]
+    uncovered      = [t for t in rotation_slice if t not in batch_flow and t not in batch_dp][:15]
+    if uncovered:
+        print(f"[Rescan] Per-ticker UW for {len(uncovered)} uncovered (batch {batch_idx}): {uncovered[:5]}...")
+        from concurrent.futures import ThreadPoolExecutor, as_completed as _ac
+        def _tf(t):
+            try:
+                from app.options_flow.unusual_whales import get_flow_alerts as _fa, get_dark_pool_ticker as _dp
+                return t, _fa(ticker=t, limit=20) or [], _dp(t, limit=20) or []
+            except Exception:
+                return t, [], []
+        with ThreadPoolExecutor(max_workers=5) as ex:
+            for fut in _ac({ex.submit(_tf, t): t for t in uncovered}, timeout=15):
+                try:
+                    t, tf, td = fut.result()
+                    if tf:
+                        bull = sum(1 for a in tf if a.get("sentiment") in ("BULLISH","CALL"))
+                        bear = sum(1 for a in tf if a.get("sentiment") in ("BEARISH","PUT"))
+                        tot  = bull + bear
+                        batch_flow[t] = {"flow_score": round((bull-bear)/tot*100,1) if tot else 0,
+                                         "sweeps": sum(1 for a in tf if a.get("is_sweep"))}
+                    if td:
+                        buys  = sum(1 for d in td if d.get("side") in ("BUY","A"))
+                        sells = sum(1 for d in td if d.get("side") in ("SELL","B"))
+                        tot   = buys + sells
+                        batch_dp[t] = {"dp_score": round((buys-sells)/tot*100,1) if tot else 0}
+                except Exception:
+                    pass
+        print(f"[Rescan] Total UW coverage: {len(batch_flow)} flow + {len(batch_dp)} dp tickers")
+
 
     # ── Step 4: Scan + enrich ─────────────────────────────────────────────────
     if pre_scanned:
@@ -263,11 +298,13 @@ def rescan_with_validation(
     llm_result = _call_smart_llm(prompt)
 
     if not llm_result:
-        # LLM failed — return morning picks unchanged
+        # LLM failed — return morning picks but still filter to options only
+        option_picks = [p for p in morning_picks if p.get("legs") and len(p.get("legs",[])) > 0]
+        print(f"[Rescan] LLM failed — returning {len(option_picks)} cached option picks (filtered from {len(morning_picks)})")
         return {
-            "picks":       morning_picks,
+            "picks":       option_picks,
             "market_view": "",
-            "source":      "morning_cache",
+            "source":      "morning_cache_fallback",
             "elapsed":     round(time.time()-t_start, 1),
         }
 
@@ -345,6 +382,9 @@ def rescan_with_validation(
                     })
                 except Exception as e:
                     print(f"[Rescan] Store failed {ticker}: {e}")
+
+    # Filter: only return picks that have legs (options only — no stock leakage)
+    final = [p for p in final if p.get("legs") and len(p.get("legs", [])) > 0]
 
     # Sort: UPDATED first, then INTACT by conviction, BROKEN last
     status_order = {STATUS_UPDATED: 0, STATUS_NEW: 1, STATUS_INTACT: 2, STATUS_BROKEN: 99}

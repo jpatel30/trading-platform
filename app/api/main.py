@@ -479,15 +479,6 @@ async def get_daily_recs(
                 for rec in results:
                     ticker = rec.get("ticker","")
                     if not ticker: continue
-
-                            except Exception as e:
-                                print(f"[StockScan] Store failed for {ticker}: {e}")
-
-                        if len(results) >= 5:
-                            break
-                    except Exception:
-                        continue
-
                 return {
                     "recommendations": [],
                     "stocks":          results,

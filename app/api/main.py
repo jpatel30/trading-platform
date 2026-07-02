@@ -338,10 +338,39 @@ async def get_portfolio(
 
         if not positions:
             from app.broker.factory import get_broker
-            broker    = get_broker(user_id)
-            positions = broker.get_positions() or []
-            balances  = broker.get_balances() or {}
-            source    = "live"
+            broker = get_broker(user_id)
+
+            # Webull rate limit protection — min 30s between live fetches per user
+            import time
+            from sqlalchemy import text
+            from app.db.session import get_session
+            now = time.time()
+            _last_fetch = getattr(get_portfolio, f"_last_{user_id}", 0)
+            if now - _last_fetch < 30 and not live:
+                # Too soon — use cache
+                _cache = get_cached_portfolio(user_id)
+                if _cache:
+                    positions = _cache.get("positions") or []
+                    balances  = _cache.get("balances")  or {}
+                    source    = "cache_cooldown"
+            if not positions:
+                try:
+                    positions = broker.get_positions() or []
+                    balances  = broker.get_balances()   or {}
+                    source    = "live"
+                    setattr(get_portfolio, f"_last_{user_id}", now)
+                except Exception as _we:
+                    if "429" in str(_we) or "TOO_MANY" in str(_we):
+                        print(f"[Portfolio] Webull 429 — using cache")
+                        _cache = get_cached_portfolio(user_id)
+                        if _cache:
+                            positions = _cache.get("positions") or []
+                            balances  = _cache.get("balances")  or {}
+                            source    = "cache_429"
+                        else:
+                            raise
+                    else:
+                        raise
 
         # Extract correct values from Webull nested structure
         acct      = (balances.get("account_currency_assets") or [{}])[0]

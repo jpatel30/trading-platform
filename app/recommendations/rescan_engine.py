@@ -282,7 +282,7 @@ def rescan_with_validation(
             ex.submit(_enrich_ticker, c, earnings_map, batch_flow, batch_dp): c["ticker"]
             for c in candidates
         }
-        for future in as_completed(futures, timeout=20):
+        for future in as_completed(futures, timeout=90):
             try: enriched.append(future.result())
             except Exception: pass
 

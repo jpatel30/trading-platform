@@ -197,6 +197,7 @@ def run_smart_stock_scan(
     prices    = {}
     fast_data = {}
 
+    import yfinance as yf
     def _fetch_fast(ticker):
         try:
             fi = yf.Ticker(ticker).fast_info

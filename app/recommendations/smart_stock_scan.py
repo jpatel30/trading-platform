@@ -29,22 +29,14 @@ def _score_fundamentals(ticker: str, price: float) -> dict:
         # Use fast_info first (no network call if cached)
         fi = t.fast_info
 
-        # Get analyst target (requires .info — may be slow first time)
+        # Phase 1: lightweight only — skip slow .info call
+        # Full fundamentals run in Phase 2 via get_stock_for_horizon
         try:
-            info           = t.info
-            target_mean    = info.get("targetMeanPrice", 0) or 0
-            peg            = info.get("pegRatio", 0) or 0
-            revenue_growth = info.get("revenueGrowth", 0) or 0
-            profit_margin  = info.get("profitMargins", 0) or 0
-            analyst_count  = info.get("numberOfAnalystOpinions", 0) or 0
-            rec_mean       = info.get("recommendationMean", 3.0) or 3.0
+            apt = t.analyst_price_targets  # fast, cached
+            target_mean = float(apt.get("mean", 0) or 0) if isinstance(apt, dict) else 0
         except Exception:
-            target_mean    = 0
-            peg            = 0
-            revenue_growth = 0
-            profit_margin  = 0
-            analyst_count  = 0
-            rec_mean       = 3.0
+            target_mean = 0
+        peg = 0; revenue_growth = 0; profit_margin = 0; analyst_count = 0; rec_mean = 3.0
 
         if not price or price <= 0:
             return {"score": 0, "filtered": True, "reason": "no price"}
@@ -257,7 +249,7 @@ def run_smart_stock_scan(
     candidates = []
     with ThreadPoolExecutor(max_workers=20) as ex:
         futures = {ex.submit(_score_ticker, t): t for t in tickers}
-        for fut in as_completed(futures, timeout=60):
+        for fut in as_completed(futures, timeout=120):
             try:
                 result = fut.result()
                 if not result.get("filtered") and result.get("composite", 0) > 0:

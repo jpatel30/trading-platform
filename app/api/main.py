@@ -480,34 +480,6 @@ async def get_daily_recs(
                     ticker = rec.get("ticker","")
                     if not ticker: continue
 
-                            # Persist to daily_recommendations for History tab
-                            try:
-                                from app.recommendations.daily_engine import _upsert_recommendation
-                                _upsert_recommendation(user_id, {
-                                    "ticker":           ticker,
-                                    "horizon":          horizon,
-                                    "direction":        rec.get("direction", "BULLISH"),
-                                    "conviction_score": rec.get("fundamental_score", 65),
-                                    "conviction_tier":  "HIGH" if rec.get("fundamental_score",0)>=75 else "MODERATE",
-                                    "act_now":          True,
-                                    "position_size_guidance": "standard",
-                                    "thesis":           rec.get("thesis", ""),
-                                    "entry_zone_low":   rec.get("entry_price", price),
-                                    "entry_zone_high":  rec.get("entry_price", price),
-                                    "entry_trigger":    "AT_MARKET",
-                                    "target_price":     rec.get("target_price", 0),
-                                    "target_pct":       rec.get("target_pct", 0),
-                                    "stop_price":       rec.get("stop_price", 0),
-                                    "stop_pct":         rec.get("stop_pct", -15),
-                                    "timeframe":        horizon,
-                                    "invalidation_conditions": rec.get("invalidation_conditions", ""),
-                                    "strategy":         "STOCK",
-                                    "legs":             [],
-                                    "key_news":         "NONE",
-                                    "warnings":         [],
-                                    "conviction_breakdown": {},
-                                    "signal_data":      {"rec_type": "stock"},
-                                })
                             except Exception as e:
                                 print(f"[StockScan] Store failed for {ticker}: {e}")
 

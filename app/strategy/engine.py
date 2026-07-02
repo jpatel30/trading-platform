@@ -134,6 +134,9 @@ def _get_yf_strikes(ticker: str, expiry: str) -> tuple[list, list]:
         return [], []
 
 
+import warnings as _warnings
+_warnings.filterwarnings("ignore", category=RuntimeWarning, module="vollib")
+
 def _uw_price_for_strike(
     uw_chain: dict,
     strike: float,

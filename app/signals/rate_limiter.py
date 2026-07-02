@@ -45,7 +45,8 @@ class TokenBucket:
 
 # Global singleton — shared across all threads, all UW calls
 # 110/min used (buffer below 120 hard limit)
-_uw_bucket = TokenBucket(rate=110/60, capacity=10)
+# capacity=3: allows small burst but prevents 95 calls firing in 3s
+_uw_bucket = TokenBucket(rate=110/60, capacity=3)
 
 
 def acquire_uw_token():

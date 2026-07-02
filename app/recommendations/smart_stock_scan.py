@@ -193,25 +193,49 @@ def run_smart_stock_scan(
     except Exception as e:
         print(f"[StockScan] Velocity cache failed: {e}")
 
-    # Get live prices for all tickers (fast)
-    prices = {}
-    try:
-        import yfinance as yf
-        for ticker in tickers:
-            try:
-                prices[ticker] = yf.Ticker(ticker).fast_info.last_price or 0
-            except Exception:
-                prices[ticker] = 0
-    except Exception:
-        pass
+    # Fetch prices + fast_data for all tickers in parallel (yfinance fast_info)
+    prices    = {}
+    fast_data = {}
+
+    def _fetch_fast(ticker):
+        try:
+            fi = yf.Ticker(ticker).fast_info
+            p  = fi.last_price or 0
+            pc = fi.previous_close or p
+            return ticker, {
+                "price":      round(p, 2),
+                "prev_close": round(pc, 2),
+                "change_pct": round((p - pc) / pc * 100, 2) if pc else 0,
+                "volume":     fi.last_volume or 0,
+                "market_cap": fi.market_cap or 0,
+                "52w_high":   fi.year_high or 0,
+                "52w_low":    fi.year_low or 0,
+                "50d_avg":    fi.fifty_day_average or 0,
+                "200d_avg":   fi.two_hundred_day_average or 0,
+                "year_chg":   round((fi.year_change or 0) * 100, 1),
+            }
+        except Exception:
+            return ticker, {"price": 0}
+
+    t_price = time.time()
+    with ThreadPoolExecutor(max_workers=20) as ex:
+        for ticker, data in ex.map(_fetch_fast, tickers):
+            fast_data[ticker] = data
+            prices[ticker]    = data.get("price", 0)
+    print(f"[StockScan] Prices fetched in {time.time()-t_price:.1f}s")
 
     # Phase 1: Parallel scoring of all tickers
     def _score_ticker(ticker: str) -> dict:
-        price = prices.get(ticker, 0)
+        fd    = fast_data.get(ticker, {})
+        price = fd.get("price", 0)
         if not price:
             return {"ticker": ticker, "composite": 0, "filtered": True}
 
-        fund     = _score_fundamentals(ticker, price)
+        # Skip very low volume tickers
+        if fd.get("volume", 0) < 50_000:
+            return {"ticker": ticker, "composite": 0, "filtered": True, "reason": "low_volume"}
+
+        fund = _score_fundamentals(ticker, price)
         velocity = _score_velocity(ticker, user_id, velocity_cache)
         insider  = _score_insider(ticker)
 
@@ -238,6 +262,11 @@ def run_smart_stock_scan(
             "peg":             fund.get("peg", 0),
             "revenue_growth":  fund.get("revenue_growth", 0),
             "velocity":        velocity.get("velocity", 0),
+            "volume":         fd.get("volume", 0),
+            "change_pct_today": fd.get("change_pct", 0),
+            "above_50d":      price > fd.get("50d_avg", price),
+            "near_52w_high":  price >= fd.get("52w_high", price) * 0.90,
+            "year_chg":       fd.get("year_chg", 0),
             "velocity_dir":    velocity.get("direction", "NEUTRAL"),
             "insider_signal":  insider.get("signal", "NEUTRAL"),
             "csuite_buy":      insider.get("csuite_buy", False),

@@ -61,6 +61,11 @@ BASE = "https://api.unusualwhales.com"
 
 
 def _get(path: str, params: dict | None = None) -> Any:
+    try:
+        from app.signals.rate_limiter import acquire_uw_token
+        acquire_uw_token()
+    except Exception:
+        pass
     """Make a GET request, return response .json()['data'] or full response."""
     if not settings.unusual_whales_token:
         raise RuntimeError("UNUSUAL_WHALES_TOKEN is not set in .env")

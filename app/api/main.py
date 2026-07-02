@@ -580,6 +580,17 @@ async def get_rec_history(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/api/signals/save-daily", tags=["Signals"])
+async def trigger_daily_snapshot(user_id: str = Depends(get_current_user)):
+    """Manually trigger daily signal snapshot (normally runs at 4:15 PM ET)."""
+    try:
+        from app.signals.velocity_tracker import save_daily_signals
+        result = save_daily_signals(user_id)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/api/recommendations/history-grouped", tags=["Recommendations"])
 async def get_history_grouped(
     days_back: int = 30,

@@ -660,6 +660,20 @@ def quick_scan(
         scored.sort(key=lambda x: abs(x.get("change_pct", 0)), reverse=True)
 
     elapsed = round(time.time() - t0, 1)
+    # Apply velocity multipliers from signal history
+    try:
+        from app.signals.velocity_tracker import get_velocity_scores, apply_velocity_to_picks
+        from app.utils.current_user import get_current_user_id
+        uid = user_id or get_current_user_id()
+        if uid and scored:
+            vel = get_velocity_scores([p["ticker"] for p in scored], uid)
+            if vel:
+                scored = apply_velocity_to_picks(scored, vel)
+                scored.sort(key=lambda x: x["score"], reverse=True)
+                print(f"[Quick Scan] Velocity applied: {sum(1 for p in scored if p.get('velocity',0) > 20)} accelerating tickers")
+    except Exception as e:
+        pass  # velocity scoring optional — never blocks scan
+
     mode    = "LIVE convergence" if market_open else "HOLIDAY/WEEKEND — momentum only, no live flow"
     print(f"[Quick Scan] Done in {elapsed}s. {len(scored)} picks → top {top_n} | Mode: {mode}")
     return scored[:top_n]

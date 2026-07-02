@@ -116,16 +116,54 @@ def _enrich_ticker(
     except Exception:
         result["news"] = []
 
-    # Live price from UW (overrides stale scanner price from Polygon grouped_daily)
+    # Live price from UW
     try:
         from app.options_flow.unusual_whales import get_stock_state
         state = get_stock_state(ticker)
         if state and state.get("price"):
-            result["price"]      = float(state["price"])
-            result["live_price"] = True
+            result["price"]       = float(state["price"])
+            result["live_price"]  = True
             result["market_time"] = state.get("market_time", "regular")
     except Exception:
         pass
+
+    # GEX — affects strategy (negative GEX = dealers short gamma = directional moves amplified)
+    try:
+        from app.options_flow.unusual_whales import get_gex
+        gex_data = get_gex(ticker) or {}
+        gex_val  = float(gex_data.get("gamma_exposure") or gex_data.get("gex") or 0)
+        result["gex_score"]     = gex_val
+        result["gex_negative"]  = gex_val < 0   # True = acceleration likely
+        result["gex_signal"]    = "ACCELERATION" if gex_val < 0 else "MEAN_REVERSION"
+    except Exception:
+        result["gex_score"] = 0
+        result["gex_negative"] = False
+        result["gex_signal"] = "UNKNOWN"
+
+    # Insider activity from SEC EDGAR
+    try:
+        from app.signals.edgar_insider import get_insider_signal_for_llm, get_insider_activity
+        insider = get_insider_activity(ticker, days=5)
+        result["insider_signal"] = insider.get("signal", "NEUTRAL")
+        result["insider_text"]   = get_insider_signal_for_llm(ticker)
+        result["insider_csuite_buy"]  = insider.get("csuite_buy", False)
+        result["insider_csuite_sell"] = insider.get("csuite_sell", False)
+    except Exception:
+        result["insider_signal"] = "NEUTRAL"
+        result["insider_text"]   = "No insider data"
+
+    # Velocity from signal history
+    try:
+        from app.signals.velocity_tracker import get_velocity_scores
+        vel = get_velocity_scores([ticker], pick.get("user_id","") or "")
+        if vel.get(ticker):
+            v = vel[ticker]
+            result["velocity"]     = v.get("velocity", 0)
+            result["velocity_dir"] = v.get("direction", "STABLE")
+            result["days_tracked"] = v.get("days_data", 0)
+    except Exception:
+        result["velocity"]     = 0
+        result["velocity_dir"] = "STABLE"
 
     # TA from UW bars
     try:
@@ -198,6 +236,8 @@ def _compress_ticker(t: dict) -> str:
         f"{earn_str}]\n"
         f"  Expiries: {expiry_str}\n"
         f"  News: {news_str}"
+    
+        f" GEX:{'NEG' if t.get('gex_negative') else 'POS'} Vel:{t.get('velocity',0):+.0f}% Insider:{t.get('insider_signal','N')}"
     )
 
 

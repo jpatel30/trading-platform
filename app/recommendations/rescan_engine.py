@@ -34,6 +34,8 @@ def _load_todays_recs(user_id: str) -> list[dict]:
                        signal_data, created_at
                 FROM daily_recommendations
                 WHERE user_id=:uid AND date=CURRENT_DATE AND status='ACTIVE'
+                  AND strategy != 'STOCK'
+                  AND legs IS NOT NULL AND jsonb_array_length(legs) > 0
                 ORDER BY conviction_score DESC
             """), {"uid": user_id}).fetchall()
 

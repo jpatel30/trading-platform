@@ -637,7 +637,15 @@ def quick_scan(
 
         # Overall score: convergence × signal count × flow intensity
         flow_intensity = abs(flow_data.get("flow_score", 0)) if flow_data else 0
-        score = (len(signals) / 3) * (confidence / 100) * (1 + flow_intensity / 100)
+        # TA bonus when no live flow
+        price  = float(t.get("price", 0) or 0)
+        prev_c = float(t.get("prev_close", 0) or 0)
+        sma_50 = float(t.get("sma_50", 0) or 0)
+        ta_bonus = 0.0
+        if price and prev_c and price > prev_c:          ta_bonus += 0.05
+        if price and sma_50 and price > sma_50:          ta_bonus += 0.05
+        if 40 < float(t.get("rsi", 50) or 50) < 65:     ta_bonus += 0.03
+        score = (len(signals) / 3) * (confidence / 100) * (1 + flow_intensity / 100) + ta_bonus
 
         scored.append({
             "ticker":      ticker,
@@ -676,6 +684,7 @@ def quick_scan(
 
     mode    = "LIVE convergence" if market_open else "HOLIDAY/WEEKEND — momentum only, no live flow"
     print(f"[Quick Scan] Done in {elapsed}s. {len(scored)} picks → top {top_n} | Mode: {mode}")
+
     return scored[:top_n]
 
 

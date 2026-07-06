@@ -281,16 +281,22 @@ def rescan_with_validation(
         days = (4 - today.weekday()) % 7 or 7
         return (today + timedelta(days=days + weeks*7)).strftime("%Y-%m-%d")
 
+    # Get live prices for SPY/QQQ
+    import yfinance as _yf
+    _spy_p = _yf.Ticker("SPY").fast_info.last_price or 0
+    _qqq_p = _yf.Ticker("QQQ").fast_info.last_price or 0
+
     index_candidates = [
-        {"ticker": "SPY", "direction": "UNKNOWN", "price": 0, "confidence": 70,
+        {"ticker": "SPY", "direction": "UNKNOWN", "price": _spy_p, "confidence": 75,
          "change_pct": 0, "flow_score": 0, "dp_score": 0, "sweeps": 0,
          "alert_count": 0, "score": 1.0, "signals": ["index"],
          "forced_expiry": _next_friday(0)},
-        {"ticker": "QQQ", "direction": "UNKNOWN", "price": 0, "confidence": 70,
+        {"ticker": "QQQ", "direction": "UNKNOWN", "price": _qqq_p, "confidence": 75,
          "change_pct": 0, "flow_score": 0, "dp_score": 0, "sweeps": 0,
          "alert_count": 0, "score": 1.0, "signals": ["index"],
          "forced_expiry": _next_friday(1)},
     ]
+    print(f"[Rescan] SPY=${_spy_p:.2f} exp={_next_friday(0)} | QQQ=${_qqq_p:.2f} exp={_next_friday(1)}")
     # Prepend index picks, then fill remaining slots from scanner
     other_picks = [p for p in picks if p["ticker"] not in ("SPY","QQQ") and _is_optionable(p)]
     candidates = index_candidates + other_picks[:10]

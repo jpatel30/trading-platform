@@ -157,6 +157,11 @@ BROKEN  → price moved significantly AGAINST thesis OR thesis condition violate
     horizon_label   = _horizon_labels.get(horizon or "1w", "SHORT TERM")
     expiry_guidance = _expiry_guidance.get(horizon or "1w", "Pick appropriate expiry from candidate list.")
 
+    # Example expiry for JSON schema — use midpoint of the horizon range
+    from datetime import date as _d2, timedelta as _td2
+    _example_offsets = {"1w":5,"2w":11,"1m":30,"3m":75,"6m":150}
+    _example_expiry  = (_d2.today() + _td2(_example_offsets.get(horizon or "1w", 30))).strftime("%Y-%m-%d")
+
     return f"""You are managing real money. Today is {today}. Budget: ${budget:.0f}.
 
 MARKET: VIX {vix.get('current', 17)} ({vix.get('zone','NORMAL')}) | {vix.get('trend','STABLE')}{regime_str}
@@ -195,7 +200,7 @@ Respond ONLY with compact JSON — no prose, no markdown:
   }},
   "new_picks": [
     {{"ticker": "X", "direction": "BULLISH", "strategy": "DEBIT_CALL_SPREAD",
-     "expiry": "2026-07-17", "buy_strike": 0.0, "sell_strike": 0.0,
+     "expiry": "{example_expiry}", "buy_strike": 0.0, "sell_strike": 0.0,
      "reasoning": "brief", "key_risk": "brief", "confidence": 70}}
   ]
 }}"""
@@ -472,11 +477,7 @@ def rescan_with_validation(
             trade["status"]        = STATUS_NEW
             trade["status_reason"] = "Fresh pick"
             trade["confidence"]    = rec["confidence"]
-            # Force correct expiry for index picks (SPY/QQQ)
-            _idx_map = {ip["ticker"]: ip.get("forced_expiry","") for ip in index_candidates}
-            if ticker in _idx_map and _idx_map[ticker]:
-                trade["expiry"] = _idx_map[ticker]
-                print(f"[Rescan] Forced {ticker} expiry → {_idx_map[ticker]}")
+
             final.append(trade)
 
             # Store to DB

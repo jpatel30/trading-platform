@@ -438,6 +438,14 @@ def _execute_smart_rec(rec: dict, budget: float, user_id: str | None) -> dict | 
     except Exception as e:
         print(f"[SmartMath] Strike validation skipped: {e}")
 
+    # Re-run direction check AFTER snapping — snapping can re-invert strikes
+    if "DEBIT_CALL_SPREAD" in strategy and buy_str > sell_str:
+        buy_str, sell_str = sell_str, buy_str
+        print(f"[SmartMath] Post-snap correction CALL: BUY ${buy_str} SELL ${sell_str}")
+    elif "DEBIT_PUT_SPREAD" in strategy and buy_str < sell_str:
+        buy_str, sell_str = sell_str, buy_str
+        print(f"[SmartMath] Post-snap correction PUT: BUY ${buy_str} SELL ${sell_str}")
+
     # Determine legs from strategy
     is_credit = "CREDIT" in strategy or "IRON" in strategy
 

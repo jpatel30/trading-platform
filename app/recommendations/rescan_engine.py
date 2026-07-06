@@ -134,8 +134,12 @@ NEWS: {news_str}
 
 === YOUR TASK ===
 1. Validate each morning pick (INTACT/UPDATED/BROKEN)
-2. Find NEW picks from fresh candidates (only if not overlapping INTACT picks)
-3. Return single merged list ranked by conviction (highest first)
+2. REQUIRED: Always include SPY (this week expiry) and QQQ (next week expiry) in new_picks
+   - Decide direction based on VIX trend + market flow
+   - Pick best strategy: NAKED_CALL, NAKED_PUT, DEBIT_CALL_SPREAD, DEBIT_PUT_SPREAD, STRADDLE, STRANGLE
+   - If VIX FALLING + bullish flow → CALL strategy; if VIX RISING → PUT or STRADDLE
+3. Find additional NEW picks from fresh candidates
+4. Return morning_status for existing picks + new_picks ranked by conviction
 
 STRIKE RULES:
 - Debit call spread: buy_strike LOWER than sell_strike (e.g. buy $62C sell $65C)
@@ -269,7 +273,27 @@ def rescan_with_validation(
     else:
         picks = quick_scan(tickers, user_id=user_id, top_n=15)
 
-    candidates = [p for p in picks if _is_optionable(p)][:12]
+
+    # Always include SPY + QQQ with next expiry dates
+    def _next_friday(weeks=0):
+        from datetime import date, timedelta
+        today = date.today()
+        days = (4 - today.weekday()) % 7 or 7
+        return (today + timedelta(days=days + weeks*7)).strftime("%Y-%m-%d")
+
+    index_candidates = [
+        {"ticker": "SPY", "direction": "UNKNOWN", "price": 0, "confidence": 70,
+         "change_pct": 0, "flow_score": 0, "dp_score": 0, "sweeps": 0,
+         "alert_count": 0, "score": 1.0, "signals": ["index"],
+         "forced_expiry": _next_friday(0)},
+        {"ticker": "QQQ", "direction": "UNKNOWN", "price": 0, "confidence": 70,
+         "change_pct": 0, "flow_score": 0, "dp_score": 0, "sweeps": 0,
+         "alert_count": 0, "score": 1.0, "signals": ["index"],
+         "forced_expiry": _next_friday(1)},
+    ]
+    # Prepend index picks, then fill remaining slots from scanner
+    other_picks = [p for p in picks if p["ticker"] not in ("SPY","QQQ") and _is_optionable(p)]
+    candidates = index_candidates + other_picks[:10]
 
     enriched = []
     with ThreadPoolExecutor(max_workers=6) as ex:

@@ -50,6 +50,7 @@ def _load_todays_recs(user_id: str) -> list[dict]:
                 "expiry":            str(r.expiry) if r.expiry else "",
                 "dte":               r.dte or 17,
                 "conviction":        r.conviction_score or 65,
+                "confidence":        r.conviction_score or 65,
                 "thesis":            r.thesis or "",
                 "webull_instructions": r.webull_instructions or "",
                 "legs":              r.legs or [],
@@ -353,11 +354,10 @@ def rescan_with_validation(
             "elapsed":     round(time.time()-t_start, 1),
         }
 
-    print(f"[Rescan] LLM responded with {len(llm_result.get('picks',[]))} picks")
-
     # ── Step 6: Execute math for NEW/UPDATED picks, keep INTACT as-is ────────
     final = []
     morning_by_ticker = {p["ticker"]: p for p in morning_picks}
+    print(f"[Rescan] morning_by_ticker: {list(morning_by_ticker.keys())}")
 
     # ── Parse compact format: morning_status + new_picks ─────────────────
     morning_status = llm_result.get("morning_status", {})

@@ -620,6 +620,17 @@ def quick_scan(
             signals.append(f"dark_pool {flow_data['dp_count']} prints")
             directions.append(flow_data["direction"])
 
+        # Signal 4: TA momentum (tiebreaker when flow absent)
+        rsi       = float(price_data.get("rsi", 0) or 0)
+        sma_50    = float(price_data.get("sma_50", 0) or 0)
+        price_val = float(price_data.get("price", 0) or 0)
+        chg       = float(price_data.get("change_pct", 0) or 0)
+        if sma_50 and price_val > sma_50 * 1.01 and 40 < rsi < 70 and chg > 0.3:
+            signals.append(f"ta_bullish rsi={rsi:.0f}")
+            directions.append("BULLISH")
+        elif sma_50 and price_val < sma_50 * 0.99 and (rsi > 65 or chg < -0.3):
+            signals.append(f"ta_bearish rsi={rsi:.0f}")
+            directions.append("BEARISH")
         if len(signals) < min_convergence:
             continue
 
@@ -637,15 +648,7 @@ def quick_scan(
 
         # Overall score: convergence × signal count × flow intensity
         flow_intensity = abs(flow_data.get("flow_score", 0)) if flow_data else 0
-        # TA bonus when no live flow
-        price  = float(t.get("price", 0) or 0)
-        prev_c = float(t.get("prev_close", 0) or 0)
-        sma_50 = float(t.get("sma_50", 0) or 0)
-        ta_bonus = 0.0
-        if price and prev_c and price > prev_c:          ta_bonus += 0.05
-        if price and sma_50 and price > sma_50:          ta_bonus += 0.05
-        if 40 < float(t.get("rsi", 50) or 50) < 65:     ta_bonus += 0.03
-        score = (len(signals) / 3) * (confidence / 100) * (1 + flow_intensity / 100) + ta_bonus
+        score = (len(signals) / 3) * (confidence / 100) * (1 + flow_intensity / 100)
 
         scored.append({
             "ticker":      ticker,

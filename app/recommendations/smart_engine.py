@@ -336,7 +336,11 @@ Respond with valid JSON only — no text before or after."""
         match = re.search(r'\{.*\}', raw, re.DOTALL)
         if match:
             data = json.loads(match.group())
-            if "recommendations" in data:
+            # Accept both old format (recommendations) and new compact format
+            if ("recommendations" in data
+                    or "morning_status" in data
+                    or "new_picks" in data
+                    or "picks" in data):
                 return data
         print(f"[SmartLLM] Could not parse: {raw[:200]}")
         return None

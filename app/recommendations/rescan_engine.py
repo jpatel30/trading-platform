@@ -135,6 +135,18 @@ BROKEN  → price moved significantly AGAINST thesis OR thesis condition violate
             f"\nOVERALL BIAS: {regime.get('overall_bias','?')} — {regime.get('strategy_hint','')}"
         )
 
+    # Horizon guidance for LLM
+    _horizon_labels = {"1w":"1 WEEK","2w":"2 WEEKS","1m":"1 MONTH","3m":"3 MONTHS","6m":"6 MONTHS"}
+    _expiry_guidance = {
+        "1w": "Pick expiry THIS week (Jul 10-11). Use near ATM strikes.",
+        "2w": "Pick expiry NEXT week (Jul 17-18). Use slightly OTM strikes.",
+        "1m": "Pick expiry 3-5 WEEKS OUT (Aug 1-22). Longer DTE = more time.",
+        "3m": "Pick expiry 8-12 WEEKS OUT (Sep-Oct). Use wider spreads.",
+        "6m": "Pick expiry 20-26 WEEKS OUT (Dec-Jan LEAPS). Deep ITM or wide spreads.",
+    }
+    horizon_label   = _horizon_labels.get(budget and horizon or "1w", "SHORT TERM")
+    expiry_guidance = _expiry_guidance.get(horizon or "1w", "Pick appropriate expiry.")
+
     return f"""You are managing real money. Today is {today}. Budget: ${budget:.0f}.
 
 MARKET: VIX {vix.get('current', 17)} ({vix.get('zone','NORMAL')}) | {vix.get('trend','STABLE')}{regime_str}
@@ -156,6 +168,9 @@ NEWS: {news_str}
 
 ⚠️  USE EXACT PRICES SHOWN ABOVE — do NOT use your training data prices.
 SPY trades around $750, QQQ around $720 as of today. Use the price shown in brackets.
+
+HORIZON: {horizon_label}
+{expiry_guidance}
 
 STRIKE RULES:
 - Debit call spread: buy_strike LOWER than sell_strike (e.g. buy $62C sell $65C)

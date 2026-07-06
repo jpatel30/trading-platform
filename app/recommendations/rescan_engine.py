@@ -20,7 +20,7 @@ STATUS_BROKEN  = "BROKEN"   # proven wrong, drop it
 STATUS_NEW     = "NEW"      # fresh pick from rescan
 
 
-def _load_todays_recs(user_id: str, horizon: str = "") -> list[dict]:
+def _load_todays_recs(user_id: str, horizon: str = "", min_exp: str = "", max_exp: str = "") -> list[dict]:
     """Load today's active recommendations from DB."""
     try:
         from sqlalchemy import text
@@ -37,8 +37,15 @@ def _load_todays_recs(user_id: str, horizon: str = "") -> list[dict]:
                   AND strategy != 'STOCK'
                   AND legs IS NOT NULL AND jsonb_array_length(legs) > 0
                   AND (:horizon = '' OR horizon = :horizon)
+                  AND (:min_exp = '' OR expiry >= :min_exp::date)
+                  AND (:max_exp = '' OR expiry <= :max_exp::date)
                 ORDER BY conviction_score DESC
-            """), {"uid": user_id, "horizon": horizon}).fetchall()
+            """), {
+                "uid": user_id,
+                "horizon": horizon,
+                "min_exp": min_exp,
+                "max_exp": max_exp,
+            }).fetchall()
 
         picks = []
         for r in rows:
@@ -228,7 +235,22 @@ def rescan_with_validation(
     _horizon_map = {"1w":"1w","2w":"2w","1m":"1m","3m":"3m","6m":"6m",
                     "17d":"1w","30d":"1m","21d":"2w","90d":"3m","180d":"6m"}
     _norm_horizon = _horizon_map.get(horizon, horizon) if horizon else ""
-    morning_picks = _load_todays_recs(user_id, horizon=_norm_horizon)
+
+    # Expiry range for morning picks — prevents loading wrong-expiry picks
+    from datetime import date as _date, timedelta as _td
+    _today_d = _date.today()
+    _expiry_ranges = {
+        "1w":  (_today_d + _td(1),   _today_d + _td(9)),
+        "2w":  (_today_d + _td(8),   _today_d + _td(16)),
+        "1m":  (_today_d + _td(18),  _today_d + _td(50)),
+        "3m":  (_today_d + _td(55),  _today_d + _td(100)),
+        "6m":  (_today_d + _td(110), _today_d + _td(200)),
+    }
+    _range = _expiry_ranges.get(_norm_horizon, (None, None))
+    _min_exp = _range[0].strftime("%Y-%m-%d") if _range[0] else ""
+    _max_exp = _range[1].strftime("%Y-%m-%d") if _range[1] else ""
+
+    morning_picks = _load_todays_recs(user_id, horizon=_norm_horizon, min_exp=_min_exp, max_exp=_max_exp)
     print(f"[Rescan] {len(morning_picks)} morning picks loaded")
 
     # ── Step 2: Get filtered universe ─────────────────────────────────────────

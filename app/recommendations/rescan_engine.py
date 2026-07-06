@@ -138,15 +138,17 @@ BROKEN  → price moved significantly AGAINST thesis OR thesis condition violate
 
     # Horizon guidance for LLM
     _horizon_labels = {"1w":"1 WEEK","2w":"2 WEEKS","1m":"1 MONTH","3m":"3 MONTHS","6m":"6 MONTHS"}
+    from datetime import date, timedelta
+    _today_dt = date.today()
     _expiry_guidance = {
-        "1w": "Pick expiry THIS week (Jul 10-11). Use near ATM strikes.",
-        "2w": "Pick expiry NEXT week (Jul 17-18). Use slightly OTM strikes.",
-        "1m": "Pick expiry 3-5 WEEKS OUT (Aug 1-22). Longer DTE = more time.",
-        "3m": "Pick expiry 8-12 WEEKS OUT (Sep-Oct). Use wider spreads.",
-        "6m": "Pick expiry 20-26 WEEKS OUT (Dec-Jan LEAPS). Deep ITM or wide spreads.",
+        "1w":  f"MUST use expiry between {(_today_dt+timedelta(3)).strftime('%Y-%m-%d')} and {(_today_dt+timedelta(7)).strftime('%Y-%m-%d')}",
+        "2w":  f"MUST use expiry between {(_today_dt+timedelta(8)).strftime('%Y-%m-%d')} and {(_today_dt+timedelta(14)).strftime('%Y-%m-%d')}",
+        "1m":  f"MUST use expiry between {(_today_dt+timedelta(21)).strftime('%Y-%m-%d')} and {(_today_dt+timedelta(45)).strftime('%Y-%m-%d')}",
+        "3m":  f"MUST use expiry between {(_today_dt+timedelta(60)).strftime('%Y-%m-%d')} and {(_today_dt+timedelta(90)).strftime('%Y-%m-%d')}",
+        "6m":  f"MUST use expiry between {(_today_dt+timedelta(120)).strftime('%Y-%m-%d')} and {(_today_dt+timedelta(180)).strftime('%Y-%m-%d')}",
     }
-    horizon_label   = _horizon_labels.get(budget and horizon or "1w", "SHORT TERM")
-    expiry_guidance = _expiry_guidance.get(horizon or "1w", "Pick appropriate expiry.")
+    horizon_label   = _horizon_labels.get(horizon or "1w", "SHORT TERM")
+    expiry_guidance = _expiry_guidance.get(horizon or "1w", "Pick appropriate expiry from candidate list.")
 
     return f"""You are managing real money. Today is {today}. Budget: ${budget:.0f}.
 
@@ -326,17 +328,23 @@ def rescan_with_validation(
     _spy_p = _yf.Ticker("SPY").fast_info.last_price or 0
     _qqq_p = _yf.Ticker("QQQ").fast_info.last_price or 0
 
+    # Expiry based on horizon
+    _horizon_weeks = {"1w":0,"2w":1,"1m":3,"3m":8,"6m":20}
+    _idx_weeks = _horizon_weeks.get(_norm_horizon or "1w", 1)
+    _spy_exp = _next_friday(_idx_weeks)
+    _qqq_exp = _next_friday(_idx_weeks + 1)
+
     index_candidates = [
         {"ticker": "SPY", "direction": "UNKNOWN", "price": _spy_p, "confidence": 75,
          "change_pct": 0, "flow_score": 0, "dp_score": 0, "sweeps": 0,
          "alert_count": 0, "score": 1.0, "signals": ["index"],
-         "forced_expiry": _next_friday(0)},
+         "forced_expiry": _spy_exp},
         {"ticker": "QQQ", "direction": "UNKNOWN", "price": _qqq_p, "confidence": 75,
          "change_pct": 0, "flow_score": 0, "dp_score": 0, "sweeps": 0,
          "alert_count": 0, "score": 1.0, "signals": ["index"],
-         "forced_expiry": _next_friday(1)},
+         "forced_expiry": _qqq_exp},
     ]
-    print(f"[Rescan] SPY=${_spy_p:.2f} exp={_next_friday(0)} | QQQ=${_qqq_p:.2f} exp={_next_friday(1)}")
+    print(f"[Rescan] SPY=${_spy_p:.2f} exp={_spy_exp} | QQQ=${_qqq_p:.2f} exp={_qqq_exp} (horizon={_norm_horizon})")
     # Lock in live prices for index picks — don't let enrichment overwrite them
     for ip in index_candidates:
         ip["_locked_price"] = ip["price"]

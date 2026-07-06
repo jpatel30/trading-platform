@@ -93,6 +93,7 @@ def _build_validation_prompt(
     global_news: list[dict],
     budget: float,
     today: str,
+    regime: dict | None = None,
 ) -> str:
     """Build single LLM prompt that validates morning picks + finds new ones."""
 
@@ -122,9 +123,19 @@ BROKEN  → price moved significantly AGAINST thesis OR thesis condition violate
         for n in (global_news or [])[:5]
     )
 
+    regime_str = ""
+    if regime:
+        ts  = regime.get("vix_structure", {})
+        pcr = regime.get("put_call", {})
+        regime_str = (
+            f"\nVIX TERM STRUCTURE: VIX9D={ts.get('vix9d',0):.1f} vs VIX={ts.get('vix30',0):.1f} "
+            f"({ts.get('signal','?')}) | PCR={pcr.get('pcr',0):.2f} ({pcr.get('signal','?')})"
+            f"\nOVERALL BIAS: {regime.get('overall_bias','?')} — {regime.get('strategy_hint','')}"
+        )
+
     return f"""You are managing real money. Today is {today}. Budget: ${budget:.0f}.
 
-MARKET: VIX {vix.get('current', 17)} ({vix.get('zone','NORMAL')}) | {vix.get('trend','STABLE')}
+MARKET: VIX {vix.get('current', 17)} ({vix.get('zone','NORMAL')}) | {vix.get('trend','STABLE')}{regime_str}
 NEWS: {news_str}
 
 {morning_section}
@@ -184,6 +195,7 @@ def rescan_with_validation(
         get_flow_alerts, get_dark_pool_recent,
     )
     from app.rag.context_builder import _build_vix_context, _build_global_news
+    from app.signals.market_regime import get_full_market_regime
     from app.scanner.quick_scan import quick_scan
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -208,6 +220,8 @@ def rescan_with_validation(
     # ── Step 3: Shared data (parallel) ───────────────────────────────────────
     vix         = _build_vix_context()
     global_news = _build_global_news()
+    regime      = get_full_market_regime()
+    print(f"[Rescan] Market regime: {regime['overall_bias']} | {regime['summary']}")
     earnings_pre  = get_earnings_premarket()  or []
     earnings_post = get_earnings_afterhours() or []
     earnings_map  = _build_earnings_map(earnings_pre, earnings_post)
@@ -325,7 +339,7 @@ def rescan_with_validation(
     print(f"[Rescan] Enriched {len(enriched)} candidates in {time.time()-t_start:.1f}s")
 
     # ── Step 5: Single LLM call (validation + new picks) ─────────────────────
-    prompt     = _build_validation_prompt(morning_picks, enriched, vix, global_news, budget, today)
+    prompt     = _build_validation_prompt(morning_picks, enriched, vix, global_news, budget, today, regime=regime)
     llm_result = _call_smart_llm(prompt)
 
     if not llm_result:
@@ -454,6 +468,24 @@ def rescan_with_validation(
 
     elapsed = round(time.time()-t_start, 1)
     print(f"[Rescan] COMPLETE in {elapsed}s — {len(final)} picks")
+
+    # Save velocity for options scan tickers
+    try:
+        from sqlalchemy import text as _t
+        from app.db.session import get_session as _gs
+        for _p in (pre_scanned or []):
+            _tk = _p.get("ticker","")
+            if not _tk: continue
+            with _gs() as _s:
+                _s.execute(_t("""
+                    INSERT INTO signal_history (user_id,ticker,date,flow_score,dp_score,price,change_pct)
+                    VALUES (:uid,:t,CURRENT_DATE,:fs,:dps,:p,:cp)
+                    ON CONFLICT (user_id,ticker,date) DO UPDATE SET
+                    flow_score=EXCLUDED.flow_score,dp_score=EXCLUDED.dp_score
+                """),{"uid":user_id,"t":_tk,"fs":_p.get("flow_score",0),
+                      "dps":_p.get("dp_score",0),"p":_p.get("price",0),"cp":_p.get("change_pct",0)})
+    except Exception:
+        pass
 
     return {
         "picks":       final,

@@ -20,7 +20,7 @@ STATUS_BROKEN  = "BROKEN"   # proven wrong, drop it
 STATUS_NEW     = "NEW"      # fresh pick from rescan
 
 
-def _load_todays_recs(user_id: str) -> list[dict]:
+def _load_todays_recs(user_id: str, horizon: str = "") -> list[dict]:
     """Load today's active recommendations from DB."""
     try:
         from sqlalchemy import text
@@ -36,6 +36,7 @@ def _load_todays_recs(user_id: str) -> list[dict]:
                 WHERE user_id=:uid AND date=CURRENT_DATE AND status='ACTIVE'
                   AND strategy != 'STOCK'
                   AND legs IS NOT NULL AND jsonb_array_length(legs) > 0
+                  AND (:horizon = '' OR horizon = :horizon)
                 ORDER BY conviction_score DESC
             """), {"uid": user_id}).fetchall()
 
@@ -182,6 +183,7 @@ def rescan_with_validation(
     sector:    str | None = None,
     cap_size:  str | None = None,
     catalyst:  str | None = None,
+    horizon:   str = "",
 ) -> dict:
     """
     Rescan with morning picks validation.
@@ -204,7 +206,7 @@ def rescan_with_validation(
     today   = datetime.now().strftime("%A %B %d, %Y")
 
     # ── Step 1: Load morning picks ────────────────────────────────────────────
-    morning_picks = _load_todays_recs(user_id)
+    morning_picks = _load_todays_recs(user_id, horizon=horizon or "")
     print(f"[Rescan] {len(morning_picks)} morning picks loaded")
 
     # ── Step 2: Get filtered universe ─────────────────────────────────────────

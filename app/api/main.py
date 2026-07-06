@@ -530,6 +530,7 @@ async def get_daily_recs(
                 user_id=user_id, budget=budget,
                 pre_scanned=picks,
                 sector=sector, cap_size=cap_size, catalyst=catalyst,
+                horizon=horizon,
             )
             recs = result.get("picks", [])
             return {

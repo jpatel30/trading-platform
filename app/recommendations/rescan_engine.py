@@ -200,7 +200,7 @@ Respond ONLY with compact JSON — no prose, no markdown:
   }},
   "new_picks": [
     {{"ticker": "X", "direction": "BULLISH", "strategy": "DEBIT_CALL_SPREAD",
-     "expiry": "{example_expiry}", "buy_strike": 0.0, "sell_strike": 0.0,
+     "expiry": "{_example_expiry}", "buy_strike": 0.0, "sell_strike": 0.0,
      "reasoning": "brief", "key_risk": "brief", "confidence": 70}}
   ]
 }}"""

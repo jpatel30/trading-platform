@@ -75,10 +75,23 @@ def us_market_holidays(year: int) -> set:
 
 def get_last_trading_date() -> str:
     """
-    Return last NYSE trading day as 'YYYY-MM-DD'.
+    Return most recent NYSE trading day as 'YYYY-MM-DD'.
+    If market is open today, returns today.
     Handles weekends + US federal holidays for any year.
     """
-    today  = datetime.now().date()
+    import pytz
+    from datetime import time as dtime
+    et    = pytz.timezone("America/New_York")
+    now   = datetime.now(et)
+    today = now.date()
+
+    # If today is a trading day and market has opened (9:30 AM ET+), use today
+    if (today.weekday() < 5
+            and today not in us_market_holidays(today.year)
+            and now.time() >= dtime(9, 30)):
+        return today.strftime("%Y-%m-%d")
+
+    # Otherwise walk back to find last trading day
     cursor = today
     for _ in range(14):
         cursor -= timedelta(days=1)

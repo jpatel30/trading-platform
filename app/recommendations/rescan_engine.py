@@ -206,7 +206,11 @@ def rescan_with_validation(
     today   = datetime.now().strftime("%A %B %d, %Y")
 
     # ── Step 1: Load morning picks ────────────────────────────────────────────
-    morning_picks = _load_todays_recs(user_id, horizon=horizon or "")
+    # Normalize horizon: UI sends 1w/2w/1m, DB stores 1w/2w/1m or 17d/30d
+    _horizon_map = {"1w":"1w","2w":"2w","1m":"1m","3m":"3m","6m":"6m",
+                    "17d":"1w","30d":"1m","21d":"2w","90d":"3m","180d":"6m"}
+    _norm_horizon = _horizon_map.get(horizon, horizon) if horizon else ""
+    morning_picks = _load_todays_recs(user_id, horizon=_norm_horizon)
     print(f"[Rescan] {len(morning_picks)} morning picks loaded")
 
     # ── Step 2: Get filtered universe ─────────────────────────────────────────
@@ -429,7 +433,7 @@ def rescan_with_validation(
                 from app.recommendations.daily_engine import _upsert_recommendation
                 legs = trade.get("legs", [])
                 _upsert_recommendation(user_id, {
-                    "ticker": ticker, "horizon": trade.get("horizon","17d"),
+                    "ticker": ticker, "horizon": _norm_horizon or trade.get("horizon","1w"),
                     "direction": trade.get("direction",""),
                     "conviction_score": trade.get("confidence",65),
                     "conviction_tier": "HIGH" if trade.get("confidence",0)>=75 else "MODERATE",

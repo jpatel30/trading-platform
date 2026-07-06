@@ -148,7 +148,9 @@ def _get_batch_prices(tickers: list[str], user_id: str | None = None) -> dict[st
     last_date  = get_last_trading_date()
     session    = _get_last_trading_session()
     ticker_set = set(tickers)
-    print(f"[Quick Scan] Market: {session} | Using: {last_date}")
+    from datetime import datetime as _dt
+    _today = _dt.now().strftime("%Y-%m-%d")
+    print(f"[Quick Scan] Market: {session} | Using: {_today}")
 
     # ── 1. Polygon grouped daily — ONE call, all US stocks ────────────────────
     try:

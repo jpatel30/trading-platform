@@ -91,7 +91,7 @@ def _enrich_ticker(
         expiry_list  = []
         iv_est       = result.get("iv_current", 30)
         for e in (expiries_raw or [])[:8]:
-            exp_str = e.get("expiry", "")
+            exp_str = e.get("expires", "") or e.get("expiry", "")  # UW returns "expires" key
             try:
                 dte = (datetime.strptime(exp_str, "%Y-%m-%d") - today).days
                 if dte < 1:
@@ -277,10 +277,21 @@ Study every candidate above. Consider:
 - Where are the real entry/exit levels?
 
 Pick up to 4 best option trades (can be same or different tickers for different setups).
-STRIKE RULES: DEBIT_PUT_SPREAD → buy_strike HIGHER than sell_strike (e.g. buy 190p sell 180p).
-DEBIT_CALL_SPREAD → buy_strike LOWER than sell_strike (e.g. buy 240c sell 250c).
-Strikes must be realistic for the stock price — within 5-10% OTM maximum.
-For each: choose expiry from the list shown above ONLY.
+STRATEGIES AVAILABLE (pick best for situation):
+- NAKED_CALL: buy single call — high conviction bullish, no hedge needed
+- NAKED_PUT: buy single put — high conviction bearish
+- DEBIT_CALL_SPREAD: buy lower strike call, sell higher — moderate bullish, cheaper
+- DEBIT_PUT_SPREAD: buy higher strike put, sell lower — moderate bearish, cheaper
+- STRADDLE: buy ATM call + ATM put (same strike) — big move expected, direction unknown
+- STRANGLE: buy OTM call + OTM put — cheaper than straddle, needs bigger move
+- IRON_CONDOR: sell OTM call spread + sell OTM put spread — range-bound market
+
+STRIKE RULES:
+- DEBIT_PUT_SPREAD: buy_strike HIGHER than sell_strike (e.g. buy 190p sell 180p)
+- DEBIT_CALL_SPREAD: buy_strike LOWER than sell_strike (e.g. buy 240c sell 250c)
+- NAKED calls/puts: set buy_strike only, set sell_strike = 0
+- STRADDLE/STRANGLE: buy_strike = call strike, sell_strike = put strike
+- Max 5-10% OTM. Choose expiry from list above ONLY.
 
 Respond with valid JSON only:
 {{
@@ -423,17 +434,39 @@ def _execute_smart_rec(rec: dict, budget: float, user_id: str | None) -> dict | 
     except Exception as e:
         print(f"[SmartMath] Strike validation skipped: {e}")
 
-    # Determine leg types from strategy
-    is_put    = "PUT" in strategy
-    leg_type  = "PUT" if is_put else "CALL"
-    is_credit = "CREDIT" in strategy
+    # Determine legs from strategy
+    is_credit = "CREDIT" in strategy or "IRON" in strategy
 
-    if is_credit:
+    if strategy == "NAKED_CALL":
+        legs = [{"action": "BUY", "type": "CALL", "strike": buy_str}]
+    elif strategy == "NAKED_PUT":
+        legs = [{"action": "BUY", "type": "PUT", "strike": buy_str}]
+    elif strategy == "STRADDLE":
+        legs = [
+            {"action": "BUY", "type": "CALL", "strike": buy_str},
+            {"action": "BUY", "type": "PUT",  "strike": buy_str},
+        ]
+    elif strategy == "STRANGLE":
+        legs = [
+            {"action": "BUY", "type": "CALL", "strike": sell_str},
+            {"action": "BUY", "type": "PUT",  "strike": buy_str},
+        ]
+    elif strategy == "IRON_CONDOR":
+        width = round((sell_str - buy_str) * 0.5, 1)
+        legs = [
+            {"action": "SELL", "type": "CALL", "strike": sell_str},
+            {"action": "BUY",  "type": "CALL", "strike": sell_str + width},
+            {"action": "SELL", "type": "PUT",  "strike": buy_str},
+            {"action": "BUY",  "type": "PUT",  "strike": buy_str - width},
+        ]
+    elif is_credit:
+        leg_type = "PUT" if "PUT" in strategy else "CALL"
         legs = [
             {"action": "SELL", "type": leg_type, "strike": buy_str},
             {"action": "BUY",  "type": leg_type, "strike": sell_str},
         ]
     else:
+        leg_type = "PUT" if "PUT" in strategy else "CALL"
         legs = [
             {"action": "BUY",  "type": leg_type, "strike": buy_str},
             {"action": "SELL", "type": leg_type, "strike": sell_str},

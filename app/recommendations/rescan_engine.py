@@ -308,74 +308,102 @@ def rescan_with_validation(
     final = []
     morning_by_ticker = {p["ticker"]: p for p in morning_picks}
 
-    for llm_pick in (llm_result.get("picks") or []):
-        ticker = llm_pick.get("ticker","")
-        status = llm_pick.get("status", STATUS_NEW)
+    # ── Parse compact format: morning_status + new_picks ─────────────────
+    morning_status = llm_result.get("morning_status", {})
+    new_picks_llm  = llm_result.get("new_picks", [])
+    market_view    = llm_result.get("market_view", "")
 
+    # Fallback: old picks[] format
+    if not morning_status and not new_picks_llm:
+        new_picks_llm = llm_result.get("picks", [])
+        # Map old format to new_picks format
+        new_picks_llm = [p for p in new_picks_llm if p.get("status") == STATUS_NEW
+                         or p.get("status") not in (STATUS_INTACT, STATUS_BROKEN, STATUS_UPDATED)]
+
+    # Process morning picks from compact status dict
+    for ticker, info in morning_status.items():
+        if ticker not in morning_by_ticker:
+            continue
+        mp     = morning_by_ticker[ticker].copy()
+        status = info.get("status", STATUS_INTACT)
+        mp["status"]        = status
+        mp["status_reason"] = info.get("reason", "")
+        mp["confidence"]    = info.get("confidence", mp.get("conviction", 65))
         if status == STATUS_BROKEN:
-            # Keep in list but mark broken so user can see what changed
-            mp = morning_by_ticker.get(ticker, {})
-            final.append({
-                **mp,
-                "status":        STATUS_BROKEN,
-                "status_reason": llm_pick.get("status_reason","Thesis broken"),
-                "confidence":    0,
-                "conviction_score": 0,
-            })
-            continue
+            mp["confidence"]       = 0
+            mp["conviction_score"] = 0
+        final.append(mp)
 
-        if status == STATUS_INTACT and ticker in morning_by_ticker:
-            # Keep exact morning pick — just update status reason
-            mp = morning_by_ticker[ticker].copy()
+    # Any morning pick not mentioned by LLM → assume INTACT
+    for ticker, mp in morning_by_ticker.items():
+        if ticker not in morning_status:
+            mp = mp.copy()
             mp["status"]        = STATUS_INTACT
-            mp["status_reason"] = llm_pick.get("status_reason","Thesis intact")
-            mp["confidence"]    = llm_pick.get("confidence", mp.get("conviction",65))
+            mp["status_reason"] = "No change"
             final.append(mp)
+
+    # Process new picks
+    from app.recommendations.smart_engine import _execute_smart_rec
+    for llm_pick in new_picks_llm:
+        ticker = llm_pick.get("ticker", "")
+        if not ticker or ticker in morning_by_ticker:
             continue
 
-        # UPDATED or NEW — run fresh math
-        from app.recommendations.smart_engine import _execute_smart_rec
-        trade = _execute_smart_rec(llm_pick, budget, user_id)
+        # Map compact fields to _execute_smart_rec format
+        rec = {
+            "ticker":     ticker,
+            "direction":  llm_pick.get("direction", "BULLISH"),
+            "strategy":   llm_pick.get("strategy", "DEBIT_CALL_SPREAD"),
+            "expiry":     llm_pick.get("expiry", ""),
+            "dte":        llm_pick.get("dte", 17),
+            "buy_strike": llm_pick.get("buy_strike", 0),
+            "sell_strike":llm_pick.get("sell_strike", 0),
+            "reasoning":  llm_pick.get("reasoning", ""),
+            "key_risk":   llm_pick.get("key_risk", ""),
+            "catalyst":   llm_pick.get("catalyst", ""),
+            "confidence": llm_pick.get("confidence", 65),
+        }
+
+        trade = _execute_smart_rec(rec, budget, user_id)
         if trade:
-            trade["status"]        = status
-            trade["status_reason"] = llm_pick.get("status_reason","")
-            trade["confidence"]    = llm_pick.get("confidence", 65)
+            trade["status"]        = STATUS_NEW
+            trade["status_reason"] = "Fresh pick"
+            trade["confidence"]    = rec["confidence"]
             final.append(trade)
 
-            # Store NEW picks to DB
-            if status == STATUS_NEW:
-                try:
-                    from app.recommendations.daily_engine import _upsert_recommendation
-                    legs = trade.get("legs", [])
-                    market_view = llm_result.get("market_view","")
-                    _upsert_recommendation(user_id, {
-                        "ticker": ticker, "horizon": trade.get("horizon","17d"),
-                        "direction": trade.get("direction",""), "conviction_score": trade.get("confidence",65),
-                        "conviction_tier": "HIGH" if trade.get("confidence",0)>=75 else "MODERATE",
-                        "act_now": trade.get("confidence",0)>=70,
-                        "position_size_guidance": "standard",
-                        "thesis": llm_pick.get("reasoning",""),
-                        "entry_zone_low": abs(trade.get("entry_debit",0)),
-                        "entry_zone_high": abs(trade.get("entry_debit",0))*1.05,
-                        "entry_trigger": "AT_MARKET",
-                        "target_price": 0, "target_pct": 0,
-                        "stop_price": 0, "stop_pct": -40.0,
-                        "timeframe": f"{trade.get('dte',17)} days",
-                        "invalidation_conditions": llm_pick.get("key_risk",""),
-                        "strategy": trade.get("strategy",""),
-                        "expiry": trade.get("expiry",""), "dte": trade.get("dte",17),
-                        "legs": legs, "entry_debit": trade.get("entry_debit",0),
-                        "total_cost": trade.get("total_cost",0),
-                        "max_profit": trade.get("max_profit_per_contract",0),
-                        "max_loss": trade.get("max_loss_per_contract",0),
-                        "risk_reward": trade.get("risk_reward",0),
-                        "webull_instructions": trade.get("webull_instructions",""),
-                        "key_news": llm_pick.get("catalyst","NONE"),
-                        "warnings": [], "conviction_breakdown": {},
-                        "signal_data": {"market_view": market_view},
-                    })
-                except Exception as e:
-                    print(f"[Rescan] Store failed {ticker}: {e}")
+            # Store to DB
+            try:
+                from app.recommendations.daily_engine import _upsert_recommendation
+                legs = trade.get("legs", [])
+                _upsert_recommendation(user_id, {
+                    "ticker": ticker, "horizon": trade.get("horizon","17d"),
+                    "direction": trade.get("direction",""),
+                    "conviction_score": trade.get("confidence",65),
+                    "conviction_tier": "HIGH" if trade.get("confidence",0)>=75 else "MODERATE",
+                    "act_now": trade.get("confidence",0)>=70,
+                    "position_size_guidance": "standard",
+                    "thesis": rec.get("reasoning",""),
+                    "entry_zone_low": abs(trade.get("entry_debit",0)),
+                    "entry_zone_high": abs(trade.get("entry_debit",0))*1.05,
+                    "entry_trigger": "AT_MARKET",
+                    "target_price": 0, "target_pct": 0,
+                    "stop_price": 0, "stop_pct": -40.0,
+                    "timeframe": f"{trade.get('dte',17)} days",
+                    "invalidation_conditions": rec.get("key_risk",""),
+                    "strategy": trade.get("strategy",""),
+                    "expiry": trade.get("expiry",""), "dte": trade.get("dte",17),
+                    "legs": legs, "entry_debit": trade.get("entry_debit",0),
+                    "total_cost": trade.get("total_cost",0),
+                    "max_profit": trade.get("max_profit_per_contract",0),
+                    "max_loss": trade.get("max_loss_per_contract",0),
+                    "risk_reward": trade.get("risk_reward",0),
+                    "webull_instructions": trade.get("webull_instructions",""),
+                    "key_news": rec.get("catalyst","NONE"),
+                    "warnings": [], "conviction_breakdown": {},
+                    "signal_data": {"market_view": market_view},
+                })
+            except Exception as e:
+                print(f"[Rescan] Store failed {ticker}: {e}")
 
     # Filter: only return picks that have legs (options only — no stock leakage)
     final = [p for p in final if p.get("legs") and len(p.get("legs", [])) > 0]

@@ -116,16 +116,20 @@ def _enrich_ticker(
     except Exception:
         result["news"] = []
 
-    # Live price from UW
-    try:
-        from app.options_flow.unusual_whales import get_stock_state
-        state = get_stock_state(ticker)
-        if state and state.get("price"):
-            result["price"]       = float(state["price"])
-            result["live_price"]  = True
-            result["market_time"] = state.get("market_time", "regular")
-    except Exception:
-        pass
+    # Live price from UW — skip if price is locked (index picks)
+    if not result.get("_locked_price"):
+        try:
+            from app.options_flow.unusual_whales import get_stock_state
+            state = get_stock_state(ticker)
+            if state and state.get("price"):
+                result["price"]       = float(state["price"])
+                result["live_price"]  = True
+                result["market_time"] = state.get("market_time", "regular")
+        except Exception:
+            pass
+    else:
+        result["price"] = result["_locked_price"]
+        result["live_price"] = True
 
     # GEX — affects strategy (negative GEX = dealers short gamma = directional moves amplified)
     try:

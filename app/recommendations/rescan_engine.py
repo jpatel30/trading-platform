@@ -141,6 +141,9 @@ NEWS: {news_str}
 3. Find additional NEW picks from fresh candidates
 4. Return morning_status for existing picks + new_picks ranked by conviction
 
+⚠️  USE EXACT PRICES SHOWN ABOVE — do NOT use your training data prices.
+SPY trades around $750, QQQ around $720 as of today. Use the price shown in brackets.
+
 STRIKE RULES:
 - Debit call spread: buy_strike LOWER than sell_strike (e.g. buy $62C sell $65C)
 - Debit put spread: buy_strike HIGHER than sell_strike (e.g. buy $61P sell $58P)
@@ -297,6 +300,10 @@ def rescan_with_validation(
          "forced_expiry": _next_friday(1)},
     ]
     print(f"[Rescan] SPY=${_spy_p:.2f} exp={_next_friday(0)} | QQQ=${_qqq_p:.2f} exp={_next_friday(1)}")
+    # Lock in live prices for index picks — don't let enrichment overwrite them
+    for ip in index_candidates:
+        ip["_locked_price"] = ip["price"]
+
     # Prepend index picks, then fill remaining slots from scanner
     other_picks = [p for p in picks if p["ticker"] not in ("SPY","QQQ") and _is_optionable(p)]
     candidates = index_candidates + other_picks[:10]

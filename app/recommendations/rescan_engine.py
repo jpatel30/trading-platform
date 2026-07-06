@@ -37,8 +37,8 @@ def _load_todays_recs(user_id: str, horizon: str = "", min_exp: str = "", max_ex
                   AND strategy != 'STOCK'
                   AND legs IS NOT NULL AND jsonb_array_length(legs) > 0
                   AND (:horizon = '' OR horizon = :horizon)
-                  AND (:min_exp = '' OR expiry >= :min_exp::date)
-                  AND (:max_exp = '' OR expiry <= :max_exp::date)
+                  AND (:min_exp = '' OR expiry >= CAST(:min_exp AS date))
+                  AND (:max_exp = '' OR expiry <= CAST(:max_exp AS date))
                 ORDER BY conviction_score DESC
             """), {
                 "uid": user_id,
@@ -472,6 +472,11 @@ def rescan_with_validation(
             trade["status"]        = STATUS_NEW
             trade["status_reason"] = "Fresh pick"
             trade["confidence"]    = rec["confidence"]
+            # Force correct expiry for index picks (SPY/QQQ)
+            _idx_map = {ip["ticker"]: ip.get("forced_expiry","") for ip in index_candidates}
+            if ticker in _idx_map and _idx_map[ticker]:
+                trade["expiry"] = _idx_map[ticker]
+                print(f"[Rescan] Forced {ticker} expiry → {_idx_map[ticker]}")
             final.append(trade)
 
             # Store to DB

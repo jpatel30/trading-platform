@@ -38,7 +38,7 @@ def _load_todays_recs(user_id: str, horizon: str = "") -> list[dict]:
                   AND legs IS NOT NULL AND jsonb_array_length(legs) > 0
                   AND (:horizon = '' OR horizon = :horizon)
                 ORDER BY conviction_score DESC
-            """), {"uid": user_id}).fetchall()
+            """), {"uid": user_id, "horizon": horizon}).fetchall()
 
         picks = []
         for r in rows:
@@ -96,6 +96,7 @@ def _build_validation_prompt(
     budget: float,
     today: str,
     regime: dict | None = None,
+    horizon: str = "1w",
 ) -> str:
     """Build single LLM prompt that validates morning picks + finds new ones."""
 
@@ -361,7 +362,7 @@ def rescan_with_validation(
     print(f"[Rescan] Enriched {len(enriched)} candidates in {time.time()-t_start:.1f}s")
 
     # ── Step 5: Single LLM call (validation + new picks) ─────────────────────
-    prompt     = _build_validation_prompt(morning_picks, enriched, vix, global_news, budget, today, regime=regime)
+    prompt     = _build_validation_prompt(morning_picks, enriched, vix, global_news, budget, today, regime=regime, horizon=_norm_horizon or "1w")
     llm_result = _call_smart_llm(prompt)
 
     if not llm_result:

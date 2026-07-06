@@ -342,7 +342,8 @@ Respond with valid JSON only — no text before or after."""
                     or "new_picks" in data
                     or "picks" in data):
                 return data
-        print(f"[SmartLLM] Could not parse: {raw[:200]}")
+        print(f"[SmartLLM] Could not parse: {raw[:400]}")
+        print(f"[SmartLLM] Full response length: {len(raw)} chars")
         return None
     except Exception as e:
         print(f"[SmartLLM] Error: {e}")

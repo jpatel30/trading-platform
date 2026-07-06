@@ -85,10 +85,11 @@ def get_last_trading_date() -> str:
     now   = datetime.now(et)
     today = now.date()
 
-    # If today is a trading day and market has opened (9:30 AM ET+), use today
+    # Polygon grouped daily is only available AFTER market close (4PM ET)
+    # During market hours, use previous close + Webull live prices for intraday
     if (today.weekday() < 5
             and today not in us_market_holidays(today.year)
-            and now.time() >= dtime(9, 30)):
+            and now.time() >= dtime(16, 0)):
         return today.strftime("%Y-%m-%d")
 
     # Otherwise walk back to find last trading day

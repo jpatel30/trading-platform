@@ -501,8 +501,8 @@ def _execute_smart_rec(rec: dict, budget: float, user_id: str | None) -> dict | 
         max_loss = budget * 0.40
         trade    = _execute_trade_math(decision, ticker, spot, budget, max_loss)
 
-        # Reject negative entry_debit for debit spreads — means strikes inverted
-        if "DEBIT" in strategy:
+        # Reject negative entry_debit for DEBIT spreads only — credit strategies have negative entry
+        if "DEBIT" in strategy and "CREDIT" not in strategy:
             ed = trade.get("entry_debit", 0) or 0
             if ed <= 0:
                 print(f"[SmartMath] {ticker} rejected: negative entry_debit={ed} for {strategy}")

@@ -193,6 +193,65 @@ async def login_with_invite(req: InviteLoginRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+
+@app.on_event("startup")
+async def startup_event():
+    try:
+        from apscheduler.schedulers.background import BackgroundScheduler
+        from apscheduler.triggers.cron import CronTrigger
+        import pytz
+
+        et = pytz.timezone("America/New_York")
+        scheduler = BackgroundScheduler(timezone=et)
+
+        def _run_velocity_snapshot():
+            try:
+                from sqlalchemy import text
+                from app.db.session import get_session
+                from app.signals.velocity_tracker import save_daily_signals
+                with get_session() as s:
+                    users = s.execute(text("SELECT id FROM users WHERE is_active=TRUE")).fetchall()
+                for u in users:
+                    result = save_daily_signals(str(u.id))
+                    print(f"[Scheduler] Velocity snapshot: {result}")
+            except Exception as e:
+                print(f"[Scheduler] Velocity snapshot failed: {e}")
+
+        def _run_nightly_learning():
+            try:
+                from sqlalchemy import text
+                from app.db.session import get_session
+                from app.learning.nightly_loop import run_nightly_loop
+                from app.broker.factory import get_broker
+                with get_session() as s:
+                    users = s.execute(text("SELECT id FROM users WHERE is_active=TRUE")).fetchall()
+                for u in users:
+                    uid = str(u.id)
+                    try:
+                        positions = get_broker(uid).get_positions() or []
+                    except Exception:
+                        positions = []
+                    result = run_nightly_loop(uid, positions)
+                    print(f"[Scheduler] Nightly learning: {result.get('ran')} for {uid[:8]}")
+            except Exception as e:
+                print(f"[Scheduler] Nightly learning failed: {e}")
+
+        scheduler.add_job(
+            _run_velocity_snapshot,
+            CronTrigger(day_of_week="mon-fri", hour=16, minute=15, timezone=et),
+            id="velocity_snapshot", replace_existing=True,
+        )
+        scheduler.add_job(
+            _run_nightly_learning,
+            CronTrigger(day_of_week="mon-fri", hour=16, minute=30, timezone=et),
+            id="nightly_learning", replace_existing=True,
+        )
+        scheduler.start()
+        print("[Scheduler] ✅ velocity@4:15PM ET | learning@4:30PM ET (weekdays)")
+    except Exception as e:
+        print(f"[Startup] Scheduler failed: {e}")
+
+
 @app.get("/api/auth/me", tags=["Auth"])
 async def get_me(user_id: str = Depends(get_current_user)):
     try:

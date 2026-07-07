@@ -540,21 +540,33 @@ def rescan_with_validation(
     elapsed = round(time.time()-t_start, 1)
     print(f"[Rescan] COMPLETE in {elapsed}s — {len(final)} picks")
 
-    # Save velocity for options scan tickers
+    # Save ALL tickers from this scan to signal_history (free — data already fetched)
     try:
         from sqlalchemy import text as _t
         from app.db.session import get_session as _gs
-        for _p in (pre_scanned or []):
+        _all_picks = list({p["ticker"]: p for p in (pre_scanned or [])}.values())
+        _saved = 0
+        for _p in _all_picks:
             _tk = _p.get("ticker","")
             if not _tk: continue
-            with _gs() as _s:
-                _s.execute(_t("""
-                    INSERT INTO signal_history (user_id,ticker,date,flow_score,dp_score,price,change_pct)
-                    VALUES (:uid,:t,CURRENT_DATE,:fs,:dps,:p,:cp)
-                    ON CONFLICT (user_id,ticker,date) DO UPDATE SET
-                    flow_score=EXCLUDED.flow_score,dp_score=EXCLUDED.dp_score
-                """),{"uid":user_id,"t":_tk,"fs":_p.get("flow_score",0),
-                      "dps":_p.get("dp_score",0),"p":_p.get("price",0),"cp":_p.get("change_pct",0)})
+            try:
+                with _gs() as _s:
+                    _s.execute(_t("""
+                        INSERT INTO signal_history
+                            (user_id,ticker,date,flow_score,dp_score,price,change_pct)
+                        VALUES (:uid,:t,CURRENT_DATE,:fs,:dps,:p,:cp)
+                        ON CONFLICT (user_id,ticker,date) DO UPDATE SET
+                            flow_score=EXCLUDED.flow_score,
+                            dp_score=EXCLUDED.dp_score,
+                            price=EXCLUDED.price,
+                            change_pct=EXCLUDED.change_pct
+                    """),{"uid":user_id,"t":_tk,
+                          "fs":_p.get("flow_score",0),"dps":_p.get("dp_score",0),
+                          "p":_p.get("price",0),"cp":_p.get("change_pct",0)})
+                _saved += 1
+            except Exception:
+                pass
+        print(f"[Rescan] Saved {_saved}/{len(_all_picks)} tickers to signal_history")
     except Exception:
         pass
 

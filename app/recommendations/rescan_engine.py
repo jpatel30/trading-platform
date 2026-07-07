@@ -330,7 +330,7 @@ def rescan_with_validation(
             except Exception:
                 return t, [], []
         with ThreadPoolExecutor(max_workers=5) as ex:
-            for fut in _ac({ex.submit(_tf, t): t for t in uncovered}, timeout=15):
+            for fut in _ac({ex.submit(_tf, t): t for t in uncovered}, timeout=30):
                 try:
                     t, tf, td = fut.result()
                     if tf:

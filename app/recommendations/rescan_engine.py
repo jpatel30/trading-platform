@@ -187,10 +187,20 @@ SPY trades around $750, QQQ around $720 as of today. Use the price shown in brac
 HORIZON: {horizon_label}
 {expiry_guidance}
 
+STRATEGY SELECTION (MANDATORY — pick based on conditions):
+  VIX STEEP_CONTANGO + NEUTRAL regime → IRON_CONDOR preferred (sell both sides, collect premium)
+  Strong directional flow + conviction >80 → NAKED_CALL or NAKED_PUT
+  Moderate directional + IV rank <50 → DEBIT_CALL_SPREAD or DEBIT_PUT_SPREAD
+  Direction unclear + big move expected → STRADDLE or STRANGLE
+  SPY/QQQ in NEUTRAL market → IRON_CONDOR is best fit
+
 STRIKE RULES:
-- Debit call spread: buy_strike LOWER than sell_strike (e.g. buy $62C sell $65C)
-- Debit put spread: buy_strike HIGHER than sell_strike (e.g. buy $61P sell $58P)
-- Max 5% OTM from current price — no further
+- Debit call spread: buy_strike LOWER than sell_strike (e.g. buy $750C sell $760C)
+- Debit put spread: buy_strike HIGHER than sell_strike (e.g. buy $750P sell $740P)
+- Naked call/put: buy_strike = ATM or slightly OTM, sell_strike = 0
+- Iron condor: buy_strike = lower put, sell_strike = upper call (wider = safer)
+- SPREAD WIDTH: 1W=$2-5, 2W=$5-10, 1M=$10-20, 3M=$20-40
+- Max 8% OTM from current price
 
 Respond ONLY with compact JSON — no prose, no markdown:
 {{
@@ -199,7 +209,10 @@ Respond ONLY with compact JSON — no prose, no markdown:
     "TICKER": {{"status": "INTACT", "reason": "5 words", "confidence": 75}}
   }},
   "new_picks": [
-    {{"ticker": "X", "direction": "BULLISH", "strategy": "DEBIT_CALL_SPREAD",
+    {{"ticker": "SPY", "direction": "NEUTRAL", "strategy": "IRON_CONDOR",
+     "expiry": "{_example_expiry}", "buy_strike": 730.0, "sell_strike": 770.0,
+     "reasoning": "brief", "key_risk": "brief", "confidence": 72}},
+    {{"ticker": "X", "direction": "BULLISH", "strategy": "NAKED_CALL",
      "expiry": "{_example_expiry}", "buy_strike": 0.0, "sell_strike": 0.0,
      "reasoning": "brief", "key_risk": "brief", "confidence": 70}}
   ]

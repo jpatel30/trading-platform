@@ -583,10 +583,16 @@ def _execute_trade_math(
 
     # ── R/R Validation ────────────────────────────────────────────────────────
     # Reject trades with terrible R/R (LLM may have chosen ITM strikes)
-    if risk_reward is not None and risk_reward < 0.5:
+    # R/R threshold relaxes for longer DTE — 1M+ options naturally have lower R/R
+    _rr_min = 0.5
+    if dte and dte >= 60:  _rr_min = 0.20   # 3M+
+    elif dte and dte >= 30: _rr_min = 0.30  # 1M
+    elif dte and dte >= 14: _rr_min = 0.40  # 2W
+
+    if risk_reward is not None and risk_reward < _rr_min:
         strikes = [l["strike"] for l in legs_out]
         raise ValueError(
-            f"R/R {risk_reward} below 0.5 — LLM chose bad strikes {strikes}. Triggering fallback."
+            f"R/R {risk_reward} below {_rr_min} — LLM chose bad strikes {strikes}. Triggering fallback."
         )
 
     # Webull limit price (net mid of all legs)

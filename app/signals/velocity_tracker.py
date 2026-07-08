@@ -27,7 +27,7 @@ def save_daily_signals(user_id: str) -> dict:
     from app.scanner.universe import get_scan_universe
     from app.options_flow.unusual_whales import (
         get_flow_alerts, get_dark_pool_recent, get_iv_rank,
-        get_stock_state, get_gex
+        get_stock_state,
     )
     from app.signals.edgar_insider import get_insider_activity
 
@@ -51,7 +51,7 @@ def save_daily_signals(user_id: str) -> dict:
         try:
             state   = get_stock_state(ticker) or {}
             iv      = get_iv_rank(ticker)     or {}
-            gex     = get_gex(ticker)         or {}
+            gex     = {}  # GEX skipped in daily snapshot (too slow per-ticker)
             insider = get_insider_activity(ticker, days=3)
 
             tf = flow_by.get(ticker, [])
@@ -96,9 +96,9 @@ def save_daily_signals(user_id: str) -> dict:
             return {"ticker": ticker}
 
     results = []
-    with ThreadPoolExecutor(max_workers=8) as ex:
+    with ThreadPoolExecutor(max_workers=5) as ex:
         futures = {ex.submit(_enrich, t): t for t in tickers}
-        for fut in as_completed(futures, timeout=120):
+        for fut in as_completed(futures, timeout=180):
             try:
                 results.append(fut.result())
             except Exception:

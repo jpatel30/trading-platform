@@ -49,13 +49,23 @@ def save_daily_signals(user_id: str) -> dict:
     # Per-ticker enrichment (parallel, token bucket handles rate)
     def _enrich(ticker: str) -> dict:
         try:
-            state   = get_stock_state(ticker) or {}
-            iv      = get_iv_rank(ticker)     or {}
-            gex     = {}  # GEX skipped in daily snapshot (too slow per-ticker)
-            insider = get_insider_activity(ticker, days=3)
-
+            # Use only batch data — no per-ticker UW calls in snapshot
+            # (per-ticker calls compete with token bucket and timeout)
             tf = flow_by.get(ticker, [])
             td = dp_by.get(ticker, [])
+
+            # Price from yfinance (free, no rate limit)
+            try:
+                import yfinance as _yf
+                fi = _yf.Ticker(ticker).fast_info
+                state = {"price": fi.last_price or 0, "change_pct": 0}
+                if fi.previous_close and fi.last_price:
+                    state["change_pct"] = round((fi.last_price - fi.previous_close) / fi.previous_close * 100, 2)
+            except Exception:
+                state = {}
+
+            iv      = {}
+            insider = {"signal": "NEUTRAL", "has_buy": False, "has_sell": False, "total_value": 0}
 
             bull = sum(1 for a in tf if a.get("sentiment") in ("BULLISH","CALL"))
             bear = sum(1 for a in tf if a.get("sentiment") in ("BEARISH","PUT"))

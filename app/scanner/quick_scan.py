@@ -548,8 +548,10 @@ def _get_uw_flow_signals(tickers: list[str]) -> dict[str, dict]:
         dp        = dp_by.get(ticker, [])
         if not alerts and not dp:
             continue
-        bull_flow  = sum(1 for a in alerts if a.get("sentiment") in ("BULLISH","CALL"))
-        bear_flow  = sum(1 for a in alerts if a.get("sentiment") in ("BEARISH","PUT"))
+        bull_flow  = sum(1 for a in alerts if a.get("type","").lower() == "call"
+                         or a.get("sentiment","").upper() in ("BULLISH","CALL"))
+        bear_flow  = sum(1 for a in alerts if a.get("type","").lower() == "put"
+                         or a.get("sentiment","").upper() in ("BEARISH","PUT"))
         total_flow = bull_flow + bear_flow
         dp_buy     = sum(1 for d in dp if d.get("side") in ("BUY","A"))
         dp_sell    = sum(1 for d in dp if d.get("side") in ("SELL","B"))

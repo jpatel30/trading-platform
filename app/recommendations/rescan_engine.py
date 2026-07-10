@@ -300,8 +300,10 @@ def rescan_with_validation(
 
     batch_flow = {}
     for ticker, alerts in flow_by.items():
-        bull = sum(1 for a in alerts if a.get("sentiment") in ("BULLISH","CALL"))
-        bear = sum(1 for a in alerts if a.get("sentiment") in ("BEARISH","PUT"))
+        bull = sum(1 for a in alerts if a.get("type","").lower() == "call"
+                   or a.get("sentiment","").upper() in ("BULLISH","CALL"))
+        bear = sum(1 for a in alerts if a.get("type","").lower() == "put"
+                   or a.get("sentiment","").upper() in ("BEARISH","PUT"))
         tot  = bull + bear
         batch_flow[ticker] = {
             "flow_score": round((bull-bear)/tot*100,1) if tot else 0,

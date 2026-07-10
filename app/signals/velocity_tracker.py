@@ -81,7 +81,7 @@ def save_daily_signals(user_id: str) -> dict:
             put_vol  = sum(a.get("volume",0) for a in tf if a.get("sentiment") in ("BEARISH","PUT"))
             cpr      = round(call_vol/put_vol, 2) if put_vol else None
 
-            gex_val = gex.get("gamma_exposure") or gex.get("gex") or 0
+            gex_val = 0  # GEX not fetched in snapshot
 
             return {
                 "ticker":       ticker,

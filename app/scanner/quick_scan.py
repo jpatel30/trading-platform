@@ -655,7 +655,7 @@ def quick_scan(
             directions.append(direction)
 
         # Signal 2: Options flow
-        if flow_data.get("alert_count", 0) >= 2:
+        if flow_data.get("alert_count", 0) >= 1:
             signals.append(f"flow {flow_data['alert_count']} alerts")
             directions.append("BULLISH" if flow_data.get("flow_score",0) > 0 else "BEARISH")
 
@@ -694,7 +694,7 @@ def quick_scan(
         # Conflict = the STRONG signals (flow/dp/oi) actively disagree,
         # not just any weak momentum/TA dissent against a real move
         strong_dirs = []
-        if flow_data.get("alert_count", 0) >= 2: strong_dirs.append("BULLISH" if flow_data.get("flow_score",0) > 0 else "BEARISH")
+        if flow_data.get("alert_count", 0) >= 1: strong_dirs.append("BULLISH" if flow_data.get("flow_score",0) > 0 else "BEARISH")
         if flow_data.get("dp_count", 0) >= 1:    strong_dirs.append("BULLISH" if flow_data.get("dp_score",0) > 0 else "BEARISH")
         if abs(oi_score) >= 40 and oi_days >= 5: strong_dirs.append(oi_dir)
         conflict = len(set(strong_dirs)) > 1

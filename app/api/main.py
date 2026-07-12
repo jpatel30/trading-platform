@@ -122,6 +122,11 @@ class HorizonRecRequest(BaseModel):
 # Auth Endpoints
 # ─────────────────────────────────────────────────────────────────────────────
 
+@app.get("/api/scan/status", tags=["Recommendations"])
+async def scan_status_endpoint(user_id: str = Depends(get_current_user)):
+    from app.utils.scan_status import get_scan_status
+    return get_scan_status(user_id)
+
 @app.post("/api/auth/login", response_model=LoginResponse, tags=["Auth"])
 async def login_with_invite(req: InviteLoginRequest):
     """Login or register with an invite code."""
@@ -250,6 +255,9 @@ async def startup_event():
         print("[Scheduler] ✅ velocity@4:15PM ET | learning@4:30PM ET (weekdays)")
     except Exception as e:
         print(f"[Startup] Scheduler failed: {e}")
+
+
+
 
 
 @app.get("/api/auth/me", tags=["Auth"])

@@ -248,6 +248,9 @@ def rescan_with_validation(
     t_start = time.time()
     today   = datetime.now().strftime("%A %B %d, %Y")
 
+    from app.utils.scan_status import set_scan_status, clear_scan_status
+    set_scan_status(user_id, "queued")
+
     # ── Step 1: Load morning picks ────────────────────────────────────────────
     # Normalize horizon: UI sends 1w/2w/1m, DB stores 1w/2w/1m or 17d/30d
     _horizon_map = {"1w":"1w","2w":"2w","1m":"1m","3m":"3m","6m":"6m",
@@ -270,6 +273,8 @@ def rescan_with_validation(
 
     morning_picks = _load_todays_recs(user_id, horizon=_norm_horizon, min_exp=_min_exp, max_exp=_max_exp)
     print(f"[Rescan] {len(morning_picks)} morning picks loaded")
+    from app.utils.scan_status import set_scan_status
+    set_scan_status(user_id, "prices")
 
     # ── Step 2: Get filtered universe ─────────────────────────────────────────
     if sector and cap_size:
@@ -287,6 +292,7 @@ def rescan_with_validation(
     global_news = _build_global_news()
     regime      = get_full_market_regime()
     print(f"[Rescan] Market regime: {regime['overall_bias']} | {regime['summary']}")
+    set_scan_status(user_id, "regime")
     earnings_pre  = get_earnings_premarket()  or []
     earnings_post = get_earnings_afterhours() or []
     earnings_map  = _build_earnings_map(earnings_pre, earnings_post)
@@ -398,6 +404,7 @@ def rescan_with_validation(
          "forced_expiry": _qqq_exp},
     ]
     print(f"[Rescan] SPY=${_spy_p:.2f} exp={_spy_exp} | QQQ=${_qqq_p:.2f} exp={_qqq_exp} (horizon={_norm_horizon})")
+    set_scan_status(user_id, "enriching")
     # Lock in live prices for index picks — don't let enrichment overwrite them
     for ip in index_candidates:
         ip["_locked_price"] = ip["price"]
@@ -421,10 +428,12 @@ def rescan_with_validation(
         reverse=True
     )
     print(f"[Rescan] Enriched {len(enriched)} candidates in {time.time()-t_start:.1f}s")
+    set_scan_status(user_id, "llm_thinking")
 
     # ── Step 5: Single LLM call (validation + new picks) ─────────────────────
     prompt     = _build_validation_prompt(morning_picks, enriched, vix, global_news, budget, today, regime=regime, horizon=_norm_horizon or "1w")
     llm_result = _call_smart_llm(prompt)
+    set_scan_status(user_id, "llm_done")
 
     if not llm_result:
         # LLM failed — return morning picks but still filter to options only
@@ -582,6 +591,8 @@ def rescan_with_validation(
         print(f"[Rescan] Saved {_saved}/{len(_all_picks)} tickers to signal_history")
     except Exception:
         pass
+
+    set_scan_status(user_id, "complete")
 
     return {
         "picks":       final,

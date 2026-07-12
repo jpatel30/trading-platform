@@ -253,6 +253,7 @@ def _compress_ticker(t: dict) -> str:
     
         f" GEX:{'NEG' if t.get('gex_negative') else 'POS'} Vel:{t.get('velocity',0):+.0f}% Insider:{t.get('insider_signal','N')}"
         f" OI:{t.get('oi_score',0):+.0f}({t.get('oi_signal','NEUTRAL')},{t.get('oi_max_days',0)}d)"
+        f"{' ⚠️SIGNALS_CONFLICT' if t.get('conflict') else ''}"
     )
 
 

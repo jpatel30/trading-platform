@@ -680,6 +680,7 @@ def quick_scan(
         oi = oi_by_ticker.get(ticker, {})
         oi_score = oi.get("score", 0)
         oi_days  = oi.get("days", 0)
+        oi_dir   = "BULLISH" if oi_score > 0 else "BEARISH" if oi_score < 0 else None
         if abs(oi_score) >= 40 and oi_days >= 5:
             oi_dir = "BULLISH" if oi_score > 0 else "BEARISH"
             signals.append(f"oi_buildup {oi_score:+.0f}% {oi_days}d")
@@ -687,17 +688,28 @@ def quick_scan(
         if len(signals) < min_convergence:
             continue
 
-        # Check convergence — all agreeing signals must point same way
-        bull = directions.count("BULLISH")
-        bear = directions.count("BEARISH")
-        if bull >= min_convergence:
+        # Check convergence — bull vs bear compared directly, ties do NOT default to bullish
+        bull     = directions.count("BULLISH")
+        bear     = directions.count("BEARISH")
+        conflict = bull > 0 and bear > 0  # signals actively disagree
+
+        if bull > bear and bull >= min_convergence:
             conv_dir   = "BULLISH"
             confidence = round((bull / len(directions)) * 100)
-        elif bear >= min_convergence:
+        elif bear > bull and bear >= min_convergence:
             conv_dir   = "BEARISH"
             confidence = round((bear / len(directions)) * 100)
+        elif bull == bear and oi_dir and bull >= min_convergence:
+            # True tie — OI (leading indicator, multi-day persistence) breaks it
+            conv_dir   = oi_dir
+            confidence = 50
         else:
-            continue  # no convergence
+            continue  # no real edge, or unresolvable tie
+
+        # Cap confidence when signals meaningfully conflict — don't let convergence
+        # math hide a genuine disagreement (e.g. flow bearish + dp bullish + oi bearish)
+        if conflict:
+            confidence = min(confidence, 58)
 
         # Overall score: convergence × signal count × flow intensity
         flow_intensity = abs(flow_data.get("flow_score", 0)) if flow_data else 0
@@ -721,6 +733,7 @@ def quick_scan(
             "alert_count": flow_data.get("alert_count", 0),
             "oi_score":    oi.get("score", 0),
             "oi_days":     oi.get("days", 0),
+            "conflict":    conflict,
         })
 
     scored.sort(key=lambda x: x["score"], reverse=True)

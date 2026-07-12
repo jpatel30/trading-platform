@@ -311,8 +311,19 @@ def rescan_with_validation(
         }
     batch_dp = {}
     for ticker, prints in dp_by.items():
-        buys  = sum(1 for d in prints if d.get("side") in ("BUY","A"))
-        sells = sum(1 for d in prints if d.get("side") in ("SELL","B"))
+
+        def _dp_side(d):
+            try:
+                price = float(d.get("price",0) or 0)
+                ask   = float(d.get("nbbo_ask",0) or 0)
+                bid   = float(d.get("nbbo_bid",0) or 0)
+                if ask and price >= ask * 0.999: return "BUY"
+                if bid and price <= bid * 1.001: return "SELL"
+                return d.get("side","")
+            except Exception:
+                return d.get("side","")
+        buys  = sum(1 for d in prints if _dp_side(d) in ("BUY","A"))
+        sells = sum(1 for d in prints if _dp_side(d) in ("SELL","B"))
         tot   = buys + sells
         batch_dp[ticker] = {"dp_score": round((buys-sells)/tot*100,1) if tot else 0}
 

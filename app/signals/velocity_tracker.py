@@ -72,8 +72,18 @@ def save_daily_signals(user_id: str) -> dict:
             tot  = bull + bear
             flow_score = round((bull-bear)/tot*100, 1) if tot else 0
 
-            dp_buy  = sum(1 for d in td if d.get("side") in ("BUY","A"))
-            dp_sell = sum(1 for d in td if d.get("side") in ("SELL","B"))
+            def _dp_side(d):
+                try:
+                    price = float(d.get("price",0) or 0)
+                    ask   = float(d.get("nbbo_ask",0) or 0)
+                    bid   = float(d.get("nbbo_bid",0) or 0)
+                    if ask and price >= ask * 0.999: return "BUY"
+                    if bid and price <= bid * 1.001: return "SELL"
+                    return d.get("side","")
+                except Exception:
+                    return d.get("side","")
+            dp_buy  = sum(1 for d in td if _dp_side(d) in ("BUY","A"))
+            dp_sell = sum(1 for d in td if _dp_side(d) in ("SELL","B"))
             dp_tot  = dp_buy + dp_sell
             dp_score = round((dp_buy-dp_sell)/dp_tot*100, 1) if dp_tot else 0
 

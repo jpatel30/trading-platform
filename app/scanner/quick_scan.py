@@ -85,12 +85,8 @@ def get_last_trading_date() -> str:
     now   = datetime.now(et)
     today = now.date()
 
-    # Polygon grouped daily only available after next trading day opens
-    # Use today only if it's a trading day AND between 9:30-16:00 ET
-    if (today.weekday() < 5
-            and today not in us_market_holidays(today.year)
-            and dtime(9, 30) <= now.time() < dtime(16, 0)):
-        return today.strftime("%Y-%m-%d")
+    # Polygon grouped daily only available after EOD processing (~8 PM ET)
+    # Always use previous completed trading day — Webull overrides live prices
 
     # Otherwise walk back to find last trading day
     cursor = today
@@ -553,8 +549,18 @@ def _get_uw_flow_signals(tickers: list[str]) -> dict[str, dict]:
         bear_flow  = sum(1 for a in alerts if a.get("type","").lower() == "put"
                          or a.get("sentiment","").upper() in ("BEARISH","PUT"))
         total_flow = bull_flow + bear_flow
-        dp_buy     = sum(1 for d in dp if d.get("side") in ("BUY","A"))
-        dp_sell    = sum(1 for d in dp if d.get("side") in ("SELL","B"))
+        def _dp_side(d):
+            try:
+                price = float(d.get("price",0) or 0)
+                ask   = float(d.get("nbbo_ask",0) or 0)
+                bid   = float(d.get("nbbo_bid",0) or 0)
+                if ask and price >= ask * 0.999: return "BUY"
+                if bid and price <= bid * 1.001: return "SELL"
+                return d.get("side","")
+            except Exception:
+                return d.get("side","")
+        dp_buy     = sum(1 for d in dp if _dp_side(d) in ("BUY","A"))
+        dp_sell    = sum(1 for d in dp if _dp_side(d) in ("SELL","B"))
         dp_total   = dp_buy + dp_sell
         flow_score = round((bull_flow-bear_flow)/total_flow*100, 1) if total_flow else 0
         dp_score   = round((dp_buy-dp_sell)/dp_total*100, 1)        if dp_total   else 0

@@ -657,12 +657,12 @@ def quick_scan(
         # Signal 2: Options flow
         if flow_data.get("alert_count", 0) >= 2:
             signals.append(f"flow {flow_data['alert_count']} alerts")
-            directions.append(flow_data["direction"])
+            directions.append("BULLISH" if flow_data.get("flow_score",0) > 0 else "BEARISH")
 
         # Signal 3: Dark pool
         if flow_data.get("dp_count", 0) >= 1:
             signals.append(f"dark_pool {flow_data['dp_count']} prints")
-            directions.append(flow_data["direction"])
+            directions.append("BULLISH" if flow_data.get("dp_score",0) > 0 else "BEARISH")
 
         # Signal 4: TA momentum (tiebreaker when flow absent)
         rsi       = float(price_data.get("rsi", 0) or 0)
@@ -691,7 +691,13 @@ def quick_scan(
         # Check convergence — bull vs bear compared directly, ties do NOT default to bullish
         bull     = directions.count("BULLISH")
         bear     = directions.count("BEARISH")
-        conflict = bull > 0 and bear > 0  # signals actively disagree
+        # Conflict = the STRONG signals (flow/dp/oi) actively disagree,
+        # not just any weak momentum/TA dissent against a real move
+        strong_dirs = []
+        if flow_data.get("alert_count", 0) >= 2: strong_dirs.append("BULLISH" if flow_data.get("flow_score",0) > 0 else "BEARISH")
+        if flow_data.get("dp_count", 0) >= 1:    strong_dirs.append("BULLISH" if flow_data.get("dp_score",0) > 0 else "BEARISH")
+        if abs(oi_score) >= 40 and oi_days >= 5: strong_dirs.append(oi_dir)
+        conflict = len(set(strong_dirs)) > 1
 
         if bull > bear and bull >= min_convergence:
             conv_dir   = "BULLISH"

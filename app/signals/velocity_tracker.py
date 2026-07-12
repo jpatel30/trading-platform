@@ -67,6 +67,13 @@ def save_daily_signals(user_id: str) -> dict:
             iv      = {}
             insider = {"signal": "NEUTRAL", "has_buy": False, "has_sell": False, "total_value": 0}
 
+            # OI buildup signal (leading indicator)
+            try:
+                from app.signals.oi_flow import get_oi_buildup_signal
+                oi_data = get_oi_buildup_signal(ticker)
+            except Exception:
+                oi_data = {"score": 0, "signal": "NEUTRAL", "max_days_building": 0}
+
             bull = sum(1 for a in tf if a.get("type","").lower()=="call" or a.get("sentiment","").upper() in ("BULLISH","CALL"))
             bear = sum(1 for a in tf if a.get("type","").lower()=="put" or a.get("sentiment","").upper() in ("BEARISH","PUT"))
             tot  = bull + bear
@@ -87,8 +94,8 @@ def save_daily_signals(user_id: str) -> dict:
             dp_tot  = dp_buy + dp_sell
             dp_score = round((dp_buy-dp_sell)/dp_tot*100, 1) if dp_tot else 0
 
-            call_vol = sum(a.get("volume",0) for a in tf if a.get("sentiment") in ("BULLISH","CALL"))
-            put_vol  = sum(a.get("volume",0) for a in tf if a.get("sentiment") in ("BEARISH","PUT"))
+            call_vol = sum(a.get("volume",0) for a in tf if a.get("type","").lower()=="call" or a.get("sentiment","").upper() in ("BULLISH","CALL"))
+            put_vol  = sum(a.get("volume",0) for a in tf if a.get("type","").lower()=="put" or a.get("sentiment","").upper() in ("BEARISH","PUT"))
             cpr      = round(call_vol/put_vol, 2) if put_vol else None
 
             gex_val = 0  # GEX not fetched in snapshot
@@ -110,6 +117,9 @@ def save_daily_signals(user_id: str) -> dict:
                 "insider_value": insider.get("total_value", 0),
                 "price":        float(state.get("price", 0) or 0),
                 "change_pct":   float(state.get("change_pct", 0) or 0),
+                "oi_score":     oi_data.get("score", 0),
+                "oi_signal":    oi_data.get("signal", "NEUTRAL"),
+                "oi_max_days":  oi_data.get("max_days_building", 0),
             }
         except Exception as e:
             print(f"[Velocity] Enrich failed for {ticker}: {e}")
@@ -137,13 +147,13 @@ def save_daily_signals(user_id: str) -> dict:
                          sweep_count, call_vol, put_vol, call_put_ratio,
                          dp_score, dp_prints, iv_rank, gex_score,
                          insider_buy, insider_sell, insider_value,
-                         price, change_pct)
+                         price, change_pct, oi_score, oi_signal, oi_max_days)
                     VALUES
                         (:uid, :ticker, CURRENT_DATE, :flow_score, :flow_alerts,
                          :sweep_count, :call_vol, :put_vol, :call_put_ratio,
                          :dp_score, :dp_prints, :iv_rank, :gex_score,
                          :insider_buy, :insider_sell, :insider_value,
-                         :price, :change_pct)
+                         :price, :change_pct, :oi_score, :oi_signal, :oi_max_days)
                     ON CONFLICT (user_id, ticker, date) DO UPDATE SET
                         flow_score   = EXCLUDED.flow_score,
                         flow_alerts  = EXCLUDED.flow_alerts,
@@ -155,7 +165,10 @@ def save_daily_signals(user_id: str) -> dict:
                         insider_sell = EXCLUDED.insider_sell,
                         insider_value= EXCLUDED.insider_value,
                         price        = EXCLUDED.price,
-                        change_pct   = EXCLUDED.change_pct
+                        change_pct   = EXCLUDED.change_pct,
+                        oi_score     = EXCLUDED.oi_score,
+                        oi_signal    = EXCLUDED.oi_signal,
+                        oi_max_days  = EXCLUDED.oi_max_days
                 """), {**r, "uid": user_id,
                        "flow_alerts": r.get("flow_alerts",0),
                        "sweep_count": r.get("sweep_count",0),

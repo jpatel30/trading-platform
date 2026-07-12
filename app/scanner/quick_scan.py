@@ -618,6 +618,26 @@ def quick_scan(
     mom_threshold    = 1.5 if market_open else 0.5
     min_convergence  = 1  # 1 signal sufficient — convergence improves quality but not required
 
+    # OI buildup — read from last night's snapshot (cached, zero API cost)
+    oi_by_ticker = {}
+    if user_id:
+        try:
+            from sqlalchemy import text
+            from app.db.session import get_session
+            with get_session() as s:
+                rows = s.execute(text("""
+                    SELECT DISTINCT ON (ticker) ticker, oi_score, oi_signal, oi_max_days
+                    FROM signal_history
+                    WHERE user_id=:uid AND ticker = ANY(:tickers)
+                    ORDER BY ticker, date DESC
+                """), {"uid": user_id, "tickers": tickers}).fetchall()
+            oi_by_ticker = {r.ticker: {"score": float(r.oi_score or 0),
+                                       "signal": r.oi_signal or "NEUTRAL",
+                                       "days": r.oi_max_days or 0} for r in rows}
+            print(f"[Quick Scan] OI buildup data: {len(oi_by_ticker)} tickers from last snapshot")
+        except Exception as e:
+            print(f"[Quick Scan] OI fetch skipped: {e}")
+
     # 3. Score each ticker
     scored = []
     for ticker in tickers:
@@ -655,6 +675,15 @@ def quick_scan(
         elif sma_50 and price_val < sma_50 * 0.99 and (rsi > 65 or chg < -0.3):
             signals.append(f"ta_bearish rsi={rsi:.0f}")
             directions.append("BEARISH")
+
+        # Signal 5: OI buildup (leading indicator — institutions positioning early)
+        oi = oi_by_ticker.get(ticker, {})
+        oi_score = oi.get("score", 0)
+        oi_days  = oi.get("days", 0)
+        if abs(oi_score) >= 40 and oi_days >= 5:
+            oi_dir = "BULLISH" if oi_score > 0 else "BEARISH"
+            signals.append(f"oi_buildup {oi_score:+.0f}% {oi_days}d")
+            directions.append(oi_dir)
         if len(signals) < min_convergence:
             continue
 
@@ -690,6 +719,8 @@ def quick_scan(
             "dp_score":    flow_data.get("dp_score", 0),
             "sweeps":      flow_data.get("sweeps", 0),
             "alert_count": flow_data.get("alert_count", 0),
+            "oi_score":    oi.get("score", 0),
+            "oi_days":     oi.get("days", 0),
         })
 
     scored.sort(key=lambda x: x["score"], reverse=True)

@@ -156,6 +156,16 @@ def _enrich_ticker(
         result["insider_signal"] = "NEUTRAL"
         result["insider_text"]   = "No insider data"
 
+    # OI buildup — leading indicator (institutions positioning before catalyst)
+    try:
+        from app.signals.oi_flow import get_oi_buildup_signal
+        oi = get_oi_buildup_signal(ticker)
+        result["oi_score"]        = oi.get("score", 0)
+        result["oi_signal"]       = oi.get("signal", "NEUTRAL")
+        result["oi_max_days"]     = oi.get("max_days_building", 0)
+    except Exception:
+        result["oi_score"], result["oi_signal"], result["oi_max_days"] = 0, "NEUTRAL", 0
+
     # Velocity from signal history
     try:
         from app.signals.velocity_tracker import get_velocity_scores
@@ -242,6 +252,7 @@ def _compress_ticker(t: dict) -> str:
         f"  News: {news_str}"
     
         f" GEX:{'NEG' if t.get('gex_negative') else 'POS'} Vel:{t.get('velocity',0):+.0f}% Insider:{t.get('insider_signal','N')}"
+        f" OI:{t.get('oi_score',0):+.0f}({t.get('oi_signal','NEUTRAL')},{t.get('oi_max_days',0)}d)"
     )
 
 

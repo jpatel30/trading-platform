@@ -579,20 +579,35 @@ def _execute_trade_math(
         pnl_label       = "premium_paid"
         credit_received = 0
 
-    risk_reward = round(target_profit / stop_loss, 2) if stop_loss > 0 else None
+    # R/R for the gate must reflect REAL trade economics, not the fixed
+    # TARGET_PROFIT_PCT/STOP_LOSS_PCT ratio (which is a constant ~1.0 for
+    # every credit trade regardless of strikes — that bug let a SPY iron
+    # condor risking $1,977 to make $23 slip through undetected).
+    if is_credit:
+        real_risk_reward = round(credit_received / margin_required, 4) if margin_required > 0 else None
+    else:
+        real_risk_reward = round((max_p_c * n) / premium_paid, 4) if premium_paid > 0 else None
+    risk_reward = round(target_profit / stop_loss, 2) if stop_loss > 0 else None  # kept for display/back-compat only
 
     # ── R/R Validation ────────────────────────────────────────────────────────
-    # Reject trades with terrible R/R (LLM may have chosen ITM strikes)
-    # R/R threshold relaxes for longer DTE — 1M+ options naturally have lower R/R
+    # Reject trades with terrible REAL economics (max_gain vs max_loss),
+    # not the constant target/stop ratio. LLM may have chosen strikes too
+    # far OTM (tiny credit vs huge width) or ITM (huge debit, little room).
     _rr_min = 0.5
     if dte and dte >= 60:  _rr_min = 0.20   # 3M+
     elif dte and dte >= 30: _rr_min = 0.30  # 1M
     elif dte and dte >= 14: _rr_min = 0.40  # 2W
 
-    if risk_reward is not None and risk_reward < _rr_min:
+    # Credit strategies (iron condor etc) naturally have lower R/R by design
+    # (you're selling premium, not buying upside) — floor is lower but not zero
+    _rr_min_check = _rr_min * 0.25 if is_credit else _rr_min
+
+    if real_risk_reward is not None and real_risk_reward < _rr_min_check:
         strikes = [l["strike"] for l in legs_out]
         raise ValueError(
-            f"R/R {risk_reward} below {_rr_min} — LLM chose bad strikes {strikes}. Triggering fallback."
+            f"Real R/R {real_risk_reward} (gain={target_profit if not is_credit else round(max_p_c*n,2)} "
+            f"vs loss={stop_loss if not is_credit else round(max_l_c*n,2)}) below {_rr_min_check} — "
+            f"LLM chose bad strikes {strikes}. Triggering fallback."
         )
 
     # Webull limit price (net mid of all legs)

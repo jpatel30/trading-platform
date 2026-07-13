@@ -12,19 +12,39 @@ Architecture (no timeouts possible):
 
 Weights: Fundamentals 50%, Velocity 25%, Insider 25%
 
-Rewritten July 2026 — found a 4th hidden copy of the flow/dark-pool
-scoring bug in _fetch_velocity_realtime (same root cause as the other
-three: alert.get("sentiment") is always empty, real signal is "type";
-dp.get("side") is always empty, real signal is price vs NBBO). This
-function feeds the ~20 uncovered tickers per scan that don't yet have
-DB velocity history — was silently returning velocity=0 for all of
-them. Now imports the shared, audited implementation.
+Rewritten July 2026 (second pass) — two fixes:
+
+1. Analyst-upside reliability discount. Raw analyst-mean upside was
+   taken at face value with zero discount for how reliable that mean
+   actually is. Concrete evidence: EVTL showed +517% upside on 5
+   analysts at a $1.62 share price — a mean target that thin and that
+   close to zero is dominated by single-analyst-outlier risk, not a
+   real consensus. Because upside_pct feeds fund_score almost linearly
+   (capped only at 100+), this structurally favored cheap/thin-coverage
+   tickers over better-covered, more reliable names — explaining why
+   recommendations kept clustering under $30. Fix: discount upside_pct
+   by a reliability factor built from price level (thin coverage below
+   ~$15) and analyst low/high dispersion (wide disagreement = low
+   confidence) — both already free from the same analyst_price_targets
+   call, no added network cost. raw_upside_pct and reliability are
+   still returned for transparency; only the SCORING input changes.
+
+2. Progress checkpoints (set_scan_status) at each phase boundary, so
+   the UI progress bar shows real stages instead of sitting at 0% for
+   the ~30s runtime (previously this function never called
+   set_scan_status at all).
+
+Note: this fixes WHICH tickers reach Phase 2 (top 10) and their
+fund_score. It does NOT touch the flat 8% stop / target_pct / R:R
+display math for whichever tickers DO surface — that lives in
+get_stock_for_horizon (horizon_engine.py), a separate file.
 """
 import time
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from app.signals.flow_scoring import compute_flow_score, compute_dp_score
+from app.utils.scan_status import set_scan_status
 
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 
@@ -52,15 +72,24 @@ def _fetch_fast_info(ticker: str) -> dict:
         return {"price": 0, "quote_type": "EQUITY"}
 
 
-def _fetch_analyst_target(ticker: str) -> float:
+def _fetch_analyst_target(ticker: str) -> dict:
+    """
+    Returns mean/low/high — not just mean — so scoring can discount
+    for analyst disagreement (dispersion), using data already fetched
+    in this one call, no extra network cost.
+    """
     try:
         import yfinance as yf
         apt = yf.Ticker(ticker).analyst_price_targets
         if isinstance(apt, dict):
-            return float(apt.get("mean", 0) or 0)
+            return {
+                "mean": float(apt.get("mean", 0) or 0),
+                "low":  float(apt.get("low", 0) or 0),
+                "high": float(apt.get("high", 0) or 0),
+            }
     except Exception:
         pass
-    return 0
+    return {"mean": 0, "low": 0, "high": 0}
 
 
 def _fetch_insider(ticker: str) -> dict:
@@ -76,15 +105,12 @@ def _fetch_insider(ticker: str) -> dict:
 
 
 def _fetch_velocity_realtime(ticker: str) -> dict:
-    """Live UW flow+dp for a ticker with no DB velocity history yet."""
     try:
         from app.options_flow.unusual_whales import get_flow_alerts, get_dark_pool_ticker
         flow = get_flow_alerts(ticker=ticker, limit=20) or []
         dp   = get_dark_pool_ticker(ticker, limit=20) or []
-
         fs  = compute_flow_score(flow)["flow_score"]
         dps = compute_dp_score(dp)["dp_score"]
-
         combined = fs * 0.6 + dps * 0.4
         score    = min(max(50 + combined * 0.5, 0), 100)
         return {
@@ -93,6 +119,41 @@ def _fetch_velocity_realtime(ticker: str) -> dict:
         }
     except Exception:
         return {"score": 50, "velocity": 0, "direction": "NEUTRAL"}
+
+
+def _reliability_factor(price: float, low: float, high: float, mean: float) -> float:
+    """
+    0.0-1.0 confidence multiplier for an analyst target, using only
+    data already fetched — no extra network calls.
+
+      Price level:  thin analyst coverage, wide bid/ask spreads, and
+                     outsized single-analyst-outlier risk make mean
+                     targets on sub-$15 names systematically less
+                     trustworthy. Ramps 0.35 (<=$3) to 1.0 (>=$15),
+                     not a hard cutoff — a $12 stock still counts,
+                     just partially discounted.
+      Dispersion:   if analyst low/high disagree widely relative to
+                     the mean, "consensus" is barely a consensus.
+                     Tight agreement (<=30% spread/mean) = full trust;
+                     150%+ spread = heavily discounted.
+    """
+    if not mean or mean <= 0:
+        return 0.5
+
+    if price >= 15:
+        price_factor = 1.0
+    elif price >= 3:
+        price_factor = 0.35 + (price - 3) / 12 * 0.65
+    else:
+        price_factor = 0.35
+
+    if low and high and high > low:
+        spread_pct = (high - low) / mean
+        dispersion_factor = max(0.3, 1.0 - max(0, spread_pct - 0.3) / 1.2)
+    else:
+        dispersion_factor = 0.6  # unknown spread — moderate discount, not full trust
+
+    return round(price_factor * dispersion_factor, 3)
 
 
 def _score_ticker(ticker, fd, target, velocity, insider) -> dict:
@@ -104,6 +165,8 @@ def _score_ticker(ticker, fd, target, velocity, insider) -> dict:
         return {"ticker": ticker, "composite": 0, "filtered": True, "reason": "low_volume"}
 
     qt = fd.get("quote_type", "EQUITY")
+    raw_upside_pct = 0.0
+    reliability     = 1.0
 
     if qt not in ("EQUITY", ""):
         avg_50   = fd.get("50d_avg", price) or price
@@ -115,14 +178,19 @@ def _score_ticker(ticker, fd, target, velocity, insider) -> dict:
         fund_score = 30 + above_50 + yr_trend + near_hi
         upside_pct = 0
     else:
-        if not target:
+        mean = target.get("mean", 0) if isinstance(target, dict) else float(target or 0)
+        if not mean:
             fund_score = 40
             upside_pct = 0
         else:
-            upside_pct = (target - price) / price * 100
-            if upside_pct < -10:
+            raw_upside_pct = (mean - price) / price * 100
+            if raw_upside_pct < -10:
                 return {"ticker": ticker, "composite": 0, "filtered": True,
-                        "reason": f"overvalued {upside_pct:.1f}%"}
+                        "reason": f"overvalued {raw_upside_pct:.1f}%"}
+            low  = target.get("low", 0)  if isinstance(target, dict) else 0
+            high = target.get("high", 0) if isinstance(target, dict) else 0
+            reliability = _reliability_factor(price, low, high, mean)
+            upside_pct  = raw_upside_pct * reliability  # discounted — this is what scores
             upside_score = min(max(upside_pct, 0), 100)
             fund_score   = upside_score*0.40 + 40*0.30 + 30*0.20 + 50*0.10
 
@@ -131,8 +199,12 @@ def _score_ticker(ticker, fd, target, velocity, insider) -> dict:
     return {
         "ticker": ticker, "price": price, "composite": round(composite,1),
         "fund_score": round(fund_score,1), "velocity_score": velocity.get("score",50),
-        "insider_score": insider.get("score",50), "upside_pct": round(upside_pct,1),
-        "target_price": round(target,2), "velocity": velocity.get("velocity",0),
+        "insider_score": insider.get("score",50),
+        "upside_pct": round(upside_pct,1),          # reliability-discounted (used for scoring)
+        "raw_upside_pct": round(raw_upside_pct,1),  # undiscounted, for transparency/debugging
+        "reliability": reliability,
+        "target_price": round(target.get("mean",0) if isinstance(target, dict) else float(target or 0), 2),
+        "velocity": velocity.get("velocity",0),
         "velocity_dir": velocity.get("direction","NEUTRAL"),
         "insider_signal": insider.get("signal","NEUTRAL"), "csuite_buy": insider.get("csuite_buy",False),
         "volume": fd.get("volume",0), "change_pct": fd.get("change_pct",0),
@@ -145,9 +217,12 @@ def run_smart_stock_scan(user_id, horizon="6m", budget=5000.0, top_n=5):
     from app.signals.velocity_tracker import get_velocity_scores
 
     t_start = time.time()
+    set_scan_status(user_id, "queued")
+
     tickers = get_scan_universe(user_id=user_id)
     print(f"[StockScan] {len(tickers)} tickers | {horizon} | ${budget:,.0f}")
 
+    set_scan_status(user_id, "fundamentals")
     t0 = time.time()
     fast_data = {}
     with ThreadPoolExecutor(max_workers=20) as ex:
@@ -155,6 +230,7 @@ def run_smart_stock_scan(user_id, horizon="6m", budget=5000.0, top_n=5):
             fast_data[ticker] = data
     print(f"[StockScan] fast_info done in {time.time()-t0:.1f}s")
 
+    set_scan_status(user_id, "analyst")
     t0 = time.time()
     analyst_targets = {}
     equities = [t for t in tickers if fast_data.get(t,{}).get("quote_type","EQUITY") in ("EQUITY","")]
@@ -167,6 +243,7 @@ def run_smart_stock_scan(user_id, horizon="6m", budget=5000.0, top_n=5):
                 pass
     print(f"[StockScan] Analyst targets: {len(analyst_targets)} in {time.time()-t0:.1f}s")
 
+    set_scan_status(user_id, "signals")
     t0 = time.time()
     velocity_cache = {}
     try:
@@ -229,11 +306,13 @@ def run_smart_stock_scan(user_id, horizon="6m", budget=5000.0, top_n=5):
     except Exception as e:
         print(f"[StockScan] Signal save failed: {e}")
 
+    set_scan_status(user_id, "scoring")
     t0 = time.time()
     candidates = []
     for ticker in tickers:
         r = _score_ticker(
-            ticker=ticker, fd=fast_data.get(ticker, {}), target=analyst_targets.get(ticker, 0),
+            ticker=ticker, fd=fast_data.get(ticker, {}),
+            target=analyst_targets.get(ticker, {"mean":0,"low":0,"high":0}),
             velocity=velocity_cache.get(ticker, {"score":50,"velocity":0,"direction":"NEUTRAL"}),
             insider=insider_cache.get(ticker, {"score":50,"signal":"NEUTRAL"}),
         )
@@ -245,15 +324,20 @@ def run_smart_stock_scan(user_id, horizon="6m", budget=5000.0, top_n=5):
     print(f"[StockScan] Top 5: {[c['ticker'] for c in candidates[:5]]}")
 
     if not candidates:
+        set_scan_status(user_id, "complete")
         return {"stocks":[], "source":"smart_stock_scan", "elapsed": round(time.time()-t_start,1), "scored":0}
 
+    set_scan_status(user_id, "deep_analysis")
     print(f"[StockScan] Phase 2: deep analysis on top {min(10,len(candidates))}...")
     from app.recommendations.horizon_engine import get_stock_for_horizon
 
-    equity_candidates = [c for c in candidates if c.get("quote_type","EQUITY") in ("EQUITY","")]
-    print(f"[StockScan] Phase 2: {len(equity_candidates)} equity candidates (ETFs excluded)")
+    # No ETF exclusion — full watchlist eligible, including SPY/QQQ/IWM/
+    # SMH/SOXX etc. get_stock_for_horizon() may still score these lower
+    # if fundamentals.py's PEG/margin/revenue-growth fields come back
+    # empty for a fund — that's data availability, not a ticker filter.
+    print(f"[StockScan] Phase 2: {len(candidates)} candidates (no ETF exclusion)")
     results, seen = [], set()
-    for cand in equity_candidates[:10]:
+    for cand in candidates[:10]:
         ticker = cand["ticker"]
         if ticker in seen: continue
         seen.add(ticker)
@@ -264,6 +348,8 @@ def run_smart_stock_scan(user_id, horizon="6m", budget=5000.0, top_n=5):
                     "composite_score": cand["composite"], "velocity": cand["velocity"],
                     "velocity_dir": cand["velocity_dir"], "insider_signal": cand["insider_signal"],
                     "csuite_buy": cand["csuite_buy"], "status": "NEW",
+                    "reliability": cand.get("reliability", 1.0),
+                    "raw_upside_pct": cand.get("raw_upside_pct", 0),
                     "fundamental_score": round(rec.get("fundamental_score",0)*0.7 + cand["composite"]*0.3),
                 })
                 results.append(rec)
@@ -273,4 +359,5 @@ def run_smart_stock_scan(user_id, horizon="6m", budget=5000.0, top_n=5):
 
     total = round(time.time()-t_start, 1)
     print(f"[StockScan] COMPLETE in {total}s — {len(results)} picks")
+    set_scan_status(user_id, "complete")
     return {"stocks": results, "source": "smart_stock_scan", "elapsed": total, "scored": len(candidates)}

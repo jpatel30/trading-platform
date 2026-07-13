@@ -554,7 +554,14 @@ async def get_daily_recs(
             # ── STOCK scan ────────────────────────────────────────────────
             if scan_type == "stocks":
                 from app.recommendations.smart_stock_scan import run_smart_stock_scan
-                scan_result = run_smart_stock_scan(
+                from starlette.concurrency import run_in_threadpool
+                # run_smart_stock_scan is fully synchronous (yfinance calls,
+                # ThreadPoolExecutor().result() waits, ~30-40s runtime) — same
+                # blocking-event-loop issue fixed for the options branch last
+                # session. Without this, /api/scan/status polls queue as
+                # genuinely unprocessed for the full scan duration.
+                scan_result = await run_in_threadpool(
+                    run_smart_stock_scan,
                     user_id=user_id, horizon=horizon, budget=budget, top_n=5
                 )
                 results = scan_result.get("stocks", [])

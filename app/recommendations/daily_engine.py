@@ -437,10 +437,6 @@ def run_daily_recommendations(
     except Exception as e:
         print(f"[DailyRec] Portfolio filter failed: {e} — using full universe")
 
-    # Remove market proxies unless specific catalyst
-    MARKET_PROXIES = {"SPY","QQQ","IWM","DIA","VXX","UVXY","SQQQ","TQQQ","SPXU"}
-    tickers = [t for t in tickers if t not in MARKET_PROXIES]
-
     picks = quick_scan(tickers, user_id=user_id, top_n=15)
 
     # Bug 3: No-signal day — never force a recommendation

@@ -21,6 +21,12 @@ STAGES = {
     "storing":      (95,  "Saving results..."),
     "complete":     (100, "Done"),
     "error":        (100, "Scan failed"),
+    # Stock-scan-specific stages
+    "fundamentals": (15,  "Fetching price & fundamentals..."),
+    "analyst":      (30,  "Fetching analyst targets..."),
+    "signals":      (50,  "Checking velocity & insider activity..."),
+    "scoring":      (65,  "Scoring candidates..."),
+    "deep_analysis":(85,  "Analyzing top picks..."),
 }
 
 def set_scan_status(user_id: str, stage: str, detail: str = "") -> None:

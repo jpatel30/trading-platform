@@ -42,14 +42,10 @@ MIN_PRICE      = 15.0
 MAX_PRICE      = 800.0
 MIN_CONFIDENCE = 50
 
-EXCLUDED = {"NMAX","VXX","UVXY","SQQQ","TQQQ","SPXU","DIA","IWM"}
-
-
 def _is_optionable(pick: dict) -> bool:
     price = float(pick.get("price", 0) or 0)
     return (
         price >= MIN_PRICE and price <= MAX_PRICE
-        and pick.get("ticker") not in EXCLUDED
         and pick.get("confidence", 0) >= MIN_CONFIDENCE
     )
 
@@ -573,9 +569,10 @@ def run_smart_recommendations(
 
     stock_recs = []
     try:
-        from app.recommendations.horizon_engine import get_stock_for_horizon
+        from app.recommendations.horizon_engine import get_stock_for_horizon, get_stock_universe
         import yfinance as yf
-        for t in ["NVDA", "AAPL"]:
+        watchlist_tickers = get_stock_universe(user_id)[:2] if user_id else []
+        for t in watchlist_tickers:
             try:
                 price = yf.Ticker(t).fast_info.last_price or 0
                 if price:

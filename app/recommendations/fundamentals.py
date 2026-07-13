@@ -247,12 +247,18 @@ def score_fundamentals(
     # Cap at 100
     final = min(100, total)
 
+    # Bug fix: dict.get(key, default) only uses `default` when the key is
+    # ABSENT — get_fundamentals() always includes "target_mean_price" in the
+    # dict (as info.get("targetMeanPrice"), which is None for any ETF/fund),
+    # so the old code returned None here, not price, and then crashed on
+    # None - price. Explicit None-check instead.
+    _target_mean = fundamentals.get("target_mean_price")
     return {
         "fundamental_score": final,
         "breakdown":         breakdown,
         "analyst_upside_pct": round(
-            (fundamentals.get("target_mean_price", price) - price) / price * 100, 1
-        ) if price else None,
-        "target_mean_price": fundamentals.get("target_mean_price"),
+            (_target_mean - price) / price * 100, 1
+        ) if (price and _target_mean) else None,
+        "target_mean_price": _target_mean,
         "analyst_recommendation": fundamentals.get("analyst_recommendation"),
     }

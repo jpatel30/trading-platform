@@ -244,6 +244,122 @@ def _group_legs(legs_out: list[dict]) -> dict[str, list[dict]]:
     return groups
 
 
+def _norm_cdf(x: float) -> float:
+    """Standard normal CDF via erf — no scipy dependency needed."""
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def _prob_above(spot: float, strike: float, dte: int, iv: float, r: float = 0.05) -> float:
+    """
+    Risk-neutral probability that S_T > strike at expiration — the
+    standard N(d2) 'probability ITM' measure used by real platforms
+    (thinkorswim, tastytrade). Distinct from delta (N(d1), a hedge
+    ratio, not a probability), though numerically close in practice.
+    """
+    if strike <= 0 or spot <= 0 or iv <= 0:
+        return 0.5
+    t = max(dte, 1) / 365.0
+    try:
+        d2 = (math.log(spot / strike) + (r - 0.5 * iv ** 2) * t) / (iv * math.sqrt(t))
+        return _norm_cdf(d2)
+    except (ValueError, ZeroDivisionError):
+        return 0.5
+
+
+def _find_leg(legs_out: list[dict], type_: str, action: str) -> dict | None:
+    for l in legs_out:
+        if l["type"] == type_ and l["action"] == action:
+            return l
+    return None
+
+
+def _estimate_pop_and_ev(
+    strategy: str, legs_out: list[dict], spot: float, dte: int, avg_iv: float,
+    entry: float, max_p_c: float, max_l_c: float,
+) -> tuple[float | None, float | None]:
+    """
+    Estimate probability of profit (BSM N(d2)) and a simplified bimodal
+    expected value: EV = POP*max_gain - (1-POP)*max_loss.
+
+    This is a real-money gate for long-premium (debit) strategies — see
+    is_credit exclusion at the call site. Bimodal EV is a standard
+    retail-analytics simplification (treats the outcome as roughly
+    max-gain or roughly max-loss, ignoring the partial-profit region
+    between breakevens) — directionally reliable, not a precise
+    integral of the full P&L distribution.
+
+    Returns (None, None) if the strategy/leg structure isn't recognized
+    — callers should skip the gate rather than reject on missing data.
+    """
+    def pop_above(k): return _prob_above(spot, k, dte, avg_iv)
+
+    pop = None
+
+    if strategy == "IRON_CONDOR":
+        call_short = _find_leg(legs_out, "CALL", "SELL")
+        put_short  = _find_leg(legs_out, "PUT",  "SELL")
+        if call_short and put_short:
+            credit  = abs(entry)
+            call_be = call_short["strike"] + credit
+            put_be  = put_short["strike"]  - credit
+            pop = pop_above(put_be) - pop_above(call_be)
+
+    elif strategy == "DEBIT_CALL_SPREAD":
+        buy_leg = _find_leg(legs_out, "CALL", "BUY")
+        if buy_leg:
+            pop = pop_above(buy_leg["strike"] + entry)
+
+    elif strategy == "CREDIT_PUT_SPREAD":
+        sell_leg = _find_leg(legs_out, "PUT", "SELL")
+        if sell_leg:
+            pop = pop_above(sell_leg["strike"] - abs(entry))
+
+    elif strategy == "DEBIT_PUT_SPREAD":
+        buy_leg = _find_leg(legs_out, "PUT", "BUY")
+        if buy_leg:
+            pop = 1 - pop_above(buy_leg["strike"] - entry)
+
+    elif strategy == "CREDIT_CALL_SPREAD":
+        sell_leg = _find_leg(legs_out, "CALL", "SELL")
+        if sell_leg:
+            pop = 1 - pop_above(sell_leg["strike"] + abs(entry))
+
+    elif strategy in ("STRADDLE", "STRANGLE"):
+        call_leg = _find_leg(legs_out, "CALL", "BUY")
+        put_leg  = _find_leg(legs_out, "PUT",  "BUY")
+        if call_leg and put_leg:
+            call_be = call_leg["strike"] + entry
+            put_be  = put_leg["strike"]  - entry
+            pop = pop_above(call_be) + (1 - pop_above(put_be))
+
+    elif strategy == "NAKED_CALL":
+        buy_leg = _find_leg(legs_out, "CALL", "BUY")
+        if buy_leg:
+            pop = pop_above(buy_leg["strike"] + entry)
+
+    elif strategy == "NAKED_PUT":
+        buy_leg = _find_leg(legs_out, "PUT", "BUY")
+        if buy_leg:
+            pop = 1 - pop_above(buy_leg["strike"] - entry)
+
+    elif strategy == "SHORT_NAKED_CALL":
+        sell_leg = _find_leg(legs_out, "CALL", "SELL")
+        if sell_leg:
+            pop = 1 - pop_above(sell_leg["strike"] + abs(entry))
+
+    elif strategy == "SHORT_NAKED_PUT":
+        sell_leg = _find_leg(legs_out, "PUT", "SELL")
+        if sell_leg:
+            pop = pop_above(sell_leg["strike"] - abs(entry))
+
+    if pop is None:
+        return None, None
+
+    pop = min(max(pop, 0.0), 1.0)
+    ev  = round(pop * max_p_c - (1 - pop) * max_l_c, 2)
+    return round(pop, 4), ev
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Data Package for LLM (single-ticker path — build_recommendation)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -581,6 +697,29 @@ def _execute_trade_math(
             f"below {_rr_min_check} — chosen strikes {strikes} rejected. Triggering fallback."
         )
 
+    # ── Probability-adjusted EV gate — long-premium strategies only ────────
+    # A trade can clear the R/R floor and still be a bad bet if the real
+    # probability of reaching that gain is far below what the ratio needs.
+    # Applied only to debit/long-premium strategies (NAKED_CALL/PUT, DEBIT
+    # spreads, STRADDLE, STRANGLE): for credit strategies, an N(d2) estimate
+    # using the SAME IV used to price the trade is known to be systematically
+    # pessimistic (the volatility risk premium — IV usually overstates
+    # realized vol — is exactly where premium-selling's real edge comes
+    # from, and this calculation can't see it). pop/ev are still computed
+    # and returned for every strategy for visibility; only the reject is
+    # scoped to avoid quietly filtering out the one strategy class
+    # (IRON_CONDOR) this system's own backtest shows actually works.
+    pop_estimate, expected_value = _estimate_pop_and_ev(
+        strategy, legs_out, spot, dte, avg_iv, entry, max_p_c, max_l_c
+    )
+    if not is_credit and expected_value is not None and expected_value < 0:
+        strikes = [l["strike"] for l in legs_out]
+        raise ValueError(
+            f"Negative estimated EV ${expected_value:,.0f} (POP={pop_estimate:.1%}, "
+            f"max_gain=${max_p_c:,.0f}, max_loss=${max_l_c:,.0f}) — "
+            f"chosen strikes {strikes} rejected. Triggering fallback."
+        )
+
     sell_mid = sum(l["mid"] for l in legs_out if l["action"] == "SELL")
     buy_mid  = sum(l["mid"] for l in legs_out if l["action"] == "BUY")
     webull_limit_price = round(sell_mid - buy_mid, 2) if is_credit else round(buy_mid - sell_mid, 2)
@@ -614,6 +753,8 @@ def _execute_trade_math(
         "target_profit":         target_profit,
         "stop_loss":             stop_loss,
         "risk_reward":           real_risk_reward,   # the ONLY r/r value now — no shadow constant
+        "pop_estimate":          pop_estimate,
+        "expected_value":        expected_value,
         "webull_limit_price":    webull_limit_price,
         "webull_instructions": (
             f"Enter as Iron Condor/Spread order at LIMIT ${webull_limit_price:.2f} credit. "

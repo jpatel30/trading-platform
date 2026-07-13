@@ -41,7 +41,7 @@ def _load_todays_recs(user_id: str, horizon: str = "", min_exp: str = "", max_ex
             rows = s.execute(text("""
                 SELECT id, ticker, direction, strategy, expiry, dte,
                        conviction_score, thesis, webull_instructions,
-                       legs, entry_debit, max_profit, max_loss,
+                       legs, entry_debit, webull_limit_price, max_profit, max_loss,
                        risk_reward, invalidation_conditions, key_news,
                        signal_data, created_at
                 FROM daily_recommendations
@@ -63,7 +63,9 @@ def _load_todays_recs(user_id: str, horizon: str = "", min_exp: str = "", max_ex
                 "dte": r.dte or 17, "conviction": r.conviction_score or 65,
                 "confidence": r.conviction_score or 65, "thesis": r.thesis or "",
                 "webull_instructions": r.webull_instructions or "", "legs": r.legs or [],
-                "entry_debit": float(r.entry_debit or 0), "max_profit": float(r.max_profit or 0),
+                "entry_debit": float(r.entry_debit or 0),
+                "webull_limit_price": float(r.webull_limit_price or 0),
+                "max_profit": float(r.max_profit or 0),
                 "max_loss": float(r.max_loss or 0), "risk_reward": float(r.risk_reward or 0),
                 "invalidation": r.invalidation_conditions or "", "key_news": r.key_news or "",
                 "market_view": sd.get("market_view", ""), "status": STATUS_INTACT,
@@ -439,6 +441,7 @@ def rescan_with_validation(
                     "invalidation_conditions": rec.get("key_risk",""),
                     "strategy": trade.get("strategy",""), "expiry": trade.get("expiry",""),
                     "dte": trade.get("dte",17), "legs": legs, "entry_debit": trade.get("entry_debit",0),
+                    "webull_limit_price": trade.get("webull_limit_price",0),
                     "total_cost": trade.get("total_cost",0),
                     "max_profit": trade.get("max_profit_per_contract",0),
                     "max_loss": trade.get("max_loss_per_contract",0),

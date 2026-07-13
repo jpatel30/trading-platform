@@ -151,7 +151,7 @@ def _upsert_recommendation(user_id: str, data: dict) -> str | None:
                     target_price, target_pct, stop_price, stop_pct,
                     timeframe, invalidation_conditions,
                     strategy, expiry, dte, legs,
-                    entry_debit, total_cost, max_profit, max_loss,
+                    entry_debit, webull_limit_price, total_cost, max_profit, max_loss,
                     risk_reward, webull_instructions, key_news,
                     conviction_breakdown, signal_data, warnings, status
                 ) VALUES (
@@ -162,7 +162,7 @@ def _upsert_recommendation(user_id: str, data: dict) -> str | None:
                     :target_price, :target_pct, :stop_price, :stop_pct,
                     :timeframe, :invalidation,
                     :strategy, :expiry, :dte, :legs,
-                    :entry_debit, :total_cost, :max_profit, :max_loss,
+                    :entry_debit, :webull_limit_price, :total_cost, :max_profit, :max_loss,
                     :risk_reward, :webull_instructions, :key_news,
                     :breakdown, :signal_data, :warnings, 'ACTIVE'
                 )
@@ -173,6 +173,7 @@ def _upsert_recommendation(user_id: str, data: dict) -> str | None:
                     act_now                 = EXCLUDED.act_now,
                     thesis                  = EXCLUDED.thesis,
                     conviction_breakdown    = EXCLUDED.conviction_breakdown,
+                    webull_limit_price      = EXCLUDED.webull_limit_price,
                     last_checked_at         = now()
                 RETURNING id
             """), {
@@ -199,6 +200,7 @@ def _upsert_recommendation(user_id: str, data: dict) -> str | None:
                 "dte":                data.get("dte"),
                 "legs":               json.dumps(data.get("legs", [])),
                 "entry_debit":        data.get("entry_debit"),
+                "webull_limit_price": data.get("webull_limit_price"),
                 "total_cost":         data.get("total_cost"),
                 "max_profit":         data.get("max_profit"),
                 "max_loss":           data.get("max_loss"),
@@ -229,7 +231,7 @@ def get_active_recommendations(user_id: str, date_str: str | None = None) -> lis
                        thesis, entry_zone_low, entry_zone_high, entry_trigger,
                        target_price, target_pct, stop_price, stop_pct,
                        timeframe, invalidation_conditions,
-                       strategy, expiry, dte, entry_debit, total_cost,
+                       strategy, expiry, dte, entry_debit, webull_limit_price, total_cost,
                        max_profit, max_loss, risk_reward, webull_instructions,
                        key_news, status, invalidated_reason, warnings, created_at
                 FROM daily_recommendations

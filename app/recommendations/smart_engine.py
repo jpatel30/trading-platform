@@ -608,6 +608,7 @@ def run_smart_recommendations(
                 "invalidation_conditions": rec.get("key_risk", ""),
                 "strategy": rec.get("strategy", ""), "expiry": rec.get("expiry", ""),
                 "dte": rec.get("dte", 17), "legs": legs, "entry_debit": rec.get("entry_debit", 0),
+                "webull_limit_price": rec.get("webull_limit_price", 0),
                 "total_cost": rec.get("total_cost", 0),
                 "max_profit": rec.get("max_profit_per_contract", 0),
                 "max_loss": rec.get("max_loss_per_contract", 0),

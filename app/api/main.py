@@ -227,11 +227,26 @@ async def startup_event():
                 from sqlalchemy import text
                 from app.db.session import get_session
                 from app.learning.nightly_loop import run_nightly_loop
+                from app.recommendations.mark_to_market import mark_all_active_recommendations
                 from app.broker.factory import get_broker
                 with get_session() as s:
                     users = s.execute(text("SELECT id FROM users WHERE is_active=TRUE")).fetchall()
                 for u in users:
                     uid = str(u.id)
+
+                    # Mark every open recommendation to market FIRST — the
+                    # learning loop needs today's real P&L, not whatever was
+                    # last computed (previously only happened lazily when
+                    # the History tab was opened, so nightly learning could
+                    # run against stale or entirely-unmarked data on a day
+                    # nobody opened the app).
+                    try:
+                        mark_result = mark_all_active_recommendations(uid, days_back=90)
+                        print(f"[Scheduler] Marked {mark_result.get('marked',0)}/"
+                              f"{mark_result.get('total',0)} recs for {uid[:8]}")
+                    except Exception as e:
+                        print(f"[Scheduler] Mark-to-market failed for {uid[:8]}: {e}")
+
                     try:
                         positions = get_broker(uid).get_positions() or []
                     except Exception:
@@ -588,12 +603,21 @@ async def get_daily_recs(
             from app.scanner.quick_scan import quick_scan
             from app.scanner.universe import get_scan_universe
 
+            from starlette.concurrency import run_in_threadpool
+
             if sector and cap_size:
                 picks = None
             else:
-                picks = quick_scan(get_scan_universe(user_id=user_id), user_id=user_id, top_n=15)
-
-            result = rescan_with_validation(
+                picks = await run_in_threadpool(
+                    quick_scan, get_scan_universe(user_id=user_id), user_id=user_id, top_n=15
+                )
+            # rescan_with_validation is fully synchronous (blocking HTTP calls
+            # to Ollama, yfinance, ThreadPoolExecutor waits, sync DB sessions)
+            # and takes ~60-80s. Run it off the event loop so /api/scan/status
+            # polls (and every other request) do not queue up "pending" behind
+            # it for the entire duration.
+            result = await run_in_threadpool(
+                rescan_with_validation,
                 user_id=user_id, budget=budget,
                 pre_scanned=picks,
                 sector=sector, cap_size=cap_size, catalyst=catalyst,

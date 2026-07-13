@@ -11,10 +11,20 @@ Architecture (no timeouts possible):
   Phase 2: get_stock_for_horizon on top 10
 
 Weights: Fundamentals 50%, Velocity 25%, Insider 25%
+
+Rewritten July 2026 — found a 4th hidden copy of the flow/dark-pool
+scoring bug in _fetch_velocity_realtime (same root cause as the other
+three: alert.get("sentiment") is always empty, real signal is "type";
+dp.get("side") is always empty, real signal is price vs NBBO). This
+function feeds the ~20 uncovered tickers per scan that don't yet have
+DB velocity history — was silently returning velocity=0 for all of
+them. Now imports the shared, audited implementation.
 """
 import time
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+from app.signals.flow_scoring import compute_flow_score, compute_dp_score
 
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 
@@ -60,36 +70,34 @@ def _fetch_insider(ticker: str) -> dict:
         signal = data.get("signal", "NEUTRAL")
         score  = {"STRONG_BULLISH": 95, "BULLISH": 75, "NEUTRAL": 50, "BEARISH": 20}.get(signal, 50)
         return {"score": score, "signal": signal,
-                "csuite_buy": data.get("csuite_buy", False),
-                "buy_value":  data.get("buy_value", 0)}
+                "csuite_buy": data.get("csuite_buy", False), "buy_value": data.get("buy_value", 0)}
     except Exception:
         return {"score": 50, "signal": "NEUTRAL"}
 
 
 def _fetch_velocity_realtime(ticker: str) -> dict:
+    """Live UW flow+dp for a ticker with no DB velocity history yet."""
     try:
         from app.options_flow.unusual_whales import get_flow_alerts, get_dark_pool_ticker
         flow = get_flow_alerts(ticker=ticker, limit=20) or []
         dp   = get_dark_pool_ticker(ticker, limit=20) or []
-        bull = sum(1 for a in flow if a.get("sentiment") in ("BULLISH","CALL"))
-        bear = sum(1 for a in flow if a.get("sentiment") in ("BEARISH","PUT"))
-        tot  = bull + bear
-        fs   = (bull - bear) / tot * 100 if tot else 0
-        db   = sum(1 for d in dp if d.get("side") in ("BUY","A"))
-        ds   = sum(1 for d in dp if d.get("side") in ("SELL","B"))
-        dt   = db + ds
-        dps  = (db - ds) / dt * 100 if dt else 0
+
+        fs  = compute_flow_score(flow)["flow_score"]
+        dps = compute_dp_score(dp)["dp_score"]
+
         combined = fs * 0.6 + dps * 0.4
         score    = min(max(50 + combined * 0.5, 0), 100)
-        return {"score": round(score,1), "velocity": round(combined,1),
-                "direction": "BULLISH" if combined > 20 else "BEARISH" if combined < -20 else "NEUTRAL"}
+        return {
+            "score": round(score, 1), "velocity": round(combined, 1),
+            "direction": "BULLISH" if combined > 20 else "BEARISH" if combined < -20 else "NEUTRAL",
+        }
     except Exception:
         return {"score": 50, "velocity": 0, "direction": "NEUTRAL"}
 
 
 def _score_ticker(ticker, fd, target, velocity, insider) -> dict:
     """Pure math — zero network calls, zero timeouts."""
-    price  = fd.get("price", 0)
+    price = fd.get("price", 0)
     if not price:
         return {"ticker": ticker, "composite": 0, "filtered": True, "reason": "no price"}
     if fd.get("volume", 0) < 50_000:
@@ -115,7 +123,7 @@ def _score_ticker(ticker, fd, target, velocity, insider) -> dict:
             if upside_pct < -10:
                 return {"ticker": ticker, "composite": 0, "filtered": True,
                         "reason": f"overvalued {upside_pct:.1f}%"}
-            upside_score = min(max(upside_pct, 0), 100)  # 100% upside = 100 score, linear
+            upside_score = min(max(upside_pct, 0), 100)
             fund_score   = upside_score*0.40 + 40*0.30 + 30*0.20 + 50*0.10
 
     composite = fund_score*0.50 + velocity.get("score",50)*0.25 + insider.get("score",50)*0.25
@@ -126,8 +134,7 @@ def _score_ticker(ticker, fd, target, velocity, insider) -> dict:
         "insider_score": insider.get("score",50), "upside_pct": round(upside_pct,1),
         "target_price": round(target,2), "velocity": velocity.get("velocity",0),
         "velocity_dir": velocity.get("direction","NEUTRAL"),
-        "insider_signal": insider.get("signal","NEUTRAL"),
-        "csuite_buy": insider.get("csuite_buy",False),
+        "insider_signal": insider.get("signal","NEUTRAL"), "csuite_buy": insider.get("csuite_buy",False),
         "volume": fd.get("volume",0), "change_pct": fd.get("change_pct",0),
         "year_chg": fd.get("year_chg",0), "quote_type": qt, "filtered": False,
     }
@@ -141,7 +148,6 @@ def run_smart_stock_scan(user_id, horizon="6m", budget=5000.0, top_n=5):
     tickers = get_scan_universe(user_id=user_id)
     print(f"[StockScan] {len(tickers)} tickers | {horizon} | ${budget:,.0f}")
 
-    # Pre-fetch 1: fast_info (parallel)
     t0 = time.time()
     fast_data = {}
     with ThreadPoolExecutor(max_workers=20) as ex:
@@ -149,7 +155,6 @@ def run_smart_stock_scan(user_id, horizon="6m", budget=5000.0, top_n=5):
             fast_data[ticker] = data
     print(f"[StockScan] fast_info done in {time.time()-t0:.1f}s")
 
-    # Pre-fetch 2: analyst targets for equities only (parallel, 60s total timeout)
     t0 = time.time()
     analyst_targets = {}
     equities = [t for t in tickers if fast_data.get(t,{}).get("quote_type","EQUITY") in ("EQUITY","")]
@@ -162,7 +167,6 @@ def run_smart_stock_scan(user_id, horizon="6m", budget=5000.0, top_n=5):
                 pass
     print(f"[StockScan] Analyst targets: {len(analyst_targets)} in {time.time()-t0:.1f}s")
 
-    # Pre-fetch 3: velocity from DB
     t0 = time.time()
     velocity_cache = {}
     try:
@@ -171,7 +175,6 @@ def run_smart_stock_scan(user_id, horizon="6m", budget=5000.0, top_n=5):
     except Exception as e:
         print(f"[StockScan] Velocity DB failed: {e}")
 
-    # Pre-fetch 4: real-time UW for uncovered (max 20, parallel)
     uncovered = [t for t in tickers if t not in velocity_cache][:20]
     if uncovered:
         t0 = time.time()
@@ -182,7 +185,6 @@ def run_smart_stock_scan(user_id, horizon="6m", budget=5000.0, top_n=5):
                 except Exception: pass
         print(f"[StockScan] Velocity realtime: {len(uncovered)} in {time.time()-t0:.1f}s")
 
-    # Pre-fetch 5: EDGAR insider (parallel, 45s total timeout)
     t0 = time.time()
     insider_cache = {}
     with ThreadPoolExecutor(max_workers=10) as ex:
@@ -192,7 +194,6 @@ def run_smart_stock_scan(user_id, horizon="6m", budget=5000.0, top_n=5):
             except Exception: insider_cache[futures[fut]] = {"score": 50, "signal": "NEUTRAL"}
     print(f"[StockScan] EDGAR: {len(insider_cache)} in {time.time()-t0:.1f}s")
 
-    # Save velocity + signals to signal_history for future scans
     try:
         from sqlalchemy import text
         from app.db.session import get_session
@@ -216,13 +217,10 @@ def run_smart_stock_scan(user_id, horizon="6m", budget=5000.0, top_n=5):
                             price      = EXCLUDED.price,
                             change_pct = EXCLUDED.change_pct
                     """), {
-                        "uid": user_id, "t": ticker,
-                        "fs":  vc.get("velocity", 0),
-                        "dps": 0,
-                        "ib":  ins.get("signal","NEUTRAL") in ("BULLISH","STRONG_BULLISH"),
+                        "uid": user_id, "t": ticker, "fs": vc.get("velocity", 0), "dps": 0,
+                        "ib": ins.get("signal","NEUTRAL") in ("BULLISH","STRONG_BULLISH"),
                         "is_": ins.get("signal","NEUTRAL") == "BEARISH",
-                        "p":   fd.get("price", 0),
-                        "cp":  fd.get("change_pct", 0),
+                        "p": fd.get("price", 0), "cp": fd.get("change_pct", 0),
                     })
                 saved += 1
             except Exception:
@@ -231,16 +229,13 @@ def run_smart_stock_scan(user_id, horizon="6m", budget=5000.0, top_n=5):
     except Exception as e:
         print(f"[StockScan] Signal save failed: {e}")
 
-    # Phase 1: pure math scoring (zero network)
     t0 = time.time()
     candidates = []
     for ticker in tickers:
         r = _score_ticker(
-            ticker   = ticker,
-            fd       = fast_data.get(ticker, {}),
-            target   = analyst_targets.get(ticker, 0),
-            velocity = velocity_cache.get(ticker, {"score":50,"velocity":0,"direction":"NEUTRAL"}),
-            insider  = insider_cache.get(ticker, {"score":50,"signal":"NEUTRAL"}),
+            ticker=ticker, fd=fast_data.get(ticker, {}), target=analyst_targets.get(ticker, 0),
+            velocity=velocity_cache.get(ticker, {"score":50,"velocity":0,"direction":"NEUTRAL"}),
+            insider=insider_cache.get(ticker, {"score":50,"signal":"NEUTRAL"}),
         )
         if not r.get("filtered") and r.get("composite",0) > 0:
             candidates.append(r)
@@ -250,14 +245,11 @@ def run_smart_stock_scan(user_id, horizon="6m", budget=5000.0, top_n=5):
     print(f"[StockScan] Top 5: {[c['ticker'] for c in candidates[:5]]}")
 
     if not candidates:
-        return {"stocks":[], "source":"smart_stock_scan",
-                "elapsed": round(time.time()-t_start,1), "scored":0}
+        return {"stocks":[], "source":"smart_stock_scan", "elapsed": round(time.time()-t_start,1), "scored":0}
 
-    # Phase 2: deep analysis on top 10
     print(f"[StockScan] Phase 2: deep analysis on top {min(10,len(candidates))}...")
     from app.recommendations.horizon_engine import get_stock_for_horizon
 
-    # Phase 2: equities only — ETFs can't get stock-style deep analysis
     equity_candidates = [c for c in candidates if c.get("quote_type","EQUITY") in ("EQUITY","")]
     print(f"[StockScan] Phase 2: {len(equity_candidates)} equity candidates (ETFs excluded)")
     results, seen = [], set()
@@ -269,12 +261,9 @@ def run_smart_stock_scan(user_id, horizon="6m", budget=5000.0, top_n=5):
             rec = get_stock_for_horizon(ticker, horizon, budget, current_price=cand["price"])
             if rec and not rec.get("filtered"):
                 rec.update({
-                    "composite_score":   cand["composite"],
-                    "velocity":          cand["velocity"],
-                    "velocity_dir":      cand["velocity_dir"],
-                    "insider_signal":    cand["insider_signal"],
-                    "csuite_buy":        cand["csuite_buy"],
-                    "status":            "NEW",
+                    "composite_score": cand["composite"], "velocity": cand["velocity"],
+                    "velocity_dir": cand["velocity_dir"], "insider_signal": cand["insider_signal"],
+                    "csuite_buy": cand["csuite_buy"], "status": "NEW",
                     "fundamental_score": round(rec.get("fundamental_score",0)*0.7 + cand["composite"]*0.3),
                 })
                 results.append(rec)
@@ -284,5 +273,4 @@ def run_smart_stock_scan(user_id, horizon="6m", budget=5000.0, top_n=5):
 
     total = round(time.time()-t_start, 1)
     print(f"[StockScan] COMPLETE in {total}s — {len(results)} picks")
-    return {"stocks": results, "source": "smart_stock_scan",
-            "elapsed": total, "scored": len(candidates)}
+    return {"stocks": results, "source": "smart_stock_scan", "elapsed": total, "scored": len(candidates)}

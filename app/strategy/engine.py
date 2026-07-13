@@ -1,37 +1,37 @@
 """
-Strategy Engine v3 (Component C7) — LLM-First Architecture.
+Strategy Engine v4 (Component C7) — LLM-First Architecture, unified math.
 
 Division of responsibility:
     LLM (Qwen 14B):   Decides strategy, strikes, expiry based on all signals
     Python:           Executes all arithmetic with real-time UW prices
 
-Flow:
-    1. Python collects full data package (TA + flow + all option chains)
-    2. LLM receives data + rules → outputs structured trade decision (JSON)
-    3. Python validates LLM's chosen strikes exist in real UW chain
-    4. Python fetches UW bid/ask for exact strikes chosen by LLM
-    5. Python computes BSM greeks, P&L, position sizing, limit price
-    6. LLM adds plain-English explanation + risk narrative
+Rewritten July 2026 after live debugging found five real bugs:
+  1. R/R gate checked a CONSTANT ratio (TARGET_PROFIT_PCT/STOP_LOSS_PCT)
+     for credit trades instead of real economics — let a SPY iron condor
+     risking $1,977 to make $23 (86:1, real R/R=0.012) pass undetected,
+     because target_profit/stop_loss for any credit trade always reduces
+     to roughly TARGET_PROFIT_PCT/STOP_LOSS_PCT regardless of strikes.
+  2. Iron condor spread-width math assumed legs arrive in a fixed
+     position order (legs_out[0]/[1]) — fragile, silently wrong for
+     asymmetric wings, mislabeled in comments.
+  3. No sanity ceiling anywhere — historical DB rows show
+     max_profit_per_contract in the $592K-$1.69M range on a $2-10K
+     budget. Root cause in that (now-rewritten) code is unrecoverable,
+     but this must never be possible again regardless of upstream cause.
+  4. Two incompatible strategy-naming conventions coexisted with no
+     alias resolution (NAKED_CALL vs SELL_NAKED_CALL mean OPPOSITE
+     things; STRADDLE vs LONG_STRADDLE are the same thing under two
+     names) — unified into one canonical list + alias map for old rows.
+  5. Position sizing could silently deploy >budget when even one
+     contract's max loss exceeded the stated budget — now rejects.
+  6. Option-type matching in UW price lookup used "C" in symbol / "P"
+     in symbol — breaks for any ticker whose own letters contain C or P
+     (CRM, COIN, CVX, CVNA, PANW, PYPL, PG, CEG, CORZ, etc). Fixed to
+     check the actual type-character position (rightmost C/P directly
+     before the 8-digit strike field), matching OCC symbol format.
 
-Why LLM for strategy decision:
-    Static rules ("BEARISH + HIGH_IV → CREDIT_CALL_SPREAD") miss nuance.
-    The LLM weighs ALL signals simultaneously:
-    - TA trend vs options flow disagreement → which signal wins?
-    - GEX wall at $210 means limited upside → affects strike choice
-    - Earnings in 12 days → shorter expiry preferred
-    - Market tide bearish but flow neutral → lower confidence → wider spread
-
-Why Python for arithmetic:
-    - LLMs make arithmetic errors with real money on the line
-    - BSM must be mathematically exact
-    - Position sizing must be deterministic ($2,000 ÷ $619 = exactly 3)
-    - Same inputs must always give same P&L output
-
-Trading Rules (given to LLM as context):
-    Rule 1: Close at 80% of max profit or 40% loss of premium
-    Rule 2: No new positions within 7 days of earnings
-    Rule 3: Regime check — 5 questions before any trade
-    Rule 4: Pre-trade checklist before execution
+Why LLM for strategy decision, Python for arithmetic: unchanged from v3 —
+LLMs weigh signals well but make arithmetic errors with real money.
 """
 import json
 import math
@@ -43,21 +43,45 @@ from datetime import datetime, timedelta
 # Constants
 # ─────────────────────────────────────────────────────────────────────────────
 
-TARGET_PROFIT_PCT = 0.80
-STOP_LOSS_PCT     = 0.40
+TARGET_PROFIT_PCT = 0.80   # "close early" guidance target — NOT used for R/R gating
+STOP_LOSS_PCT      = 0.40
 
+# No single option contract's max profit or max loss should ever exceed
+# this on a realistic retail budget. Anything above is corrupted data
+# (bad width, unit error, price glitch) — reject outright rather than
+# let a phantom six/seven-figure number flow into recommendations,
+# mark-to-market, or backtest stats.
+PER_CONTRACT_SANITY_CAP = 50_000
+
+# Canonical strategy names — used everywhere in this codebase.
 STRATEGIES = [
-    "DEBIT_PUT_SPREAD",    # bearish, low/med IV — buy puts, defined risk
-    "DEBIT_CALL_SPREAD",   # bullish, low/med IV — buy calls, defined risk
-    "CREDIT_CALL_SPREAD",  # bearish, high IV — sell calls, collect premium
-    "CREDIT_PUT_SPREAD",   # bullish, high IV — sell puts, collect premium
-    "IRON_CONDOR",         # neutral, high IV — sell both sides
-    "LONG_STRADDLE",       # neutral, low IV — buy both, expect big move
-    "LONG_PUT",            # very bearish, low IV — naked long put
-    "LONG_CALL",           # very bullish, low IV — naked long call
-    "SELL_NAKED_CALL",     # very bearish, very high IV ⚠️ aggressive
-    "SELL_NAKED_PUT",      # very bullish, very high IV ⚠️ aggressive
+    "NAKED_CALL", "NAKED_PUT",               # buy single option, risk = premium paid
+    "SHORT_NAKED_CALL", "SHORT_NAKED_PUT",   # sell single option ⚠️ (call = uncapped risk)
+    "DEBIT_CALL_SPREAD", "DEBIT_PUT_SPREAD",
+    "CREDIT_CALL_SPREAD", "CREDIT_PUT_SPREAD",
+    "IRON_CONDOR",
+    "STRADDLE", "STRANGLE",
 ]
+
+# Legacy names from earlier sessions / historical DB rows — normalized
+# on read so nothing downstream has to special-case old data.
+STRATEGY_ALIASES = {
+    "LONG_STRADDLE":   "STRADDLE",
+    "LONG_PUT":        "NAKED_PUT",
+    "LONG_CALL":       "NAKED_CALL",
+    "SELL_NAKED_CALL": "SHORT_NAKED_CALL",
+    "SELL_NAKED_PUT":  "SHORT_NAKED_PUT",
+}
+
+CREDIT_STRATEGIES = {
+    "CREDIT_CALL_SPREAD", "CREDIT_PUT_SPREAD",
+    "SHORT_NAKED_CALL", "SHORT_NAKED_PUT",
+    "IRON_CONDOR",
+}
+
+
+def normalize_strategy(strategy: str) -> str:
+    return STRATEGY_ALIASES.get(strategy, strategy)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -76,8 +100,7 @@ def _get_live_spot(ticker: str, fallback: float = 0, user_id: str | None = None)
     if user_id:
         try:
             from app.broker.webull_connector import WebullConnector
-            from app.broker.base import BrokerNotConnectedError
-            wb  = WebullConnector(user_id)
+            wb = WebullConnector(user_id)
             for p in wb.get_positions():
                 if (p.get("symbol","").upper() == ticker.upper()
                         and p.get("instrument_type") == "STOCK"):
@@ -105,33 +128,40 @@ def _get_all_expiries(ticker: str) -> list[str]:
 
 
 def _get_uw_chain(ticker: str, expiry: str) -> dict[str, dict]:
-    """
-    Fetch UW option contracts for a specific expiry.
-    Returns {symbol: contract_dict} for fast lookup.
-    """
+    """Fetch UW option contracts for a specific expiry. Returns {symbol: contract}."""
     try:
         from app.options_flow.unusual_whales import get_option_contracts
         contracts = get_option_contracts(ticker, expiry=expiry, limit=500)
-        lookup = {}
-        for c in contracts:
-            sym = c.get("option_symbol", "")
-            if sym:
-                lookup[sym] = c
-        return lookup
+        return {c.get("option_symbol",""): c for c in contracts if c.get("option_symbol")}
     except Exception:
         return {}
 
 
 def _get_yf_strikes(ticker: str, expiry: str) -> tuple[list, list]:
-    """Get available call and put strikes from yfinance (structure only)."""
     try:
         import yfinance as yf
         chain = yf.Ticker(ticker).option_chain(expiry)
-        call_strikes = sorted(chain.calls["strike"].unique().tolist())
-        put_strikes  = sorted(chain.puts["strike"].unique().tolist())
-        return call_strikes, put_strikes
+        return (sorted(chain.calls["strike"].unique().tolist()),
+                sorted(chain.puts["strike"].unique().tolist()))
     except Exception:
         return [], []
+
+
+def _option_type_from_symbol(sym: str) -> str | None:
+    """
+    Determine CALL/PUT from an OCC option symbol by finding the type
+    character in its correct position (immediately before the 8-digit
+    strike field), NOT by naive substring search — 'C' in symbol breaks
+    for tickers like CRM/COIN/CVX/CVNA/PANW/PYPL/PG/CEG/CORZ, since the
+    ticker itself often contains the letters C or P.
+    """
+    idx_c = sym.rfind("C")
+    idx_p = sym.rfind("P")
+    if idx_c > idx_p and sym[idx_c+1:].isdigit() and len(sym[idx_c+1:]) == 8:
+        return "CALL"
+    if idx_p > idx_c and sym[idx_p+1:].isdigit() and len(sym[idx_p+1:]) == 8:
+        return "PUT"
+    return None
 
 
 import warnings as _warnings
@@ -146,16 +176,12 @@ def _uw_price_for_strike(
     avg_iv: float,
     max_diff: float = 2.5,
 ) -> tuple[float, float, float, str]:
-    """
-    Get UW bid/ask for a specific strike.
-    Returns (bid, ask, iv, source) where source is 'UW' or 'BSM_estimate'.
-    """
-    type_char = "C" if option_type == "CALL" else "P"
+    """Get UW bid/ask for a specific strike. Returns (bid, ask, iv, source)."""
     best = None
     best_diff = float("inf")
 
     for sym, c in uw_chain.items():
-        if type_char not in sym:
+        if _option_type_from_symbol(sym) != option_type:
             continue
         try:
             s = float(sym[-8:]) / 1000.0
@@ -176,7 +202,6 @@ def _uw_price_for_strike(
         if ask > 0.05:
             return round(ask * 0.85, 2), round(ask, 2), iv, "UW"
 
-    # BSM fallback — estimate only, labeled clearly
     try:
         from py_vollib.black_scholes import black_scholes
         flag = "c" if option_type == "CALL" else "p"
@@ -209,26 +234,25 @@ def _round_to_strike(price: float) -> float:
     return round(round(price / iv) * iv, 2)
 
 
+def _group_legs(legs_out: list[dict]) -> dict[str, list[dict]]:
+    """Group legs by TYPE+ACTION — robust to whatever order they arrive in."""
+    groups: dict[str, list[dict]] = {"CALL_BUY": [], "CALL_SELL": [], "PUT_BUY": [], "PUT_SELL": []}
+    for leg in legs_out:
+        key = f"{leg['type']}_{leg['action']}"
+        if key in groups:
+            groups[key].append(leg)
+    return groups
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Data Package for LLM
+# Data Package for LLM (single-ticker path — build_recommendation)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _build_llm_data_package(
-    ticker: str,
-    ta_profile: dict,
-    flow_signal: dict,
-    spot: float,
-    expiry_options: list[dict],  # [{expiry, dte, call_strikes, put_strikes, key_prices}]
-    budget: float,
-    max_loss: float,
-    profit_target: float | None,
-    rag_context: str = "",
+    ticker: str, ta_profile: dict, flow_signal: dict, spot: float,
+    expiry_options: list[dict], budget: float, max_loss: float,
+    profit_target: float | None, rag_context: str = "",
 ) -> str:
-    """
-    Build a structured data package for the LLM to reason over.
-    This is the full context the LLM needs to make its decision.
-    """
-    # TA summary
     ta = f"""
 TECHNICAL ANALYSIS — {ticker} @ ${spot}
   Trend:        {ta_profile.get('trend')}
@@ -241,7 +265,6 @@ TECHNICAL ANALYSIS — {ticker} @ ${spot}
   BB %B:        {ta_profile.get('bb_pct_b')}  (>1=overbought, <0=oversold)
   Rel Volume:   {ta_profile.get('relative_volume')}x"""
 
-    # Flow summary
     flow = f"""
 OPTIONS FLOW (Unusual Whales)
   Direction:    {flow_signal.get('direction')}
@@ -256,14 +279,12 @@ OPTIONS FLOW (Unusual Whales)
   Earnings:     {flow_signal.get('earnings_risk', {}).get('days_to_earnings')} days away
     Risk level: {flow_signal.get('earnings_risk', {}).get('risk')}"""
 
-    # Available expiries with key prices
     expiry_str = "\nAVAILABLE OPTION EXPIRIES (with sample UW prices):"
-    for e in expiry_options[:8]:  # show first 8 expiries
+    for e in expiry_options[:8]:
         expiry_str += f"\n  {e['expiry']} ({e['dte']} DTE) — ATM call bid/ask: {e.get('atm_call_bid','?')}/{e.get('atm_call_ask','?')} | ATM put: {e.get('atm_put_bid','?')}/{e.get('atm_put_ask','?')} | IV: {e.get('avg_iv','?')}"
         expiry_str += f"\n    Call strikes: {e.get('call_strikes', [])[:6]}"
         expiry_str += f"\n    Put strikes:  {e.get('put_strikes', [])[:6]}"
 
-    # User constraints
     constraints = f"""
 USER CONSTRAINTS
   Budget:         ${budget} (total to deploy)
@@ -271,95 +292,67 @@ USER CONSTRAINTS
   Profit target:  ${profit_target or 'no minimum'} (minimum desired profit)
   Risk tolerance: {'conservative' if max_loss < budget * 0.3 else 'moderate' if max_loss < budget * 0.5 else 'aggressive'}"""
 
-    # Rules
     rules = """
 TRADING RULES (must be followed)
   Rule 1: Close at 80% of max profit OR 40% loss of premium paid
   Rule 2: No new positions if earnings within 7 days (check earnings_risk)
   Rule 3: Regime check — only trade in confirmed direction
-  
+
 AVAILABLE STRATEGIES
-  DEBIT_PUT_SPREAD:   Buy lower put, sell higher put — bearish, defined risk, low/med IV
+  NAKED_CALL:         Buy single call — very bullish, low IV, risk = premium
+  NAKED_PUT:          Buy single put — very bearish, low IV, risk = premium
   DEBIT_CALL_SPREAD:  Buy lower call, sell higher call — bullish, defined risk, low/med IV
+  DEBIT_PUT_SPREAD:   Buy higher put, sell lower put — bearish, defined risk, low/med IV
   CREDIT_CALL_SPREAD: Sell lower call, buy higher call — bearish, high IV, collect premium
   CREDIT_PUT_SPREAD:  Sell higher put, buy lower put — bullish, high IV, collect premium
   IRON_CONDOR:        Sell call + put spread both sides — neutral, high IV
-  LONG_STRADDLE:      Buy call + put ATM — neutral, low IV, expect big move
-  LONG_PUT:           Buy single put — very bearish, low IV
-  LONG_CALL:          Buy single call — very bullish, low IV
-  SELL_NAKED_CALL:    Sell single call ⚠️ — very bearish, very high IV, requires margin
-  SELL_NAKED_PUT:     Sell single put ⚠️ — very bullish, very high IV, cash secured
+  STRADDLE:           Buy call + put ATM — neutral, expect big move, either direction
+  STRANGLE:           Buy OTM call + OTM put — cheaper than straddle, needs bigger move
+  SHORT_NAKED_CALL:   Sell single call ⚠️ UNCAPPED RISK — very bearish, very high IV
+  SHORT_NAKED_PUT:    Sell single put ⚠️ — very bullish, very high IV, cash secured
 
 PUT SPREAD RULE: sell strike MUST be higher than buy strike (sell closer to ATM, buy further OTM)
 CALL SPREAD RULE: buy strike MUST be higher than sell strike (sell closer to ATM, buy further OTM)
 IRON CONDOR LEG ORDER (Webull convention): BUY PUT (lowest) → SELL PUT → SELL CALL → BUY CALL (highest)"""
 
-    # RAG context: historical price + earnings + macro + news
-    rag_section = ""
-    if rag_context:
-        rag_section = "\n\nMARKET CONTEXT (Historical + News + Macro):\n" + rag_context[:2000]
+    rag_section = f"\n\nMARKET CONTEXT (Historical + News + Macro):\n{rag_context[:2000]}" if rag_context else ""
 
     return ta + flow + expiry_str + constraints + rules + rag_section
 
 
 def _log_llm_decision(ticker: str, decision: dict, outcome: str, status: str) -> None:
-    """
-    Log LLM decisions to a JSONL file for prompt improvement.
-    Rejected decisions help us identify prompt weaknesses.
-    Log location: logs/llm_decisions.jsonl
-    """
-    import json
     from pathlib import Path
-
     log_dir = Path(__file__).resolve().parents[2] / "logs"
     log_dir.mkdir(exist_ok=True)
-    log_file = log_dir / "llm_decisions.jsonl"
-
     entry = {
-        "timestamp": datetime.now().isoformat(),
-        "ticker": ticker,
-        "status": status,          # ACCEPTED or REJECTED
-        "outcome": outcome,        # R/R value or rejection reason
-        "strategy": decision.get("strategy"),
-        "expiry": decision.get("expiry"),
-        "direction": decision.get("direction"),
-        "confidence": decision.get("confidence"),
-        "legs": decision.get("legs", []),
-        "reasoning": decision.get("reasoning", ""),
-        "key_news":  decision.get("key_news", "NONE"),
+        "timestamp": datetime.now().isoformat(), "ticker": ticker, "status": status,
+        "outcome": outcome, "strategy": decision.get("strategy"), "expiry": decision.get("expiry"),
+        "direction": decision.get("direction"), "confidence": decision.get("confidence"),
+        "legs": decision.get("legs", []), "reasoning": decision.get("reasoning", ""),
+        "key_news": decision.get("key_news", "NONE"),
     }
-
     try:
-        with open(log_file, "a") as f:
+        with open(log_dir / "llm_decisions.jsonl", "a") as f:
             f.write(json.dumps(entry) + "\n")
     except Exception:
-        pass  # logging is non-critical
+        pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# LLM Strategy Decision
+# LLM Strategy Decision (single-ticker path)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _llm_decide_strategy(data_package: str, ticker: str) -> dict | None:
-    """
-    Ask Qwen 14B to decide the best strategy and specific strikes.
-    Returns structured JSON decision or None if LLM unavailable.
-
-    Includes:
-    - Prompt size guard (truncates if > 3000 chars to avoid context overflow)
-    - Retry with minimal prompt if full prompt fails
-    - JSON extraction with fallback parsing
-    """
-    system = f"""You are an expert options trader. Select the optimal strategy and OTM strikes.
+    system = """You are an expert options trader. Select the optimal strategy and OTM strikes.
 Respond with valid JSON ONLY — no text before or after the JSON.
 
 JSON format:
-{{
+{
   "strategy": "DEBIT_PUT_SPREAD",
   "expiry": "YYYY-MM-DD from AVAILABLE OPTION EXPIRIES list only",
   "legs": [
-    {{"action": "BUY", "type": "PUT", "strike": 205.0}},
-    {{"action": "SELL", "type": "PUT", "strike": 195.0}}
+    {"action": "BUY", "type": "PUT", "strike": 205.0},
+    {"action": "SELL", "type": "PUT", "strike": 195.0}
   ],
   "direction": "BEARISH",
   "confidence": 65,
@@ -367,22 +360,22 @@ JSON format:
   "key_risk": "1 sentence on main risk",
   "key_news": "1-2 global headlines that influenced this recommendation, or NONE",
   "regime_check": "PASS or FAIL with reason"
-}}
+}
 
-CRITICAL EXPIRY RULE — YOU MUST FOLLOW:
-Use ONLY dates from the AVAILABLE OPTION EXPIRIES list above.
-Do NOT invent dates. Do NOT use example dates. Copy exactly from the list.
+CRITICAL EXPIRY RULE: use ONLY dates from the AVAILABLE OPTION EXPIRIES list. Do NOT invent dates.
+
+STRATEGIES: NAKED_CALL, NAKED_PUT, DEBIT_CALL_SPREAD, DEBIT_PUT_SPREAD, CREDIT_CALL_SPREAD,
+CREDIT_PUT_SPREAD, IRON_CONDOR, STRADDLE, STRANGLE, SHORT_NAKED_CALL, SHORT_NAKED_PUT.
 
 CRITICAL STRIKE RULES — ALWAYS OTM/ATM ONLY:
-- DEBIT_PUT_SPREAD (bearish): BUY strike 0-3% below spot, SELL strike 5-10% below spot
-  Example at spot={ticker}_SPOT: BUY put at spot×0.99, SELL put at spot×0.93
-- DEBIT_CALL_SPREAD (bullish): BUY strike 0-3% above spot, SELL strike 5-10% above spot
-- CREDIT_CALL_SPREAD (bearish): SELL strike 3-8% above spot, BUY strike 8-13% above spot
-- CREDIT_PUT_SPREAD (bullish): SELL strike 3-8% below spot, BUY strike 8-13% below spot
+- DEBIT_PUT_SPREAD (bearish): BUY 0-3% below spot, SELL 5-10% below spot
+- DEBIT_CALL_SPREAD (bullish): BUY 0-3% above spot, SELL 5-10% above spot
+- CREDIT_CALL_SPREAD (bearish): SELL 3-8% above spot, BUY 8-13% above spot
+- CREDIT_PUT_SPREAD (bullish): SELL 3-8% below spot, BUY 8-13% below spot
 - IRON_CONDOR (neutral): short strikes 3-6% each side from spot
 
-NEVER pick deeply ITM strikes (>10% in the money) — they have no profit potential.
-Minimum required R/R = 0.5. Spread width must be ≥ 2× entry debit for debit spreads.
+NEVER pick deeply ITM strikes (>10% ITM). Minimum required R/R = 0.5 for debit trades,
+0.15 for credit trades (checked against REAL max_gain/max_loss, not a target/stop ratio).
 
 Strike ordering:
 - PUT SPREAD: sell_strike < buy_strike (sell is lower/further OTM)
@@ -395,29 +388,14 @@ Strike ordering:
     def _call(prompt_text: str, max_tokens: int = 600) -> dict | None:
         try:
             payload = {
-                "model":  settings.ollama_model,
-                "prompt": prompt_text,
-                "system": system,
+                "model": settings.ollama_model, "prompt": prompt_text, "system": system,
                 "stream": False,
-                "options": {
-                    "num_predict": max_tokens,
-                    "temperature": 0.1,
-                    "top_p": 0.9,
-                    "num_ctx": 4096,  # explicit context window
-                }
+                "options": {"num_predict": max_tokens, "temperature": 0.1, "top_p": 0.9, "num_ctx": 4096},
             }
-            r = req.post(
-                f"{settings.ollama_host}/api/generate",
-                json=payload,
-                timeout=120
-            )
+            r = req.post(f"{settings.ollama_host}/api/generate", json=payload, timeout=120)
             r.raise_for_status()
             raw = r.json().get("response", "").strip()
-
-            # Extract JSON
-            json_match = re.search(r'\{[^{}]*"strategy"[^{}]*\}', raw, re.DOTALL)
-            if not json_match:
-                json_match = re.search(r'\{.*\}', raw, re.DOTALL)
+            json_match = re.search(r'\{[^{}]*"strategy"[^{}]*\}', raw, re.DOTALL) or re.search(r'\{.*\}', raw, re.DOTALL)
             if json_match:
                 try:
                     decision = json.loads(json_match.group())
@@ -425,36 +403,24 @@ Strike ordering:
                         return decision
                 except json.JSONDecodeError:
                     pass
-
             print(f"[LLM] Could not parse JSON from: {raw[:200]}")
             return None
         except Exception as e:
             print(f"[LLM] Call failed: {e}")
             return None
 
-    # Attempt 1: Full data package (truncated to 3500 chars)
-    prompt_full = f"Analyze this {ticker} options trade and select the best strategy:\n\n{data_package[:3500]}"
-    result = _call(prompt_full)
+    result = _call(f"Analyze this {ticker} options trade and select the best strategy:\n\n{data_package[:3500]}")
     if result:
         return result
 
-    # Attempt 2: Minimal prompt with just key signals
     lines = data_package.split('\n')
     key_lines = [l for l in lines if any(k in l for k in
         ['Direction', 'Confidence', 'Signal', 'RSI', 'MACD', 'trend', 'TREND',
          'GEX', 'tide', 'Earnings', 'Budget', 'Max loss', 'expiry', 'DTE',
          'call strikes', 'put strikes', 'ATM call', 'IV:'])]
     mini_package = '\n'.join(key_lines[:40])
-
-    prompt_mini = f"""Select the best options strategy for {ticker}.
-
-Key data:
-{mini_package}
-
-Pick strategy, expiry, and strikes. Respond with JSON only."""
-
-    print(f"[LLM] Retrying with minimal prompt ({len(prompt_mini)} chars)...")
-    result = _call(prompt_mini, max_tokens=400)
+    print(f"[LLM] Retrying with minimal prompt ({len(mini_package)} chars)...")
+    result = _call(f"Select the best options strategy for {ticker}.\n\nKey data:\n{mini_package}\n\nPick strategy, expiry, and strikes. Respond with JSON only.", max_tokens=400)
     if result:
         return result
 
@@ -463,179 +429,192 @@ Pick strategy, expiry, and strikes. Respond with JSON only."""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Python Arithmetic Executor
+# Python Arithmetic Executor — the core fix lives here
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _execute_trade_math(
-    decision: dict,
-    ticker: str,
-    spot: float,
-    budget: float,
-    max_loss: float,
+    decision: dict, ticker: str, spot: float, budget: float, max_loss: float,
 ) -> dict:
     """
     Given LLM's strategy decision, execute all arithmetic with real UW prices.
-
-    Python's job:
-    - Fetch actual UW bid/ask for the chosen strikes
-    - Validate strikes make financial sense
-    - Calculate BSM greeks
-    - Calculate exact P&L (entry cost, max profit, max loss)
-    - Size position to fit budget
-    - Compute limit price for Webull order
+    Position-independent leg grouping, real R/R gating, hard sanity cap.
     """
-    strategy = decision["strategy"]
+    strategy = normalize_strategy(decision["strategy"])
     expiry   = decision["expiry"]
     legs_in  = decision["legs"]
     dte      = (datetime.strptime(expiry, "%Y-%m-%d") - datetime.now()).days
 
-    # Get real UW prices for this expiry
     uw_chain = _get_uw_chain(ticker, expiry)
-
-    # Compute avg IV from this chain
     ivs = [_safe(c.get("implied_volatility")) for c in uw_chain.values()
            if _safe(c.get("implied_volatility")) > 0.05]
     avg_iv = sum(ivs) / len(ivs) if ivs else 0.30
 
-    is_credit = strategy in ("CREDIT_CALL_SPREAD","CREDIT_PUT_SPREAD",
-                              "SELL_NAKED_CALL","SELL_NAKED_PUT","IRON_CONDOR")
+    is_credit = strategy in CREDIT_STRATEGIES
 
-    # Fetch real UW prices for each leg
     legs_out = []
     for leg in legs_in:
-        strike    = float(leg["strike"])
-        opt_type  = leg["type"]
-        action    = leg["action"]
+        strike   = float(leg["strike"])
+        opt_type = leg["type"]
+        action   = leg["action"]
         bid, ask, iv, source = _uw_price_for_strike(uw_chain, strike, opt_type, spot, dte, avg_iv)
         flag = "c" if opt_type == "CALL" else "p"
         greeks = _bsm_greeks(spot, strike, dte, iv, flag)
-
         legs_out.append({
-            "action":       action,
-            "type":         opt_type,
-            "strike":       strike,
-            "expiry":       expiry,
-            "bid":          bid,
-            "ask":          ask,
-            "mid":          round((bid + ask) / 2, 2),
-            "iv":           round(iv, 3),
-            "price_source": source,
-            **greeks,
+            "action": action, "type": opt_type, "strike": strike, "expiry": expiry,
+            "bid": bid, "ask": ask, "mid": round((bid + ask) / 2, 2),
+            "iv": round(iv, 3), "price_source": source, **greeks,
         })
 
-    # Calculate net entry cost/credit
     entry = 0.0
     for leg in legs_out:
-        if leg["action"] == "BUY":
-            entry += leg["ask"]   # pay ask when buying
-        else:
-            entry -= leg["bid"]   # receive bid when selling
-
+        entry += leg["ask"] if leg["action"] == "BUY" else -leg["bid"]
     entry = round(entry, 2)
 
-    # Compute spread width for spread strategies
-    spread_width = 0.0
-    if len(legs_out) >= 2:
-        if strategy in ("DEBIT_PUT_SPREAD","DEBIT_CALL_SPREAD"):
-            spread_width = abs(legs_out[0]["strike"] - legs_out[1]["strike"])
-        elif strategy in ("CREDIT_CALL_SPREAD","CREDIT_PUT_SPREAD"):
-            spread_width = abs(legs_out[0]["strike"] - legs_out[1]["strike"])
-        elif strategy == "IRON_CONDOR" and len(legs_out) == 4:
-            spread_width = abs(legs_out[1]["strike"] - legs_out[0]["strike"])  # put spread width
+    groups = _group_legs(legs_out)
 
-    # Max profit/loss per contract
-    if is_credit:
-        credit      = abs(entry)
-        max_p_c     = round(credit * 100, 2)
+    # ── Width computation — by leg TYPE, never by position ────────────────
+    call_width = put_width = spread_width = 0.0
+    if strategy == "IRON_CONDOR":
+        if groups["CALL_BUY"] and groups["CALL_SELL"]:
+            call_width = abs(groups["CALL_BUY"][0]["strike"] - groups["CALL_SELL"][0]["strike"])
+        if groups["PUT_BUY"] and groups["PUT_SELL"]:
+            put_width = abs(groups["PUT_BUY"][0]["strike"] - groups["PUT_SELL"][0]["strike"])
+        if not (call_width and put_width) and len(legs_out) == 4:
+            # Defensive fallback only if type-grouping somehow failed
+            call_width = put_width = abs(legs_out[1]["strike"] - legs_out[0]["strike"])
+        spread_width = max(call_width, put_width)   # worst-case wing drives max loss
+    elif len(legs_out) == 2 and strategy not in ("STRADDLE", "STRANGLE"):
+        spread_width = abs(legs_out[0]["strike"] - legs_out[1]["strike"])
+
+    # ── Max profit / max loss per contract ─────────────────────────────────
+    max_profit_is_estimate = False
+
+    if strategy in ("STRADDLE", "STRANGLE"):
+        # Always a debit (buy both legs). Max loss = premium paid (defined).
+        # Max profit is technically unbounded on the call side — estimate
+        # using a 1-standard-deviation expected move from IV, clearly
+        # flagged as an ESTIMATE, never treated as a hard ceiling.
+        max_l_c = round(entry * 100, 2)
+        expected_move = spot * avg_iv * math.sqrt(max(dte, 1) / 365.0)
+        call_leg = next((l for l in legs_out if l["type"] == "CALL"), None)
+        put_leg  = next((l for l in legs_out if l["type"] == "PUT"),  None)
+        up_price, down_price = spot + expected_move, max(spot - expected_move, 0)
+        up_payoff   = max(up_price - call_leg["strike"], 0) if call_leg else 0
+        down_payoff = max(put_leg["strike"] - down_price, 0) if put_leg else 0
+        max_p_c = max(round((max(up_payoff, down_payoff) - entry) * 100, 2), 1.0)
+        max_profit_is_estimate = True
+        size_by = max(max_l_c, 1)
+
+    elif is_credit:
+        credit  = abs(entry)
+        max_p_c = round(credit * 100, 2)
         if spread_width > 0:
             max_l_c = round((spread_width - credit) * 100, 2)
         else:
-            max_l_c = round(spot * 100, 2)  # naked = full stock price as risk
-        size_by     = max(max_l_c, 1)
+            max_l_c = round(spot * 100, 2)   # naked — capped display near spot
+        size_by = max(max_l_c, 1)
+
     else:
-        max_p_c = round((spread_width - entry) * 100, 2) if spread_width > 0 else round(spot * 0.20 * 100, 2)
+        # Debit spreads and single-leg NAKED_CALL/NAKED_PUT
+        if spread_width > 0:
+            max_p_c = round((spread_width - entry) * 100, 2)
+        else:
+            max_p_c = round(spot * 0.20 * 100, 2)   # naked long — rough estimate
+            max_profit_is_estimate = True
         max_l_c = round(entry * 100, 2)
         size_by = max(max_l_c, 1)
 
-    # Position sizing
+    # ── Sanity cap — reject corrupted math outright ────────────────────────
+    if abs(max_p_c) > PER_CONTRACT_SANITY_CAP or abs(max_l_c) > PER_CONTRACT_SANITY_CAP:
+        raise ValueError(
+            f"Sanity cap triggered: max_profit_per_contract={max_p_c} "
+            f"max_loss_per_contract={max_l_c} exceeds ${PER_CONTRACT_SANITY_CAP:,} — "
+            f"rejecting as corrupted trade math. entry={entry} width={spread_width}"
+        )
+
+    # ── Position sizing — never silently exceed budget ─────────────────────
+    if size_by > budget * 1.1:
+        raise ValueError(
+            f"Position too large for budget: 1 contract risks ${size_by:,.0f} "
+            f"against a ${budget:,.0f} budget."
+        )
     n = max(1, int(budget / size_by))
     while (size_by * n) > budget and n > 1:
         n -= 1
 
-    # P&L calculations
+    # ── P&L rollup ──────────────────────────────────────────────────────────
     if is_credit:
-        credit_received = round(abs(entry) * 100 * n, 2)
-        margin_required = round(max_l_c * n, 2)
-        target_profit   = round(credit_received * TARGET_PROFIT_PCT, 2)
-        stop_loss       = round(credit_received * STOP_LOSS_PCT, 2)
-        total_cost      = credit_received
-        pnl_label       = "credit_received"
+        credit_received  = round(abs(entry) * 100 * n, 2)
+        margin_required   = round(max_l_c * n, 2)
+        target_profit     = round(credit_received * TARGET_PROFIT_PCT, 2)
+        stop_loss         = round(credit_received * STOP_LOSS_PCT, 2)
+        total_cost        = credit_received
+        pnl_label         = "credit_received"
+        real_risk_reward  = round(credit_received / margin_required, 4) if margin_required > 0 else None
     else:
-        premium_paid    = round(abs(entry) * 100 * n, 2)
-        margin_required = premium_paid
-        target_profit   = round(max_p_c * TARGET_PROFIT_PCT * n, 2)
-        stop_loss       = round(premium_paid * STOP_LOSS_PCT, 2)
-        total_cost      = premium_paid
-        pnl_label       = "premium_paid"
-        credit_received = 0
+        premium_paid      = round(abs(entry) * 100 * n, 2)
+        margin_required   = premium_paid
+        target_profit     = round(max_p_c * TARGET_PROFIT_PCT * n, 2)
+        stop_loss         = round(premium_paid * STOP_LOSS_PCT, 2)
+        total_cost        = premium_paid
+        pnl_label         = "premium_paid"
+        credit_received   = 0
+        real_risk_reward  = round((max_p_c * n) / premium_paid, 4) if premium_paid > 0 else None
 
-    # R/R for the gate must reflect REAL trade economics, not the fixed
-    # TARGET_PROFIT_PCT/STOP_LOSS_PCT ratio (which is a constant ~1.0 for
-    # every credit trade regardless of strikes — that bug let a SPY iron
-    # condor risking $1,977 to make $23 slip through undetected).
-    if is_credit:
-        real_risk_reward = round(credit_received / margin_required, 4) if margin_required > 0 else None
-    else:
-        real_risk_reward = round((max_p_c * n) / premium_paid, 4) if premium_paid > 0 else None
-    risk_reward = round(target_profit / stop_loss, 2) if stop_loss > 0 else None  # kept for display/back-compat only
-
-    # ── R/R Validation ────────────────────────────────────────────────────────
-    # Reject trades with terrible REAL economics (max_gain vs max_loss),
-    # not the constant target/stop ratio. LLM may have chosen strikes too
-    # far OTM (tiny credit vs huge width) or ITM (huge debit, little room).
+    # ── R/R validation — REAL economics gate the trade, period ─────────────
     _rr_min = 0.5
-    if dte and dte >= 60:  _rr_min = 0.20   # 3M+
-    elif dte and dte >= 30: _rr_min = 0.30  # 1M
-    elif dte and dte >= 14: _rr_min = 0.40  # 2W
+    if dte and dte >= 60:   _rr_min = 0.20
+    elif dte and dte >= 30: _rr_min = 0.30
+    elif dte and dte >= 14: _rr_min = 0.40
 
-    # Credit strategies (iron condor etc) naturally have lower R/R by design
-    # (you're selling premium, not buying upside) — floor is lower but not zero
-    _rr_min_check = _rr_min * 0.25 if is_credit else _rr_min
+    # Credit trades (selling premium) have structurally different economics
+    # — a well-built iron condor typically shows real R/R around 0.15-0.50,
+    # nothing like a debit spread. Flat floor, not scaled off debit buckets.
+    _rr_min_check = 0.15 if is_credit else _rr_min
 
     if real_risk_reward is not None and real_risk_reward < _rr_min_check:
         strikes = [l["strike"] for l in legs_out]
+        gain = target_profit if not is_credit else round(max_p_c * n, 2)
+        loss = stop_loss if not is_credit else round(max_l_c * n, 2)
         raise ValueError(
-            f"Real R/R {real_risk_reward} (gain={target_profit if not is_credit else round(max_p_c*n,2)} "
-            f"vs loss={stop_loss if not is_credit else round(max_l_c*n,2)}) below {_rr_min_check} — "
-            f"LLM chose bad strikes {strikes}. Triggering fallback."
+            f"Real R/R {real_risk_reward} (gain=${gain:,.0f} vs loss=${loss:,.0f}) "
+            f"below {_rr_min_check} — chosen strikes {strikes} rejected. Triggering fallback."
         )
 
-    # Webull limit price (net mid of all legs)
     sell_mid = sum(l["mid"] for l in legs_out if l["action"] == "SELL")
     buy_mid  = sum(l["mid"] for l in legs_out if l["action"] == "BUY")
     webull_limit_price = round(sell_mid - buy_mid, 2) if is_credit else round(buy_mid - sell_mid, 2)
 
+    engine_warnings = []
+    if max_profit_is_estimate:
+        engine_warnings.append("Max profit is an ESTIMATE (1σ expected move), not a hard ceiling.")
+    if strategy == "SHORT_NAKED_CALL":
+        engine_warnings.append("⚠️ UNCAPPED RISK — naked short call has theoretically unlimited max loss.")
+
     return {
-        "strategy":            strategy,
-        "expiry":              expiry,
-        "dte":                 dte,
-        "is_credit_strategy":  is_credit,
-        "pnl_label":           pnl_label,
-        "legs":                legs_out,
-        "spread_width":        spread_width,
-        "entry_debit":         entry,
-        "avg_iv":              round(avg_iv, 3),
-        "contracts":           n,
-        "total_cost":          total_cost,
-        "credit_received":     credit_received if is_credit else 0,
-        "premium_paid":        total_cost if not is_credit else 0,
-        "margin_required":     margin_required,
+        "strategy":              strategy,
+        "expiry":                expiry,
+        "dte":                   dte,
+        "is_credit_strategy":    is_credit,
+        "pnl_label":             pnl_label,
+        "legs":                  legs_out,
+        "spread_width":          spread_width,
+        "call_width":            call_width,
+        "put_width":             put_width,
+        "entry_debit":           entry,
+        "avg_iv":                round(avg_iv, 3),
+        "contracts":             n,
+        "total_cost":            total_cost,
+        "credit_received":       credit_received if is_credit else 0,
+        "premium_paid":          total_cost if not is_credit else 0,
+        "margin_required":       margin_required,
         "max_loss_per_contract": max_l_c,
         "max_profit_per_contract": max_p_c,
-        "target_profit":       target_profit,
-        "stop_loss":           stop_loss,
-        "risk_reward":         risk_reward,
-        "webull_limit_price":  webull_limit_price,
+        "max_profit_is_estimate": max_profit_is_estimate,
+        "target_profit":         target_profit,
+        "stop_loss":             stop_loss,
+        "risk_reward":           real_risk_reward,   # the ONLY r/r value now — no shadow constant
+        "webull_limit_price":    webull_limit_price,
         "webull_instructions": (
             f"Enter as Iron Condor/Spread order at LIMIT ${webull_limit_price:.2f} credit. "
             f"If not filled in 5 min, lower by $0.10. Keep lowering until filled."
@@ -643,6 +622,7 @@ def _execute_trade_math(
             f"Enter as spread order at LIMIT ${webull_limit_price:.2f} debit. "
             f"If not filled in 5 min, raise by $0.05."
         ),
+        "engine_warnings": engine_warnings,
         "llm_decision": {
             "reasoning":    decision.get("reasoning",""),
             "key_news":     decision.get("key_news","NONE"),
@@ -659,66 +639,44 @@ def _execute_trade_math(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _deterministic_strategy(
-    direction: str,
-    confidence: int,
-    avg_iv: float,
-    spot: float,
-    dte: int,
-    call_strikes: list,
-    put_strikes: list,
-    atr: float,
+    direction: str, confidence: int, avg_iv: float, spot: float, dte: int,
+    call_strikes: list, put_strikes: list, atr: float,
 ) -> dict:
-    """
-    Fallback when LLM is unavailable.
-    Uses deterministic rules to pick strategy and strikes.
-    """
     IV_HIGH = 0.40
-    spread_width = 10.0  # default $10 wide
+    spread_width = 10.0
 
     if direction == "BEARISH":
         if avg_iv >= IV_HIGH:
             strategy = "CREDIT_CALL_SPREAD"
-            ss = _round_to_strike(spot * 1.05)
-            bs = _round_to_strike(ss + spread_width)
-            legs = [{"action":"SELL","type":"CALL","strike":ss},
-                    {"action":"BUY", "type":"CALL","strike":bs}]
+            ss = _round_to_strike(spot * 1.05); bs = _round_to_strike(ss + spread_width)
+            legs = [{"action":"SELL","type":"CALL","strike":ss}, {"action":"BUY","type":"CALL","strike":bs}]
         else:
             strategy = "DEBIT_PUT_SPREAD"
-            bs = _round_to_strike(spot * 0.99)
-            ss = _round_to_strike(bs - spread_width)
-            legs = [{"action":"BUY", "type":"PUT","strike":bs},
-                    {"action":"SELL","type":"PUT","strike":ss}]
+            bs = _round_to_strike(spot * 0.99); ss = _round_to_strike(bs - spread_width)
+            legs = [{"action":"BUY","type":"PUT","strike":bs}, {"action":"SELL","type":"PUT","strike":ss}]
     elif direction == "BULLISH":
         if avg_iv >= IV_HIGH:
             strategy = "CREDIT_PUT_SPREAD"
-            ss = _round_to_strike(spot * 0.95)
-            bs = _round_to_strike(ss - spread_width)
-            legs = [{"action":"SELL","type":"PUT","strike":ss},
-                    {"action":"BUY", "type":"PUT","strike":bs}]
+            ss = _round_to_strike(spot * 0.95); bs = _round_to_strike(ss - spread_width)
+            legs = [{"action":"SELL","type":"PUT","strike":ss}, {"action":"BUY","type":"PUT","strike":bs}]
         else:
             strategy = "DEBIT_CALL_SPREAD"
-            bs = _round_to_strike(spot * 1.01)
-            ss = _round_to_strike(bs + spread_width)
-            legs = [{"action":"BUY", "type":"CALL","strike":bs},
-                    {"action":"SELL","type":"CALL","strike":ss}]
+            bs = _round_to_strike(spot * 1.01); ss = _round_to_strike(bs + spread_width)
+            legs = [{"action":"BUY","type":"CALL","strike":bs}, {"action":"SELL","type":"CALL","strike":ss}]
     else:
         if avg_iv >= IV_HIGH:
             strategy = "IRON_CONDOR"
             cs = _round_to_strike(spot * 1.05); cb = _round_to_strike(cs + spread_width)
             ps = _round_to_strike(spot * 0.95); pb = _round_to_strike(ps - spread_width)
             legs = [
-                {"action":"BUY", "type":"PUT", "strike":pb},
-                {"action":"SELL","type":"PUT", "strike":ps},
-                {"action":"SELL","type":"CALL","strike":cs},
-                {"action":"BUY", "type":"CALL","strike":cb},
+                {"action":"BUY","type":"PUT","strike":pb}, {"action":"SELL","type":"PUT","strike":ps},
+                {"action":"SELL","type":"CALL","strike":cs}, {"action":"BUY","type":"CALL","strike":cb},
             ]
         else:
-            strategy = "LONG_STRADDLE"
+            strategy = "STRADDLE"
             atm = _round_to_strike(spot)
-            legs = [{"action":"BUY","type":"CALL","strike":atm},
-                    {"action":"BUY","type":"PUT", "strike":atm}]
+            legs = [{"action":"BUY","type":"CALL","strike":atm}, {"action":"BUY","type":"PUT","strike":atm}]
 
-    # Find nearest Friday 3 weeks out for expiry
     today = datetime.now()
     days_until_friday = (4 - today.weekday()) % 7 or 7
     expiry = (today + timedelta(days=days_until_friday + 14)).strftime("%Y-%m-%d")
@@ -729,7 +687,7 @@ def _deterministic_strategy(
         "reasoning": f"Fallback deterministic rules: {direction} + {'HIGH' if avg_iv >= IV_HIGH else 'LOW'} IV",
         "key_news": "NONE — LLM unavailable",
         "key_risk": "LLM unavailable — rule-based fallback",
-        "regime_check": "PASS (not verified)"
+        "regime_check": "PASS (not verified)",
     }
 
 
@@ -738,52 +696,21 @@ def _deterministic_strategy(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_recommendation(
-    ticker: str,
-    ta_profile: dict,
-    flow_signal: dict,
-    option_contracts: list[dict] | None = None,
-    budget: float = 2000.0,
-    max_loss: float | None = None,
-    profit_target: float | None = None,
-    min_dte: int = 4,
-    max_dte: int = 365,
-    top_n: int = 3,
-    user_id: str | None = None,
+    ticker: str, ta_profile: dict, flow_signal: dict,
+    option_contracts: list[dict] | None = None, budget: float = 2000.0,
+    max_loss: float | None = None, profit_target: float | None = None,
+    min_dte: int = 4, max_dte: int = 365, top_n: int = 3, user_id: str | None = None,
 ) -> dict:
-    """
-    Build complete trade recommendation.
-
-    Architecture:
-        1. Python collects all real-time data (spot, TA, flow, option chains)
-        2. LLM decides strategy + strikes (reasoning over ALL signals holistically)
-        3. Python executes arithmetic with real UW prices (exact math)
-        4. LLM adds plain-English narrative
-
-    Args:
-        ticker:         stock ticker
-        ta_profile:     from get_technical_profile()
-        flow_signal:    from score_signal_package()
-        budget:         max capital to deploy ($)
-        max_loss:       max acceptable loss ($) — default budget × 40%
-        profit_target:  minimum profit desired ($) — optional filter
-        min_dte:        minimum DTE (default 4)
-        max_dte:        maximum DTE (default 365, set 911+ for LEAPS)
-    """
     ticker   = ticker.upper()
     max_loss = max_loss or budget * STOP_LOSS_PCT
 
-    # ── Safety blocks ─────────────────────────────────────────────────────────
     if flow_signal.get("trade_blocked"):
-        return {
-            "signal": "BLOCKED", "ticker": ticker,
-            "reason": flow_signal.get("earnings_risk", {}).get("reason","Earnings < 7 days"),
-            "warnings": ["Rule 2: No new positions within 7 days of earnings"],
-        }
+        return {"signal": "BLOCKED", "ticker": ticker,
+                "reason": flow_signal.get("earnings_risk", {}).get("reason","Earnings < 7 days"),
+                "warnings": ["Rule 2: No new positions within 7 days of earnings"]}
     if ta_profile.get("error"):
-        return {"signal":"INSUFFICIENT_DATA","ticker":ticker,
-                "reason":ta_profile["error"],"warnings":[]}
+        return {"signal":"INSUFFICIENT_DATA","ticker":ticker,"reason":ta_profile["error"],"warnings":[]}
 
-    # ── Step 1: Collect all data ──────────────────────────────────────────────
     polygon_close = ta_profile.get("current_price", 0)
     spot          = _get_live_spot(ticker, polygon_close, user_id)
     atr           = ta_profile.get("atr_14") or spot * 0.03
@@ -793,7 +720,6 @@ def build_recommendation(
     flow_conf     = flow_signal.get("confidence", 50)
     days_to_earn  = flow_signal.get("earnings_risk",{}).get("days_to_earnings")
 
-    # Combined direction + confidence (used for fallback + context)
     if ta_signal == "SELL" and flow_dir == "BEARISH":
         direction, confidence = "BEARISH", min(95, flow_conf + 15)
     elif ta_signal == "BUY" and flow_dir == "BULLISH":
@@ -807,7 +733,6 @@ def build_recommendation(
     else:
         direction, confidence = "NEUTRAL", 45
 
-    # Get all available expiries
     all_expiries = _get_all_expiries(ticker)
     today        = datetime.now()
     expiry_dtes  = []
@@ -823,153 +748,101 @@ def build_recommendation(
         return {"signal":"NO_EXPIRIES","ticker":ticker,
                 "reason":f"No expiries found between {min_dte}-{max_dte} DTE","warnings":[]}
 
-    # Build expiry options with sample UW prices (for LLM context)
     expiry_options = []
-    uw_avg_iv = 0.30  # baseline
-
-    for exp, dte in expiry_dtes[:8]:  # first 8 expiries
-        uw_chain     = _get_uw_chain(ticker, exp)
+    uw_avg_iv = 0.30
+    for exp, dte in expiry_dtes[:8]:
+        uw_chain = _get_uw_chain(ticker, exp)
         call_strikes, put_strikes = _get_yf_strikes(ticker, exp)
-
-        # Get ATM prices from UW
         atm_call = _uw_price_for_strike(uw_chain, spot, "CALL", spot, dte, 0.30)
         atm_put  = _uw_price_for_strike(uw_chain, spot, "PUT",  spot, dte, 0.30)
-
-        # Avg IV from this chain
         ivs = [_safe(c.get("implied_volatility")) for c in uw_chain.values()
                if _safe(c.get("implied_volatility")) > 0.05]
         chain_iv = round(sum(ivs)/len(ivs), 3) if ivs else 0.30
-
         if 20 <= dte <= 40:
-            uw_avg_iv = chain_iv  # use mid-term IV as baseline
-
+            uw_avg_iv = chain_iv
         expiry_options.append({
-            "expiry":       exp,
-            "dte":          dte,
-            "call_strikes": call_strikes,
-            "put_strikes":  put_strikes,
-            "atm_call_bid": atm_call[0],
-            "atm_call_ask": atm_call[1],
-            "atm_put_bid":  atm_put[0],
-            "atm_put_ask":  atm_put[1],
-            "avg_iv":       f"{chain_iv:.1%}",
+            "expiry": exp, "dte": dte, "call_strikes": call_strikes, "put_strikes": put_strikes,
+            "atm_call_bid": atm_call[0], "atm_call_ask": atm_call[1],
+            "atm_put_bid": atm_put[0], "atm_put_ask": atm_put[1], "avg_iv": f"{chain_iv:.1%}",
         })
 
-    # Build lookup set of valid expiries (for post-LLM validation)
     valid_expiry_set = {exp for exp, _ in expiry_dtes}
 
-    # ── Step 2: LLM decides strategy + strikes ────────────────────────────────
-    # Fetch RAG context (historical price, earnings, macro, news)
     rag_context = ""
     try:
         from app.rag.context_builder import get_context_for_prompt
         rag_context = get_context_for_prompt(ticker)
-        print(f"[Strategy] RAG context loaded for {ticker}")
     except Exception as e:
         print(f"[Strategy] RAG unavailable: {e}")
 
     data_package = _build_llm_data_package(
-        ticker=ticker,
-        ta_profile=ta_profile,
-        flow_signal=flow_signal,
-        spot=spot,
-        expiry_options=expiry_options,
-        budget=budget,
-        max_loss=max_loss,
-        profit_target=profit_target,
-        rag_context=rag_context,
+        ticker=ticker, ta_profile=ta_profile, flow_signal=flow_signal, spot=spot,
+        expiry_options=expiry_options, budget=budget, max_loss=max_loss,
+        profit_target=profit_target, rag_context=rag_context,
     )
 
     llm_decision = _llm_decide_strategy(data_package, ticker)
 
     if not llm_decision:
-        # Fallback to deterministic rules
         print(f"[Strategy] LLM unavailable — using deterministic fallback")
-        exp, dte = expiry_dtes[min(2, len(expiry_dtes)-1)]  # 3rd expiry as default
+        exp, dte = expiry_dtes[min(2, len(expiry_dtes)-1)]
         call_strikes, put_strikes = _get_yf_strikes(ticker, exp)
-        llm_decision = _deterministic_strategy(
-            direction, confidence, uw_avg_iv, spot, dte,
-            call_strikes, put_strikes, atr
-        )
+        llm_decision = _deterministic_strategy(direction, confidence, uw_avg_iv, spot, dte, call_strikes, put_strikes, atr)
         llm_decision["expiry"] = exp
 
-    # ── Validate LLM expiry is within allowed DTE range ─────────────────────
     if llm_decision and llm_decision.get("expiry"):
         chosen_exp = llm_decision["expiry"]
         if chosen_exp not in valid_expiry_set:
-            # LLM hallucinated an expiry outside our range — correct it
             corrected_exp, corrected_dte = expiry_dtes[min(1, len(expiry_dtes)-1)]
             print(f"[Strategy] LLM chose {chosen_exp} outside range — correcting to {corrected_exp} ({corrected_dte} DTE)")
             llm_decision["expiry"] = corrected_exp
             llm_decision["dte"]    = corrected_dte
 
-    # ── Step 3: Python executes exact arithmetic with real UW prices ──────────
     try:
         trade = _execute_trade_math(llm_decision, ticker, spot, budget, max_loss)
     except ValueError as e:
-        # Log bad LLM decision for prompt improvement
         _log_llm_decision(ticker, llm_decision, str(e), "REJECTED")
-
         print(f"[Strategy] LLM trade rejected: {e}")
         print(f"[Strategy] Falling back to deterministic rules...")
         exp, dte = expiry_dtes[min(2, len(expiry_dtes)-1)]
         call_strikes, put_strikes = _get_yf_strikes(ticker, exp)
-        llm_decision = _deterministic_strategy(
-            direction, confidence, uw_avg_iv, spot, dte,
-            call_strikes, put_strikes, atr
-        )
+        llm_decision = _deterministic_strategy(direction, confidence, uw_avg_iv, spot, dte, call_strikes, put_strikes, atr)
         llm_decision["expiry"] = exp
         llm_decision["reasoning"] = f"LLM trade rejected (bad R/R) — using deterministic rules. {llm_decision['reasoning']}"
         trade = _execute_trade_math(llm_decision, ticker, spot, budget, max_loss)
         _log_llm_decision(ticker, llm_decision, f"R/R={trade.get('risk_reward')}", "ACCEPTED")
 
-    # Add greeks to legs
     for leg in trade["legs"]:
         flag = "c" if leg["type"] == "CALL" else "p"
         g    = _bsm_greeks(spot, leg["strike"], trade["dte"], leg.get("iv", uw_avg_iv), flag)
         leg.update(g)
 
-    # ── Step 4: LLM narrative ─────────────────────────────────────────────────
     llm_explanation = ""
     try:
         from app.llm.service import explain_recommendation, is_ollama_available
         if is_ollama_available():
             llm_explanation = explain_recommendation(ticker, {
-                **trade, "direction": direction, "confidence": confidence,
-                "spot_used": round(spot, 2),
+                **trade, "direction": direction, "confidence": confidence, "spot_used": round(spot, 2),
             }, ta_profile, flow_signal)
     except Exception:
         pass
 
-    # Validation warnings
-    warnings = []
+    warnings = list(trade.get("engine_warnings", []))
     if any(l.get("price_source") == "BSM_estimate" for l in trade["legs"]):
         warnings.append("⚠️ Some prices are BSM estimates — UW didn't have that contract. Verify in Webull before trading.")
     if confidence < 55:
         warnings.append(f"Low confidence ({confidence}/100) — LLM flagged this, consider waiting.")
     if days_to_earn and trade["dte"] >= days_to_earn:
         warnings.append(f"⚠️ Expiry {trade['expiry']} crosses earnings ({days_to_earn}d away) — IV crush risk after report.")
-    if trade.get("is_credit_strategy") and "NAKED" in trade.get("strategy",""):
-        warnings.append("⚠️ Naked strategy requires margin account approval.")
 
     sig = "SELL" if direction == "BEARISH" else ("BUY" if direction == "BULLISH" else "NEUTRAL")
 
     return {
-        "ticker":           ticker,
-        "signal":           sig,
-        "direction":        direction,
-        "confidence":       confidence,
-        "spot":             round(spot, 2),
-        "ta_summary":       ta_profile.get("summary"),
-        "flow_summary":     flow_signal.get("summary"),
-        "best":             trade,
-        "alternatives":     [],   # future: run LLM with different constraints
-        "llm_explanation":  llm_explanation,
-        "llm_decided":      llm_decision is not None,
-        "warnings":         warnings,
-        "user_constraints": {
-            "budget": budget, "max_loss": max_loss,
-            "profit_target": profit_target,
-            "min_dte": min_dte, "max_dte": max_dte,
-        },
+        "ticker": ticker, "signal": sig, "direction": direction, "confidence": confidence,
+        "spot": round(spot, 2), "ta_summary": ta_profile.get("summary"),
+        "flow_summary": flow_signal.get("summary"), "best": trade, "alternatives": [],
+        "llm_explanation": llm_explanation, "llm_decided": llm_decision is not None,
+        "warnings": warnings,
+        "user_constraints": {"budget": budget, "max_loss": max_loss, "profit_target": profit_target,
+                              "min_dte": min_dte, "max_dte": max_dte},
     }

@@ -2,52 +2,53 @@
 Smart Multi-Horizon Recommendation Engine.
 
 Architecture (target: 20-25s total):
-  Phase 1 (5s parallel): Enrich top 15 scanner picks simultaneously
-    - IV rank + IV term structure per ticker (UW, 0.12s each)
-    - Earnings proximity + expected move (already fetched)
-    - News headlines (UW, 3 per ticker)
-    - TA from UW bars (0.15s each)
-    All run in parallel → max(individual times) not sum
+  Phase 1 (parallel): Enrich top candidates simultaneously
+    - IV rank + IV term structure, expiries, earnings, news, TA
+    - GEX, insider activity (EDGAR), OI buildup (leading indicator),
+      velocity (signal_history)
+  Phase 2: ONE LLM call with all context
+  Phase 3: Deterministic math (real UW prices, real R/R gate)
 
-  Phase 2 (18s): ONE LLM call with all context
-    - Compressed 50-token context per ticker (~750 tokens for 15 tickers)
-    - Full market context (VIX, sector flow, global news, economic calendar)
-    - ALL available expiries with IV per expiry for each candidate
-    - LLM decides: best ticker per timeframe, best expiry, best strategy, best strikes
-    - Output: JSON with 4-6 recommendations
+Rewritten July 2026 — fixed two bugs found live during debugging:
+  1. get_gex() doesn't exist on unusual_whales module (only
+     get_gex_by_strike/get_gex_by_expiry) — every enrichment call was
+     silently raising ImportError, caught by a broad except, so
+     gex_score/gex_negative have been 0/False for every candidate this
+     entire session regardless of real GEX conditions.
+  2. get_velocity_scores([ticker], pick.get("user_id","") or "") — 
+     scanner picks never carry a "user_id" key, so this always resolved
+     to an empty string, which matches zero rows in signal_history.
+     Velocity shown to the LLM (Vel:+0%) has been wrong for every
+     candidate in the live-scan enrichment path all session, even
+     though the scanner's own Signal 5 (quick_scan.py) correctly used
+     the real user_id. _enrich_ticker now takes user_id explicitly.
 
-  Phase 3 (1s): Deterministic math
-    - Validate LLM strikes against real UW contracts
-    - Calculate cost, max profit, max loss, R/R
-    - Apply position sizing
-    - Store in daily_recommendations
-
-Key insight: LLM sees the full picture and picks expiry freely.
-No artificial DTE buckets. If Monday has a catalyst, LLM picks this-week expiry.
-If market is quiet, LLM picks monthly. Goal = make money, not follow rules.
+Flow/dark-pool scoring now imports from app.signals.flow_scoring —
+the shared, audited implementation — instead of a local copy.
 """
 import json
 import time
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from app.signals.flow_scoring import compute_flow_score, compute_dp_score
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Filters for option-tradeable tickers
 # ─────────────────────────────────────────────────────────────────────────────
 
-MIN_PRICE      = 15.0    # below this = no liquid options
-MAX_PRICE      = 800.0   # above this = too expensive for $2K budget
-MIN_CONFIDENCE = 50      # scanner confidence threshold
+MIN_PRICE      = 15.0
+MAX_PRICE      = 800.0
+MIN_CONFIDENCE = 50
 
-EXCLUDED = {"NMAX","VXX","UVXY","SQQQ","TQQQ","SPXU","DIA","IWM"}  # no individual options play
+EXCLUDED = {"NMAX","VXX","UVXY","SQQQ","TQQQ","SPXU","DIA","IWM"}
 
 
 def _is_optionable(pick: dict) -> bool:
     price = float(pick.get("price", 0) or 0)
     return (
-        price >= MIN_PRICE
-        and price <= MAX_PRICE
+        price >= MIN_PRICE and price <= MAX_PRICE
         and pick.get("ticker") not in EXCLUDED
         and pick.get("confidence", 0) >= MIN_CONFIDENCE
     )
@@ -62,20 +63,17 @@ def _enrich_ticker(
     earnings_map: dict,
     batch_flow: dict,
     batch_dp: dict,
+    user_id: str = "",
 ) -> dict:
-    """
-    Enrich one scanner pick with IV, expiries, news, TA.
-    Returns compressed context dict ready for LLM prompt.
-    """
+    """Enrich one scanner pick with IV, expiries, news, TA, GEX, insider, OI, velocity."""
     from app.options_flow.unusual_whales import (
         get_iv_rank, get_expiry_breakdown, get_ohlc, get_news_headlines,
     )
     from app.technical_analysis.engine import get_technical_profile
 
     ticker  = pick["ticker"]
-    result  = {**pick}  # start with scanner fields
+    result  = {**pick}
 
-    # IV rank
     try:
         iv = get_iv_rank(ticker)
         result["iv_rank"]    = round(iv.get("iv_rank", 50), 1) if iv else 50
@@ -83,15 +81,13 @@ def _enrich_ticker(
     except Exception:
         result["iv_rank"], result["iv_current"] = 50, 30
 
-    # Expiry breakdown — dates only, use overall iv_rank for all
-    # (removed per-expiry option_contracts call — was 8 extra UW calls per ticker)
     try:
         expiries_raw = get_expiry_breakdown(ticker)
         today        = datetime.now()
         expiry_list  = []
         iv_est       = result.get("iv_current", 30)
         for e in (expiries_raw or [])[:8]:
-            exp_str = e.get("expires", "") or e.get("expiry", "")  # UW returns "expires" key
+            exp_str = e.get("expires", "") or e.get("expiry", "")
             try:
                 dte = (datetime.strptime(exp_str, "%Y-%m-%d") - today).days
                 if dte < 1:
@@ -103,20 +99,17 @@ def _enrich_ticker(
     except Exception:
         result["expiries"] = []
 
-    # Earnings proximity
     earnings_info = earnings_map.get(ticker, {})
-    result["earnings_days"]   = earnings_info.get("days_away", 999)
-    result["expected_move"]   = earnings_info.get("expected_move_perc", 0)
-    result["earnings_date"]   = earnings_info.get("report_date", "")
+    result["earnings_days"] = earnings_info.get("days_away", 999)
+    result["expected_move"] = earnings_info.get("expected_move_perc", 0)
+    result["earnings_date"] = earnings_info.get("report_date", "")
 
-    # Recent news
     try:
         news = get_news_headlines(ticker=ticker, limit=3)
         result["news"] = [n.get("headline", "")[:60] for n in (news or [])[:3]]
     except Exception:
         result["news"] = []
 
-    # Live price from UW — skip if price is locked (index picks)
     if not result.get("_locked_price"):
         try:
             from app.options_flow.unusual_whales import get_stock_state
@@ -131,55 +124,51 @@ def _enrich_ticker(
         result["price"] = result["_locked_price"]
         result["live_price"] = True
 
-    # GEX — affects strategy (negative GEX = dealers short gamma = directional moves amplified)
+    # GEX — get_gex() does not exist; use get_gex_by_strike and take the
+    # highest-ranked strike's exposure as the ticker-level signal.
     try:
-        from app.options_flow.unusual_whales import get_gex
-        gex_data = get_gex(ticker) or {}
-        gex_val  = float(gex_data.get("gamma_exposure") or gex_data.get("gex") or 0)
-        result["gex_score"]     = gex_val
-        result["gex_negative"]  = gex_val < 0   # True = acceleration likely
-        result["gex_signal"]    = "ACCELERATION" if gex_val < 0 else "MEAN_REVERSION"
+        from app.options_flow.unusual_whales import get_gex_by_strike
+        gex_rows = get_gex_by_strike(ticker) or []
+        gex_row  = gex_rows[0] if gex_rows else {}
+        gex_val  = float(gex_row.get("total_gex") or gex_row.get("gex") or 0)
+        result["gex_score"]    = gex_val
+        result["gex_negative"] = gex_val < 0
+        result["gex_signal"]   = "ACCELERATION" if gex_val < 0 else "MEAN_REVERSION"
     except Exception:
-        result["gex_score"] = 0
-        result["gex_negative"] = False
-        result["gex_signal"] = "UNKNOWN"
+        result["gex_score"], result["gex_negative"], result["gex_signal"] = 0, False, "UNKNOWN"
 
-    # Insider activity from SEC EDGAR
     try:
         from app.signals.edgar_insider import get_insider_signal_for_llm, get_insider_activity
         insider = get_insider_activity(ticker, days=5)
-        result["insider_signal"] = insider.get("signal", "NEUTRAL")
-        result["insider_text"]   = get_insider_signal_for_llm(ticker)
+        result["insider_signal"]      = insider.get("signal", "NEUTRAL")
+        result["insider_text"]        = get_insider_signal_for_llm(ticker)
         result["insider_csuite_buy"]  = insider.get("csuite_buy", False)
         result["insider_csuite_sell"] = insider.get("csuite_sell", False)
     except Exception:
-        result["insider_signal"] = "NEUTRAL"
-        result["insider_text"]   = "No insider data"
+        result["insider_signal"], result["insider_text"] = "NEUTRAL", "No insider data"
 
-    # OI buildup — leading indicator (institutions positioning before catalyst)
     try:
         from app.signals.oi_flow import get_oi_buildup_signal
         oi = get_oi_buildup_signal(ticker)
-        result["oi_score"]        = oi.get("score", 0)
-        result["oi_signal"]       = oi.get("signal", "NEUTRAL")
-        result["oi_max_days"]     = oi.get("max_days_building", 0)
+        result["oi_score"]    = oi.get("score", 0)
+        result["oi_signal"]   = oi.get("signal", "NEUTRAL")
+        result["oi_max_days"] = oi.get("max_days_building", 0)
     except Exception:
         result["oi_score"], result["oi_signal"], result["oi_max_days"] = 0, "NEUTRAL", 0
 
-    # Velocity from signal history
+    # Velocity — must use the REAL user_id, not pick.get("user_id",""),
+    # which is always "" since scanner picks never carry that key.
     try:
         from app.signals.velocity_tracker import get_velocity_scores
-        vel = get_velocity_scores([ticker], pick.get("user_id","") or "")
+        vel = get_velocity_scores([ticker], user_id)
         if vel.get(ticker):
             v = vel[ticker]
             result["velocity"]     = v.get("velocity", 0)
             result["velocity_dir"] = v.get("direction", "STABLE")
             result["days_tracked"] = v.get("days_data", 0)
     except Exception:
-        result["velocity"]     = 0
-        result["velocity_dir"] = "STABLE"
+        result["velocity"], result["velocity_dir"] = 0, "STABLE"
 
-    # TA from UW bars
     try:
         bars = get_ohlc(ticker, "1d", limit=60)
         if bars:
@@ -192,19 +181,19 @@ def _enrich_ticker(
     except Exception:
         result["rsi"], result["trend"], result["macd"] = 50, "SIDEWAYS", "NEUTRAL"
 
-    # Merge batch flow/dp
     flow_data = batch_flow.get(ticker, {})
     dp_data   = batch_dp.get(ticker, {})
     if flow_data:
         result["flow_score"] = flow_data.get("flow_score", result.get("flow_score", 0))
         result["dp_score"]   = flow_data.get("dp_score",   result.get("dp_score", 0))
         result["sweeps"]     = flow_data.get("sweeps",     result.get("sweeps", 0))
+    if dp_data:
+        result["dp_score"] = dp_data.get("dp_score", result.get("dp_score", 0))
 
     return result
 
 
 def _build_earnings_map(pre: list, post: list) -> dict:
-    """Build {ticker: earnings_info} from UW earnings data."""
     today   = datetime.now()
     mapping = {}
     for item in (pre or []) + (post or []):
@@ -215,10 +204,10 @@ def _build_earnings_map(pre: list, post: list) -> dict:
         except Exception:
             days = 999
         mapping[symbol] = {
-            "days_away":          days,
+            "days_away": days,
             "expected_move_perc": float(item.get("expected_move_perc", 0) or 0) * 100,
-            "report_date":        item.get("report_date", ""),
-            "report_time":        item.get("report_time", ""),
+            "report_date": item.get("report_date", ""),
+            "report_time": item.get("report_time", ""),
         }
     return mapping
 
@@ -228,14 +217,10 @@ def _build_earnings_map(pre: list, post: list) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _compress_ticker(t: dict) -> str:
-    """Build a compact ~60-token context block for one ticker."""
     expiry_str = " | ".join(
-        f"{e['expiry']}({e['dte']}d,IV{e['iv_pct']:.0f}%)"
-        for e in t.get("expiries", [])[:5]
+        f"{e['expiry']}({e['dte']}d,IV{e['iv_pct']:.0f}%)" for e in t.get("expiries", [])[:5]
     ) or "no expiries available"
-
     news_str = " // ".join(t.get("news", [])[:2]) or "no news"
-
     earn = t.get("earnings_days", 999)
     earn_str = (f"EARNINGS {earn}d (move±{t.get('expected_move', 0):.1f}%)"
                 if earn < 60 else "no near earnings")
@@ -250,28 +235,15 @@ def _compress_ticker(t: dict) -> str:
         f"{earn_str}]\n"
         f"  Expiries: {expiry_str}\n"
         f"  News: {news_str}"
-    
         f" GEX:{'NEG' if t.get('gex_negative') else 'POS'} Vel:{t.get('velocity',0):+.0f}% Insider:{t.get('insider_signal','N')}"
         f" OI:{t.get('oi_score',0):+.0f}({t.get('oi_signal','NEUTRAL')},{t.get('oi_max_days',0)}d)"
         f"{' ⚠️SIGNALS_CONFLICT' if t.get('conflict') else ''}"
     )
 
 
-def _build_llm_prompt(
-    enriched: list[dict],
-    vix: dict,
-    global_news: list[dict],
-    budget: float,
-    today_str: str,
-) -> str:
-    """Build the single combined LLM prompt."""
-
+def _build_llm_prompt(enriched: list[dict], vix: dict, global_news: list[dict], budget: float, today_str: str) -> str:
     ticker_blocks = "\n\n".join(_compress_ticker(t) for t in enriched)
-
-    news_block = "\n".join(
-        f"  - [{n.get('source','')}] {n.get('headline','')[:80]}"
-        for n in (global_news or [])[:6]
-    )
+    news_block = "\n".join(f"  - [{n.get('source','')}] {n.get('headline','')[:80]}" for n in (global_news or [])[:6])
 
     return f"""You are managing real money. Today is {today_str}.
 Budget per trade: ${budget:.0f}. Goal: maximum probability of profit.
@@ -292,7 +264,7 @@ Study every candidate above. Consider:
 - What catalyst will move this stock?
 - Where are the real entry/exit levels?
 
-Pick up to 4 best option trades (can be same or different tickers for different setups).
+Pick up to 4 best option trades.
 STRATEGIES AVAILABLE (pick best for situation):
 - NAKED_CALL: buy single call — high conviction bullish, no hedge needed
 - NAKED_PUT: buy single put — high conviction bearish
@@ -314,26 +286,17 @@ Respond with valid JSON only:
   "market_view": "one sentence on today's market bias",
   "recommendations": [
     {{
-      "ticker": "NVDA",
-      "direction": "BEARISH",
-      "expiry": "2026-07-17",
-      "dte": 19,
-      "strategy": "DEBIT_PUT_SPREAD",
-      "buy_strike": 190.0,
-      "sell_strike": 182.5,
+      "ticker": "NVDA", "direction": "BEARISH", "expiry": "2026-07-17", "dte": 19,
+      "strategy": "DEBIT_PUT_SPREAD", "buy_strike": 190.0, "sell_strike": 182.5,
       "reasoning": "2 sentences: why this ticker, why this expiry",
-      "key_risk": "1 sentence on main risk",
-      "confidence": 72,
-      "catalyst": "what will move it"
+      "key_risk": "1 sentence on main risk", "confidence": 72, "catalyst": "what will move it"
     }}
   ],
-  "skip": ["NMAX", "CBRS"],
-  "skip_reason": "too illiquid / no catalyst"
+  "skip": ["NMAX", "CBRS"], "skip_reason": "too illiquid / no catalyst"
 }}"""
 
 
 def _call_smart_llm(prompt: str, ticker: str = "MULTI") -> dict | None:
-    """Single LLM call for all recommendations."""
     from app.utils.config import settings
     import requests as req
     import re
@@ -345,29 +308,16 @@ Respond with valid JSON only — no text before or after."""
 
     try:
         payload = {
-            "model":  settings.ollama_model,
-            "prompt": prompt,
-            "system": system,
-            "stream": False,
-            "options": {
-                "num_predict": 10000,
-                "temperature": 0.05,
-                "top_p":       0.9,
-                "num_ctx":     8192,
-            }
+            "model":  settings.ollama_model, "prompt": prompt, "system": system, "stream": False,
+            "options": {"num_predict": 10000, "temperature": 0.05, "top_p": 0.9, "num_ctx": 8192},
         }
         r   = req.post(f"{settings.ollama_host}/api/generate", json=payload, timeout=120)
         raw = r.json().get("response", "").strip()
-
-        # Extract JSON
         match = re.search(r'\{.*\}', raw, re.DOTALL)
         if match:
             data = json.loads(match.group())
-            # Accept both old format (recommendations) and new compact format
-            if ("recommendations" in data
-                    or "morning_status" in data
-                    or "new_picks" in data
-                    or "picks" in data):
+            if ("recommendations" in data or "morning_status" in data
+                    or "new_picks" in data or "picks" in data):
                 return data
         print(f"[SmartLLM] Could not parse: {raw[:400]}")
         print(f"[SmartLLM] Full response length: {len(raw)} chars")
@@ -382,23 +332,19 @@ Respond with valid JSON only — no text before or after."""
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _execute_smart_rec(rec: dict, budget: float, user_id: str | None) -> dict | None:
-    """Run deterministic trade math for one LLM recommendation."""
-    from app.strategy.engine import _execute_trade_math, _uw_price_for_strike, _bsm_greeks
-    from app.options_flow.unusual_whales import get_option_contracts
+    from app.strategy.engine import _execute_trade_math, normalize_strategy
 
     ticker    = rec.get("ticker", "")
     expiry    = rec.get("expiry", "")
     direction = rec.get("direction", "NEUTRAL")
-    strategy  = rec.get("strategy", "DEBIT_PUT_SPREAD")
+    strategy  = normalize_strategy(rec.get("strategy", "DEBIT_PUT_SPREAD"))
     buy_str   = float(rec.get("buy_strike", 0) or 0)
     sell_str  = float(rec.get("sell_strike", 0) or 0)
     dte       = int(rec.get("dte", 21) or 21)
 
-    # Build a decision dict that _execute_trade_math expects
     from app.options_flow.unusual_whales import get_stock_state
     state = get_stock_state(ticker)
     spot  = float(state.get("price", 0)) if state else 0
-
     if not spot:
         try:
             import yfinance as yf
@@ -409,7 +355,6 @@ def _execute_smart_rec(rec: dict, budget: float, user_id: str | None) -> dict | 
     if not spot or not buy_str:
         return None
 
-    # Validate and correct strike order — LLM sometimes inverts them
     if "DEBIT_CALL_SPREAD" in strategy and buy_str > sell_str:
         buy_str, sell_str = sell_str, buy_str
         print(f"[SmartMath] Auto-corrected CALL spread strikes: BUY ${buy_str} SELL ${sell_str}")
@@ -423,8 +368,6 @@ def _execute_smart_rec(rec: dict, budget: float, user_id: str | None) -> dict | 
         buy_str, sell_str = sell_str, buy_str
         print(f"[SmartMath] Auto-corrected CREDIT PUT strikes: BUY ${buy_str} SELL ${sell_str}")
 
-    # Snap to REAL listed strikes — LLM sometimes invents strikes that don't exist
-    # (e.g. $80.5 when only $80/$81/$82 are actually listed)
     try:
         from app.options_flow.unusual_whales import get_option_contracts
         real_contracts = get_option_contracts(ticker, expiry=expiry, limit=200)
@@ -440,17 +383,14 @@ def _execute_smart_rec(rec: dict, budget: float, user_id: str | None) -> dict | 
             buy_str  = min(real_strikes, key=lambda s: abs(s - buy_str))
             sell_str = min(real_strikes, key=lambda s: abs(s - sell_str))
             if buy_str == sell_str:
-                # collision after snapping — pick next nearest distinct strike
                 remaining = sorted(real_strikes - {buy_str})
                 if remaining:
                     sell_str = min(remaining, key=lambda s: abs(s - orig_sell))
             if (buy_str, sell_str) != (orig_buy, orig_sell):
-                print(f"[SmartMath] Snapped to real strikes: "
-                      f"BUY ${orig_buy}→${buy_str} SELL ${orig_sell}→${sell_str}")
+                print(f"[SmartMath] Snapped to real strikes: BUY ${orig_buy}→${buy_str} SELL ${orig_sell}→${sell_str}")
     except Exception as e:
         print(f"[SmartMath] Strike validation skipped: {e}")
 
-    # Re-run direction check AFTER snapping — snapping can re-invert strikes
     if "DEBIT_CALL_SPREAD" in strategy and buy_str > sell_str:
         buy_str, sell_str = sell_str, buy_str
         print(f"[SmartMath] Post-snap correction CALL: BUY ${buy_str} SELL ${sell_str}")
@@ -458,7 +398,6 @@ def _execute_smart_rec(rec: dict, budget: float, user_id: str | None) -> dict | 
         buy_str, sell_str = sell_str, buy_str
         print(f"[SmartMath] Post-snap correction PUT: BUY ${buy_str} SELL ${sell_str}")
 
-    # Determine legs from strategy
     is_credit = "CREDIT" in strategy or "IRON" in strategy
 
     if strategy == "NAKED_CALL":
@@ -466,15 +405,11 @@ def _execute_smart_rec(rec: dict, budget: float, user_id: str | None) -> dict | 
     elif strategy == "NAKED_PUT":
         legs = [{"action": "BUY", "type": "PUT", "strike": buy_str}]
     elif strategy == "STRADDLE":
-        legs = [
-            {"action": "BUY", "type": "CALL", "strike": buy_str},
-            {"action": "BUY", "type": "PUT",  "strike": buy_str},
-        ]
+        legs = [{"action": "BUY", "type": "CALL", "strike": buy_str},
+                {"action": "BUY", "type": "PUT",  "strike": buy_str}]
     elif strategy == "STRANGLE":
-        legs = [
-            {"action": "BUY", "type": "CALL", "strike": sell_str},
-            {"action": "BUY", "type": "PUT",  "strike": buy_str},
-        ]
+        legs = [{"action": "BUY", "type": "CALL", "strike": sell_str},
+                {"action": "BUY", "type": "PUT",  "strike": buy_str}]
     elif strategy == "IRON_CONDOR":
         width = round((sell_str - buy_str) * 0.5, 1)
         legs = [
@@ -485,35 +420,24 @@ def _execute_smart_rec(rec: dict, budget: float, user_id: str | None) -> dict | 
         ]
     elif is_credit:
         leg_type = "PUT" if "PUT" in strategy else "CALL"
-        legs = [
-            {"action": "SELL", "type": leg_type, "strike": buy_str},
-            {"action": "BUY",  "type": leg_type, "strike": sell_str},
-        ]
+        legs = [{"action": "SELL", "type": leg_type, "strike": buy_str},
+                {"action": "BUY",  "type": leg_type, "strike": sell_str}]
     else:
         leg_type = "PUT" if "PUT" in strategy else "CALL"
-        legs = [
-            {"action": "BUY",  "type": leg_type, "strike": buy_str},
-            {"action": "SELL", "type": leg_type, "strike": sell_str},
-        ]
+        legs = [{"action": "BUY",  "type": leg_type, "strike": buy_str},
+                {"action": "SELL", "type": leg_type, "strike": sell_str}]
 
     decision = {
-        "strategy":     strategy,
-        "expiry":       expiry,
-        "dte":          dte,
-        "legs":         legs,
-        "direction":    direction,
-        "confidence":   int(rec.get("confidence", 65) or 65),
-        "reasoning":    rec.get("reasoning", ""),
-        "key_risk":     rec.get("key_risk", ""),
-        "key_news":     rec.get("catalyst", "NONE"),
-        "regime_check": "PASS",
+        "strategy": strategy, "expiry": expiry, "dte": dte, "legs": legs,
+        "direction": direction, "confidence": int(rec.get("confidence", 65) or 65),
+        "reasoning": rec.get("reasoning", ""), "key_risk": rec.get("key_risk", ""),
+        "key_news": rec.get("catalyst", "NONE"), "regime_check": "PASS",
     }
 
     try:
         max_loss = budget * 0.40
         trade    = _execute_trade_math(decision, ticker, spot, budget, max_loss)
 
-        # Reject negative entry_debit for DEBIT spreads only — credit strategies have negative entry
         if "DEBIT" in strategy and "CREDIT" not in strategy:
             ed = trade.get("entry_debit", 0) or 0
             if ed <= 0:
@@ -541,15 +465,9 @@ def _execute_smart_rec(rec: dict, budget: float, user_id: str | None) -> dict | 
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_smart_recommendations(
-    user_id:    str,
-    budget:     float = 2000.0,
-    top_picks:  int   = 15,
-    pre_scanned: list | None = None,   # pass existing picks to skip re-scan
+    user_id: str, budget: float = 2000.0, top_picks: int = 15,
+    pre_scanned: list | None = None,
 ) -> dict:
-    """
-    Full smart recommendation run.
-    Returns options + stock recommendations with reasoning.
-    """
     from app.scanner.quick_scan import quick_scan
     from app.scanner.universe import get_scan_universe
     from app.rag.context_builder import _build_vix_context, _build_global_news
@@ -562,9 +480,6 @@ def run_smart_recommendations(
     today   = datetime.now().strftime("%A %B %d, %Y")
 
     print(f"[SmartEngine] Starting run — budget=${budget:.0f}")
-
-    # ── Pre-fetch shared data (batch) ─────────────────────────────────────────
-    print(f"[SmartEngine] Pre-fetching shared data...")
     t0 = time.time()
 
     vix         = _build_vix_context()
@@ -582,43 +497,13 @@ def run_smart_recommendations(
     for d in all_dp:
         dp_by.setdefault(d.get("ticker",""), []).append(d)
 
-    # Build batch flow dict
-    batch_flow = {}
-    for ticker, alerts in flow_by.items():
-        bull = sum(1 for a in alerts if a.get("type","").lower() == "call"
-                   or a.get("sentiment","").upper() in ("BULLISH","CALL"))
-        bear = sum(1 for a in alerts if a.get("type","").lower() == "put"
-                   or a.get("sentiment","").upper() in ("BEARISH","PUT"))
-        tot  = bull + bear
-        batch_flow[ticker] = {
-            "flow_score": round((bull-bear)/tot*100, 1) if tot else 0,
-            "sweeps":     sum(1 for a in alerts if a.get("is_sweep")),
-        }
-    batch_dp = {}
-    for ticker, prints in dp_by.items():
-
-        def _dp_side(d):
-            try:
-                price = float(d.get("price",0) or 0)
-                ask   = float(d.get("nbbo_ask",0) or 0)
-                bid   = float(d.get("nbbo_bid",0) or 0)
-                if ask and price >= ask * 0.999: return "BUY"
-                if bid and price <= bid * 1.001: return "SELL"
-                return d.get("side","")
-            except Exception:
-                return d.get("side","")
-        buys  = sum(1 for d in prints if _dp_side(d) in ("BUY","A"))
-        sells = sum(1 for d in prints if _dp_side(d) in ("SELL","B"))
-        tot   = buys + sells
-        batch_dp[ticker] = {
-            "dp_score": round((buys-sells)/tot*100, 1) if tot else 0,
-        }
+    batch_flow = {t: compute_flow_score(alerts) for t, alerts in flow_by.items()}
+    batch_dp   = {t: compute_dp_score(prints)   for t, prints in dp_by.items()}
 
     print(f"[SmartEngine] Shared data in {time.time()-t0:.1f}s | "
           f"VIX={vix.get('current')} | news={len(global_news)} | "
           f"earnings={len(earnings_pre+earnings_post)}")
 
-    # ── Scanner (skip if pre-scanned picks provided) ──────────────────────────
     if pre_scanned:
         picks = pre_scanned
         print(f"[SmartEngine] Using {len(picks)} pre-scanned picks")
@@ -628,12 +513,10 @@ def run_smart_recommendations(
         tickers = get_scan_universe(user_id=user_id)
         picks   = quick_scan(tickers, user_id=user_id, top_n=top_picks)
 
-    # Filter to optionable tickers
     candidates = [p for p in picks if _is_optionable(p)]
     print(f"[SmartEngine] Scanner: {len(picks)} picks → {len(candidates)} optionable in {time.time()-t0:.1f}s")
 
     if not candidates:
-        # Fallback to liquid tickers
         candidates = [
             {"ticker": "SPY", "direction": "BEARISH", "price": 590, "confidence": 60,
              "change_pct": 0, "flow_score": 0, "dp_score": 0, "sweeps": 0, "alert_count": 0, "score": 0.5, "signals": []},
@@ -642,14 +525,13 @@ def run_smart_recommendations(
         ]
         print("[SmartEngine] No candidates — using SPY/QQQ fallback")
 
-    # ── Phase 1: Parallel enrichment ──────────────────────────────────────────
     print(f"[SmartEngine] Enriching {len(candidates)} candidates in parallel...")
     t0       = time.time()
     enriched = []
 
     with ThreadPoolExecutor(max_workers=min(8, len(candidates))) as ex:
         futures = {
-            ex.submit(_enrich_ticker, c, earnings_map, batch_flow, batch_dp): c["ticker"]
+            ex.submit(_enrich_ticker, c, earnings_map, batch_flow, batch_dp, user_id): c["ticker"]
             for c in candidates
         }
         for future in as_completed(futures, timeout=30):
@@ -660,15 +542,11 @@ def run_smart_recommendations(
 
     print(f"[SmartEngine] Enriched {len(enriched)} tickers in {time.time()-t0:.1f}s")
 
-    # Sort by signal strength
     enriched.sort(key=lambda x: (
-        abs(x.get("flow_score", 0)) +
-        abs(x.get("dp_score", 0)) +
-        abs(x.get("change_pct", 0)) * 2 +
-        (20 if x.get("earnings_days", 999) < 14 else 0)
+        abs(x.get("flow_score", 0)) + abs(x.get("dp_score", 0)) +
+        abs(x.get("change_pct", 0)) * 2 + (20 if x.get("earnings_days", 999) < 14 else 0)
     ), reverse=True)
 
-    # ── Phase 2: Single LLM call ──────────────────────────────────────────────
     print(f"[SmartEngine] Calling LLM with {len(enriched)} candidates...")
     t0     = time.time()
     prompt = _build_llm_prompt(enriched[:10], vix, global_news, budget, today)
@@ -676,35 +554,28 @@ def run_smart_recommendations(
     print(f"[SmartEngine] LLM responded in {time.time()-t0:.1f}s")
 
     if not llm_result:
-        return {
-            "error":   "LLM call failed",
-            "elapsed": round(time.time()-t_total, 1),
-        }
+        return {"error": "LLM call failed", "elapsed": round(time.time()-t_total, 1)}
 
     print(f"[SmartEngine] Market view: {llm_result.get('market_view','')}")
     print(f"[SmartEngine] Recommendations: {len(llm_result.get('recommendations',[]))}")
 
-    # ── Phase 3: Deterministic math ───────────────────────────────────────────
-    t0       = time.time()
-    final    = []
+    t0    = time.time()
+    final = []
     for rec in (llm_result.get("recommendations") or []):
         trade = _execute_smart_rec(rec, budget, user_id)
         if trade:
             final.append(trade)
-            print(f"[SmartEngine] ✅ {rec['ticker']} {rec['direction']} "
-                  f"{rec['strategy']} exp={rec['expiry']} conf={rec.get('confidence')}")
+            print(f"[SmartEngine] ✅ {rec['ticker']} {rec['direction']} {rec['strategy']} exp={rec['expiry']} conf={rec.get('confidence')}")
         else:
             print(f"[SmartEngine] ⚠️  {rec.get('ticker')} math failed")
 
     print(f"[SmartEngine] Math done in {time.time()-t0:.1f}s")
 
-    # ── Stock recommendations (parallel, no LLM needed for fundamentals) ──────
     stock_recs = []
     try:
         from app.recommendations.horizon_engine import get_stock_for_horizon
         import yfinance as yf
-        stock_tickers = ["NVDA", "AAPL", "MSFT"]  # top liquid from watchlist
-        for t in stock_tickers[:2]:
+        for t in ["NVDA", "AAPL"]:
             try:
                 price = yf.Ticker(t).fast_info.last_price or 0
                 if price:
@@ -716,65 +587,45 @@ def run_smart_recommendations(
     except Exception as e:
         print(f"[SmartEngine] Stock recs failed: {e}")
 
-    # Store option recs to daily_recommendations
     market_view = llm_result.get("market_view", "")
     for rec in final:
         try:
             from app.recommendations.daily_engine import _upsert_recommendation
             legs = rec.get("legs", [])
+            rr_pct = round((rec.get("risk_reward") or 0) * 100, 1)
             _upsert_recommendation(user_id, {
-                "ticker":           rec["ticker"],
-                "horizon":          rec.get("horizon", "17d"),
-                "direction":        rec["direction"],
-                "conviction_score": rec.get("confidence", 65),
-                "conviction_tier":  "HIGH" if rec.get("confidence",0)>=75
-                                    else "MODERATE" if rec.get("confidence",0)>=65
-                                    else "WATCH",
-                "act_now":          rec.get("confidence", 0) >= 70,
-                "position_size_guidance": "standard",
-                "thesis":           rec.get("reasoning", ""),
-                "entry_zone_low":   abs(rec.get("entry_debit", 0)),
-                "entry_zone_high":  abs(rec.get("entry_debit", 0)) * 1.05,
-                "entry_trigger":    "AT_MARKET",
-                "target_price":     0,
-                "target_pct":       rec.get("max_profit_per_contract", 0) /
-                                    max(abs(rec.get("max_loss_per_contract", 100)), 1) * 100,
-                "stop_price":       0,
-                "stop_pct":         -40.0,
-                "timeframe":        f"{rec.get('dte', 17)} days",
+                "ticker": rec["ticker"], "horizon": rec.get("horizon", "17d"),
+                "direction": rec["direction"], "conviction_score": rec.get("confidence", 65),
+                "conviction_tier": "HIGH" if rec.get("confidence",0)>=75
+                                    else "MODERATE" if rec.get("confidence",0)>=65 else "WATCH",
+                "act_now": rec.get("confidence", 0) >= 70,
+                "position_size_guidance": "standard", "thesis": rec.get("reasoning", ""),
+                "entry_zone_low": abs(rec.get("entry_debit", 0)),
+                "entry_zone_high": abs(rec.get("entry_debit", 0)) * 1.05,
+                "entry_trigger": "AT_MARKET", "target_price": 0, "target_pct": rr_pct,
+                "stop_price": 0, "stop_pct": -40.0,
+                "timeframe": f"{rec.get('dte', 17)} days",
                 "invalidation_conditions": rec.get("key_risk", ""),
-                "strategy":         rec.get("strategy", ""),
-                "expiry":           rec.get("expiry", ""),
-                "dte":              rec.get("dte", 17),
-                "legs":             legs,
-                "entry_debit":      rec.get("entry_debit", 0),
-                "total_cost":       rec.get("total_cost", 0),
-                "max_profit":       rec.get("max_profit_per_contract", 0),
-                "max_loss":         rec.get("max_loss_per_contract", 0),
-                "risk_reward":      rec.get("risk_reward", 0),
+                "strategy": rec.get("strategy", ""), "expiry": rec.get("expiry", ""),
+                "dte": rec.get("dte", 17), "legs": legs, "entry_debit": rec.get("entry_debit", 0),
+                "total_cost": rec.get("total_cost", 0),
+                "max_profit": rec.get("max_profit_per_contract", 0),
+                "max_loss": rec.get("max_loss_per_contract", 0),
+                "risk_reward": rec.get("risk_reward", 0),
                 "webull_instructions": rec.get("webull_instructions", ""),
-                "key_news":         rec.get("catalyst", "NONE"),
-                "warnings":         [],
-                "conviction_breakdown": {},
-                "signal_data":      {"market_view": market_view},
+                "key_news": rec.get("catalyst", "NONE"), "warnings": rec.get("engine_warnings", []),
+                "conviction_breakdown": {}, "signal_data": {"market_view": market_view},
             })
             print(f"[SmartEngine] Stored rec: {rec['ticker']}")
         except Exception as e:
             print(f"[SmartEngine] Store failed for {rec.get('ticker','?')}: {e}")
 
     total_time = round(time.time()-t_total, 1)
-    print(f"\n[SmartEngine] COMPLETE in {total_time}s — "
-          f"{len(final)} option recs + {len(stock_recs)} stock recs")
+    print(f"\n[SmartEngine] COMPLETE in {total_time}s — {len(final)} option recs + {len(stock_recs)} stock recs")
 
     return {
-        "market_view":       llm_result.get("market_view", ""),
-        "options":           final,
-        "stocks":            stock_recs,
-        "skipped":           llm_result.get("skip", []),
-        "skip_reason":       llm_result.get("skip_reason", ""),
-        "candidates_scanned": len(candidates),
-        "elapsed":           total_time,
-        "vix":               vix.get("current"),
-        "vix_zone":          vix.get("zone"),
-        "date":              today,
+        "market_view": llm_result.get("market_view", ""), "options": final, "stocks": stock_recs,
+        "skipped": llm_result.get("skip", []), "skip_reason": llm_result.get("skip_reason", ""),
+        "candidates_scanned": len(candidates), "elapsed": total_time,
+        "vix": vix.get("current"), "vix_zone": vix.get("zone"), "date": today,
     }

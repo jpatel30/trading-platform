@@ -6,6 +6,17 @@ for the History tab and backtest dataset.
 
 Lazy-refresh model: triggered when History tab loads, only re-marks
 if existing marks are >15 min stale. No separate scheduler needed.
+
+Rewritten July 2026 — found the P&L% denominator was wrong for credit
+strategies (iron condor etc). pnl_pct was computed as profit/credit
+received, but credit received is NOT the capital at risk for a credit
+trade — max_loss is. This inflated every condor's return by roughly
+(max_loss/credit), e.g. ~3.26x for a QQQ condor tested this session
+(credit=$470, max_loss=$1,530). Debit trades were always correct
+(entry_debit = premium paid = capital at risk there, so no fix needed
+for that branch). Also added excluded_from_stats filtering so rows
+flagged as corrupted (phantom $1M+ "max profit" from a fixed upstream
+bug) no longer pollute backtest aggregates.
 """
 from datetime import datetime, timezone
 
@@ -31,9 +42,6 @@ def get_current_option_value(ticker: str, legs: list[dict]) -> float | None:
         if not contracts:
             return None
 
-        # Build lookup: (strike, type_letter) -> mid price
-        # UW returns option_symbol like "AFRM260717C00085000" (no separate strike/type fields)
-        # Format: TICKER + YYMMDD + C/P + strike*1000 (8 digits)
         contract_map = {}
         for c in contracts:
             sym = c.get("option_symbol", "")
@@ -43,7 +51,6 @@ def get_current_option_value(ticker: str, legs: list[dict]) -> float | None:
             if not sym or not mid:
                 continue
             try:
-                # Find C or P marker, strike is the 8 digits after it
                 for marker in ("C", "P"):
                     idx = sym.rfind(marker)
                     if idx > 0 and sym[idx+1:].isdigit() and len(sym[idx+1:]) == 8:
@@ -53,7 +60,6 @@ def get_current_option_value(ticker: str, legs: list[dict]) -> float | None:
             except Exception:
                 continue
 
-        # Match legs with small tolerance for float precision
         def _find_match(strike, type_key):
             if (strike, type_key) in contract_map:
                 return contract_map[(strike, type_key)]
@@ -80,7 +86,7 @@ def get_current_option_value(ticker: str, legs: list[dict]) -> float | None:
                 total_value -= current_mid
 
         if matched < len(legs):
-            return None  # couldn't price every leg — unreliable mark
+            return None
 
         return round(total_value, 2)
 
@@ -104,41 +110,69 @@ def get_current_stock_value(ticker: str) -> float | None:
 def mark_recommendation(rec: dict, is_market_open: bool) -> dict:
     """
     Calculate current value + P&L for a single recommendation.
-    Handles both debit spreads (positive entry_debit) and
-    credit spreads (negative entry_debit) correctly.
+
+    P&L percentage is always computed against CAPITAL AT RISK, not
+    premium flow direction:
+      Debit trades:  capital at risk = entry_debit (premium paid) — unchanged
+      Credit trades: capital at risk = max_loss (NOT credit received —
+                     that was the bug). max_loss is stored per-contract
+                     in the DB (already ×100 vs the per-share entry_debit),
+                     so it's converted to a per-share basis before the ratio.
+
+    Also returns pct_of_max_profit_captured — "how much of the
+    theoretical max profit have I realized" — which is the metric that
+    actually matches Trading Rule 1 ("close at 80% of max profit"). This
+    is informational for the UI, separate from pnl_pct which feeds
+    backtest stats and must be comparable across debit and credit trades.
     """
     ticker      = rec.get("ticker", "")
     legs        = rec.get("legs") or []
     entry_debit = float(rec.get("entry_debit", 0) or 0)
     entry_low   = float(rec.get("entry_zone_low", 0) or 0)
+    max_loss    = float(rec.get("max_loss", 0) or 0)     # per-contract, from DB
+    max_profit  = float(rec.get("max_profit", 0) or 0)   # per-contract, from DB
 
     result = {
         "current_value": None,
         "pnl_dollars":   None,
         "pnl_pct":       None,
+        "pct_of_max_profit_captured": None,
         "mark_type":     "live" if is_market_open else "eod_close",
     }
 
     if legs:
-        # OPTIONS — match same BUY/SELL convention as entry_debit
         current_value = get_current_option_value(ticker, legs)
         if current_value is not None and entry_debit:
             result["current_value"] = current_value
+
             if entry_debit > 0:
-                # Debit spread: paid entry_debit, profit when value rises
-                pnl_per_share = current_value - entry_debit
+                # Debit spread: paid entry_debit, profit when value rises.
+                # Capital at risk = entry_debit — already correct.
+                pnl_per_share        = current_value - entry_debit
+                risk_basis_per_share = entry_debit
             else:
-                # Credit spread: received |entry_debit|, profit when cost to close falls
+                # Credit spread / iron condor: received |entry_debit|,
+                # profit when cost to close falls. Capital at risk is
+                # max_loss (the actual dollar exposure), NOT the credit
+                # received — dividing by credit inflated returns by
+                # roughly (max_loss / credit), ~3x in tested cases.
                 pnl_per_share = abs(entry_debit) - current_value
-            result["pnl_dollars"] = round(pnl_per_share * 100, 2)  # per contract
-            result["pnl_pct"] = round((pnl_per_share / abs(entry_debit)) * 100, 1) if entry_debit else None
+                risk_basis_per_share = (max_loss / 100.0) if max_loss > 0 else abs(entry_debit)
+
+            pnl_dollars = round(pnl_per_share * 100, 2)
+            result["pnl_dollars"] = pnl_dollars
+            result["pnl_pct"] = (
+                round((pnl_per_share / risk_basis_per_share) * 100, 1)
+                if risk_basis_per_share else None
+            )
+            if max_profit > 0:
+                result["pct_of_max_profit_captured"] = round(pnl_dollars / max_profit * 100, 1)
     else:
-        # STOCKS
         current_price = get_current_stock_value(ticker)
         if current_price is not None and entry_low:
             result["current_value"] = current_price
             pnl_per_share = current_price - entry_low
-            result["pnl_dollars"] = round(pnl_per_share, 2)  # per share
+            result["pnl_dollars"] = round(pnl_per_share, 2)
             result["pnl_pct"] = round((pnl_per_share / entry_low) * 100, 1) if entry_low else None
 
     return result
@@ -160,7 +194,7 @@ def mark_all_active_recommendations(user_id: str, days_back: int = 90) -> dict:
     try:
         with get_session() as s:
             rows = s.execute(text("""
-                SELECT id, ticker, legs, entry_debit, entry_zone_low
+                SELECT id, ticker, legs, entry_debit, entry_zone_low, max_loss, max_profit
                 FROM daily_recommendations
                 WHERE user_id = :uid
                   AND date >= CURRENT_DATE - :days
@@ -173,6 +207,8 @@ def mark_all_active_recommendations(user_id: str, days_back: int = 90) -> dict:
                 "legs":            row.legs or [],
                 "entry_debit":     float(row.entry_debit or 0),
                 "entry_zone_low":  float(row.entry_zone_low or 0),
+                "max_loss":        float(row.max_loss or 0),
+                "max_profit":      float(row.max_profit or 0),
             }
             mark = mark_recommendation(rec, is_open)
 
@@ -212,6 +248,11 @@ def calculate_backtest_stats(user_id: str, days_back: int = 90) -> dict:
     """
     Aggregate stats from marked recommendations — feeds learning/calibration.
     Answers: is conviction scoring actually predictive? Which strategies win?
+
+    Excludes rows flagged excluded_from_stats (corrupted historical P&L
+    from a fixed upstream bug — see the July 2026 sanity-cap rewrite of
+    app/strategy/engine.py) so a handful of phantom $1M+ "max profit"
+    trades don't dominate the averages.
     """
     from sqlalchemy import text
     from app.db.session import get_session
@@ -223,6 +264,7 @@ def calculate_backtest_stats(user_id: str, days_back: int = 90) -> dict:
             FROM daily_recommendations
             WHERE user_id = :uid AND date >= CURRENT_DATE - :days
               AND current_pnl_pct IS NOT NULL
+              AND (excluded_from_stats IS NULL OR excluded_from_stats = FALSE)
         """), {"uid": user_id, "days": days_back}).fetchall()
 
     if not rows:

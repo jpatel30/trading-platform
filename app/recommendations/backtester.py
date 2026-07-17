@@ -178,7 +178,7 @@ def backtest_entry_quality(user_id: str) -> dict:
     """
     Did AT_RESISTANCE/AT_SUPPORT entries outperform BETWEEN_LEVELS?
     Did volume-confirmed entries win more?
-    Needs: closed strategy_recommendations with entry_trigger data.
+    Needs: closed daily_recommendations with entry_trigger data.
     """
     try:
         from sqlalchemy import text

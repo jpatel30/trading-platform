@@ -143,7 +143,7 @@ def recalibrate_conviction_weights(user_id: str) -> dict:
             # (populated by prediction_tracker.log_exit()) — no JOIN needed,
             # and this correctly sees every trade closed through the
             # current fill-tracking flow, not just the old
-            # strategy_recommendations path.
+            # (now fully retired) strategy_recommendations table.
             rows = s.execute(text("""
                 SELECT conviction_breakdown, was_correct
                 FROM daily_recommendations

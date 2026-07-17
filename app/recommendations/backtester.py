@@ -8,10 +8,10 @@ Backtest 1: "Cost of ignoring sell signals" (ACTIVE — has data)
     "If you had exited GLD at -17% (first signal), you avoided -77% more loss"
     Dollar amounts calculated from cost_basis in sell_recommendations
 
-Backtest 2: "Entry quality" (FRAMEWORK — needs strategy_rec outcomes)
+Backtest 2: "Entry quality" (FRAMEWORK — needs daily_rec outcomes)
     Did AT_RESISTANCE entries outperform BETWEEN_LEVELS?
     Did volume-confirmed entries win more?
-    Activates after 10+ closed strategy_recommendations
+    Activates after 10+ closed daily_recommendations (user_executed trades)
 
 Backtest 3: "Conviction gate" (FRAMEWORK — needs daily_rec outcomes)
     Did conviction ≥70 picks outperform <70?
@@ -185,16 +185,16 @@ def backtest_entry_quality(user_id: str) -> dict:
         from app.db.session import get_session
 
         with get_session() as s:
+            # actual_pnl_pct/was_correct now live directly on
+            # daily_recommendations (Step 1 + prediction_tracker.log_exit())
+            # — no JOIN needed, and this sees every real close going forward.
             rows = s.execute(text("""
-                SELECT dr.entry_trigger, dr.conviction_score,
-                       sr.actual_pnl_pct, sr.was_correct
-                FROM daily_recommendations dr
-                JOIN strategy_recommendations sr
-                    ON dr.ticker = sr.symbol
-                    AND dr.date  = sr.rec_date
-                WHERE dr.user_id = :uid
-                  AND sr.was_correct IS NOT NULL
-                  AND sr.actual_pnl_pct IS NOT NULL
+                SELECT entry_trigger, conviction_score,
+                       actual_pnl_pct, was_correct
+                FROM daily_recommendations
+                WHERE user_id = :uid
+                  AND was_correct IS NOT NULL
+                  AND actual_pnl_pct IS NOT NULL
             """), {"uid": user_id}).fetchall()
 
         if len(rows) < 5:
@@ -257,16 +257,14 @@ def backtest_conviction_gate(user_id: str) -> dict:
         from app.db.session import get_session
 
         with get_session() as s:
+            # Same fix as backtest_entry_quality() above — single table now.
             rows = s.execute(text("""
-                SELECT dr.conviction_score, dr.conviction_tier,
-                       dr.conviction_breakdown,
-                       sr.actual_pnl_pct, sr.was_correct
-                FROM daily_recommendations dr
-                JOIN strategy_recommendations sr
-                    ON dr.ticker = sr.symbol
-                    AND dr.date  = sr.rec_date
-                WHERE dr.user_id = :uid
-                  AND sr.was_correct IS NOT NULL
+                SELECT conviction_score, conviction_tier,
+                       conviction_breakdown,
+                       actual_pnl_pct, was_correct
+                FROM daily_recommendations
+                WHERE user_id = :uid
+                  AND was_correct IS NOT NULL
             """), {"uid": user_id}).fetchall()
 
         if len(rows) < 10:

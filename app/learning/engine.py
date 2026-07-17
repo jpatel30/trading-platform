@@ -5,10 +5,10 @@ Analyses all historical data to generate actionable insights and
 adjust strategy confidence weights for future recommendations.
 
 Learning sources:
-    sell_recommendations  — did user act? was signal correct?
-    strategy_recommendations — win/loss per strategy, direction, ticker
-    position_alerts       — what patterns in ignored alerts?
-    user_profiles         — baseline risk profile
+    sell_recommendations   — did user act? was signal correct?
+    daily_recommendations  — win/loss per strategy, direction, ticker
+    position_alerts        — what patterns in ignored alerts?
+    user_profiles          — baseline risk profile
 
 Outputs:
     1. Behavioral insights  — what does the user tend to ignore?
@@ -135,12 +135,15 @@ def analyze_strategy_performance(user_id: str) -> dict:
         from app.db.session import get_session
 
         with get_session() as s:
+            # ticker AS symbol — keeps every downstream r.symbol reference
+            # unchanged. All these columns now live on daily_recommendations
+            # (Step 1 + prediction_tracker.log_exit() from Step 2).
             rows = s.execute(text("""
-                SELECT symbol, strategy, direction,
+                SELECT ticker AS symbol, strategy, direction,
                        actual_pnl_pct, risk_reward,
                        was_correct, user_executed,
                        executed_at, closed_at
-                FROM strategy_recommendations
+                FROM daily_recommendations
                 WHERE user_id   = :uid
                   AND was_correct IS NOT NULL
             """), {"uid": user_id}).fetchall()

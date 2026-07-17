@@ -50,69 +50,52 @@ def confirm_execution(
             if existing:
                 return {"status": "already_tracked", "id": str(existing.id)}
 
-            # 1. Find existing rec for today at this price (any status)
+            # 1. Find today's daily_recommendations row for this ticker —
+            #    the table the CURRENT engine actually writes to. Prefer an
+            #    exact recommendation_id if the caller passed one; otherwise
+            #    match on ticker + today's date (most recent if several).
             if not recommendation_id:
+                # Options commonly have MULTIPLE recs for the same ticker on
+                # the same day (e.g. SPY as both IRON_CONDOR and
+                # DEBIT_CALL_SPREAD) — "most recently created" isn't a
+                # reliable way to pick the right one. Disambiguate using the
+                # price the user actually reports filling at: it should be
+                # close to ONE specific rec's entry_debit (options) or
+                # entry_zone_low (stock), and meaningfully off from the
+                # others. Falls back naturally to "closest anyway" if there's
+                # only one candidate, or none are close (COALESCE→0 pushes
+                # unpriced/legacy rows to the bottom, doesn't crash on them).
                 row = s.execute(text("""
-                    SELECT id FROM strategy_recommendations
-                    WHERE user_id      = :uid
-                      AND symbol       = :sym
-                      AND actual_entry = :entry
-                      AND rec_date     = CURRENT_DATE
+                    SELECT id, ABS(COALESCE(entry_debit, entry_zone_low, 0) - :entry) AS diff
+                    FROM daily_recommendations
+                    WHERE user_id = :uid AND ticker = :sym AND date = CURRENT_DATE
+                    ORDER BY diff ASC, created_at DESC
                     LIMIT 1
-                """), {"uid": user_id, "sym": symbol,
-                       "entry": entry_price}).fetchone()
-
+                """), {"uid": user_id, "sym": symbol.upper(), "entry": entry_price}).fetchone()
                 if row:
                     recommendation_id = str(row.id)
-                    print(f"[Tracker] Found existing rec for {symbol} @ ${entry_price}")
+                    print(f"[Tracker] Matched daily_recommendations for {symbol} "
+                          f"(price diff: {row.diff})")
                 else:
-                    # Try unexecuted rec from today (from strategy engine)
-                    row = s.execute(text("""
-                        SELECT id FROM strategy_recommendations
-                        WHERE user_id         = :uid
-                          AND symbol          = :sym
-                          AND rec_date        = CURRENT_DATE
-                          AND user_executed IS NULL
-                        ORDER BY recommended_at DESC
-                        LIMIT 1
-                    """), {"uid": user_id, "sym": symbol}).fetchone()
-                    if row:
-                        recommendation_id = str(row.id)
-                        print(f"[Tracker] Found unexecuted rec for {symbol}")
+                    print(f"[Tracker] No daily_recommendations match for {symbol} today "
+                          f"— fill will still be tracked, just unlinked to a specific rec")
 
-            # 2. Update existing or create new
+            # 2. Mark that recommendation as executed with the REAL fill
+            #    details — separate from the recommended entry/target/stop,
+            #    which stay untouched as the original thesis record.
             if recommendation_id:
                 s.execute(text("""
-                    UPDATE strategy_recommendations
-                    SET user_executed = TRUE,
-                        actual_entry  = :entry,
-                        contracts     = :qty,
-                        executed_at   = now(),
-                        rec_date      = COALESCE(rec_date, CURRENT_DATE)
+                    UPDATE daily_recommendations
+                    SET user_executed      = TRUE,
+                        actual_entry_price = :entry,
+                        actual_qty         = :qty,
+                        executed_at        = now()
                     WHERE id = :rid AND user_id = :uid
                 """), {
                     "rid": recommendation_id, "uid": user_id,
                     "entry": entry_price, "qty": qty,
                 })
-                print(f"[Tracker] Updated strategy_recommendation for {symbol}")
-            else:
-                # No existing rec — create new MANUAL entry
-                row = s.execute(text("""
-                    INSERT INTO strategy_recommendations
-                        (user_id, symbol, strategy, user_executed,
-                         actual_entry, contracts, executed_at, rec_date)
-                    VALUES
-                        (:uid, :sym, 'MANUAL', TRUE, :entry, :qty,
-                         now(), CURRENT_DATE)
-                    ON CONFLICT DO NOTHING
-                    RETURNING id
-                """), {
-                    "uid": user_id, "sym": symbol,
-                    "entry": entry_price, "qty": qty,
-                }).fetchone()
-                if row:
-                    recommendation_id = str(row.id)
-                    print(f"[Tracker] Created strategy_recommendation for {symbol}")
+                print(f"[Tracker] Marked daily_recommendations {recommendation_id[:8]} as executed")
 
             # Pull REAL target_pct/stop_pct from the actual daily_recommendations
             # row for this ticker today — the table the current engine
@@ -261,6 +244,29 @@ def log_exit(
             """), {
                 "ep": exit_price, "pnl": round(pnl_abs, 2),
                 "won": won, "uid": user_id, "sym": symbol.upper(),
+            })
+
+            # Ground-truth close on the matching daily_recommendations row —
+            # this is the real, actually-realized outcome, distinct from
+            # mark_to_market's paper current_pnl_pct (computed for every
+            # rec whether filled or not).
+            s.execute(text("""
+                UPDATE daily_recommendations
+                SET exit_price     = :ep,
+                    exit_reason    = :reason,
+                    closed_at      = now(),
+                    actual_pnl     = :pnl_abs,
+                    actual_pnl_pct = :pnl_pct,
+                    was_correct    = :won
+                WHERE user_id = :uid AND ticker = :sym
+                  AND user_executed = TRUE AND closed_at IS NULL
+                ORDER BY executed_at DESC
+                LIMIT 1
+            """), {
+                "uid": user_id, "sym": symbol.upper(),
+                "ep": exit_price, "reason": exit_reason,
+                "pnl_abs": round(pnl_abs, 2), "pnl_pct": round(pnl_pct, 1),
+                "won": won,
             })
 
         result = {

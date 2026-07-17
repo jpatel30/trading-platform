@@ -271,6 +271,28 @@ async def startup_event():
     except Exception as e:
         print(f"[Startup] Scheduler failed: {e}")
 
+    # Auto-resume position monitoring for anyone with an active
+    # tracked position. Without this, any server restart (which
+    # happens on every --reload trigger in dev, or any crash/redeploy
+    # in production) silently stops the 15-min polling with no
+    # indication anything broke.
+    try:
+        from sqlalchemy import text as _mtext
+        from app.db.session import get_session as _mgs
+        from app.monitor.position_monitor import get_monitor
+        with _mgs() as _ms:
+            _active_users = _ms.execute(_mtext(
+                "SELECT DISTINCT user_id FROM tracked_positions WHERE is_active=TRUE"
+            )).fetchall()
+        for _u in _active_users:
+            _uid = str(_u.user_id)
+            _result = get_monitor(_uid).start()
+            print(f"[Startup] Resumed monitoring for {_uid[:8]}: {_result.get('status')}")
+        if not _active_users:
+            print("[Startup] No active tracked positions — monitor not auto-started")
+    except Exception as e:
+        print(f"[Startup] Monitor auto-resume failed: {e}")
+
 
 
 

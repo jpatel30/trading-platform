@@ -114,6 +114,32 @@ def confirm_execution(
                     recommendation_id = str(row.id)
                     print(f"[Tracker] Created strategy_recommendation for {symbol}")
 
+            # Pull REAL target_pct/stop_pct from the actual daily_recommendations
+            # row for this ticker today — the table the current engine
+            # (smart_engine/rescan_engine/daily_engine) actually writes to —
+            # instead of hardcoding a generic +20%/-40%. Falls back to those
+            # defaults only if no matching recommendation exists at all
+            # (a fully manual, off-system trade with nothing to link to).
+            real_target_pct, real_stop_pct = 20.0, -40.0
+            try:
+                rec_row = s.execute(text("""
+                    SELECT target_pct, stop_pct
+                    FROM daily_recommendations
+                    WHERE user_id = :uid AND ticker = :sym AND date = CURRENT_DATE
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                """), {"uid": user_id, "sym": symbol.upper()}).fetchone()
+                if rec_row and rec_row.target_pct is not None and rec_row.stop_pct is not None:
+                    real_target_pct = float(rec_row.target_pct)
+                    real_stop_pct   = float(rec_row.stop_pct)
+                    print(f"[Tracker] Real target/stop for {symbol}: "
+                          f"+{real_target_pct}% / {real_stop_pct}%")
+                else:
+                    print(f"[Tracker] No daily_recommendations match for {symbol} today "
+                          f"— using generic +20%/-40% defaults")
+            except Exception as e:
+                print(f"[Tracker] target/stop lookup failed, using defaults: {e}")
+
             # 3. tracked_positions — update if exists today at this price, else insert
             existing = s.execute(text("""
                 SELECT id FROM tracked_positions
@@ -143,11 +169,12 @@ def confirm_execution(
                         check_interval_min
                     ) VALUES (
                         :uid, :sym, 'recommendation', CURRENT_DATE,
-                        :entry, :qty, 20.0, -40.0, 15
+                        :entry, :qty, :tgt, :stp, 15
                     )
                 """), {
                     "uid": user_id, "sym": symbol,
                     "entry": entry_price, "qty": qty,
+                    "tgt": real_target_pct, "stp": real_stop_pct,
                 })
                 print(f"[Tracker] Created tracked_position for {symbol}")
 
@@ -159,12 +186,14 @@ def confirm_execution(
             "qty":               qty,
             "total_cost":        total_cost,
             "recommendation_id": recommendation_id,
+            "target_pct":        real_target_pct,
+            "stop_pct":          real_stop_pct,
             "monitoring":        "every 15 min during market hours",
             "message": (
                 f"✅ Logged: {qty} {symbol} contracts at ${entry_price} "
-                f"(total ${total_cost:,.0f}). "
-                f"Monitoring every 15 min. "
-                f"Discord alert fires when target or stop is hit."
+                f"(total ${total_cost:,.0f}). Monitoring every 15 min. "
+                f"Discord alert fires at +{real_target_pct}% target "
+                f"or {real_stop_pct}% stop."
             ),
         }
 

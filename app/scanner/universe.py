@@ -1,28 +1,73 @@
 """
 Scanner / Discovery Engine (Component C5).
 
+Rewritten July 2026 — removed all live broker dependency for building
+the scan universe, and removed DEFAULT_UNIVERSE (a hardcoded 36-ticker
+fallback list). The fallback made sense in the old design, where it
+was the PRIMARY path for anyone without a connected broker — now that
+the admin's own user_watchlist (always populated) is Priority 1 for
+every user, that fallback branch could only ever fire if the admin's
+watchlist somehow became empty, which would mean something is
+genuinely misconfigured. Silently substituting unrelated tickers in
+that case is the same failure mode as the EXCLUDED set / SP500
+supplement / hardcoded stock fallbacks removed elsewhere in the engine
+this session — an honest empty result is more debuggable than a silent
+substitute nobody actually chose.
+
+Design: no separate "default watchlist" table. The admin user's own
+user_watchlist rows (users.is_admin=TRUE) ARE the shared default list.
+For the admin themselves, "default" and "mine" are the same rows, so
+no special-casing is needed anywhere in this function.
+
 Priority order:
-1. Webull live watchlist (via OpenAPI — auto-loads your 127 stocks)
-2. Current Webull positions (official SDK)
-3. Extra tickers
-4. Default universe (top optionable US stocks, only if total < 5)
+1. Admin's user_watchlist rows (the shared default universe)
+2. This user's OWN user_watchlist rows, if watchlist_mode requests it
+   (a no-op for the admin — already covered by #1)
+3. Extra tickers (caller-provided, unchanged from before)
+4. Optional sector/price/market-cap filters applied to the result —
+   a real, kept capability, no longer tied to the removed fallback
 """
 from app.utils.current_user import get_current_user_id
 
-DEFAULT_UNIVERSE = [
-    "AAPL","MSFT","NVDA","GOOGL","META","AMZN","TSLA",
-    "AMD","AVGO","INTC","MU","QCOM","ARM","SNDK","WDC",
-    "JPM","GS","BAC","V","MA",
-    "SPY","QQQ","IWM","GLD","SLV",
-    "CEG","ETN","NOW","PLTR","CRM","SNOW",
-    "GEV","VRT","CRWD","IBM","MRVL",
-]
+
+def _get_admin_watchlist() -> list[str]:
+    """The shared default universe — the admin user's own user_watchlist rows."""
+    try:
+        from sqlalchemy import text
+        from app.db.session import get_session
+        with get_session() as s:
+            rows = s.execute(text("""
+                SELECT uw.ticker
+                FROM user_watchlist uw
+                JOIN users u ON u.id = uw.user_id
+                WHERE u.is_admin = TRUE
+            """)).fetchall()
+        return [r.ticker for r in rows]
+    except Exception as e:
+        print(f"[Scanner] Admin watchlist lookup failed: {e}")
+        return []
+
+
+def _get_user_watchlist(user_id: str) -> list[str]:
+    """This specific user's own watchlist rows."""
+    try:
+        from sqlalchemy import text
+        from app.db.session import get_session
+        with get_session() as s:
+            rows = s.execute(text("""
+                SELECT ticker FROM user_watchlist WHERE user_id = :uid
+            """), {"uid": user_id}).fetchall()
+        return [r.ticker for r in rows]
+    except Exception as e:
+        print(f"[Scanner] User watchlist lookup failed: {e}")
+        return []
 
 
 def get_scan_universe(
     user_id: str | None = None,
-    include_positions: bool = True,
-    include_watchlist: bool = True,
+    watchlist_mode: str = "default_plus_mine",
+    include_positions: bool = True,   # deprecated, kept for backward compat — no-op
+    include_watchlist: bool = True,   # deprecated, kept for backward compat — no-op
     filters: dict | None = None,
     extra_tickers: list[str] | None = None,
     max_tickers: int = 150,
@@ -30,11 +75,17 @@ def get_scan_universe(
     """
     Build the full scan universe for today's analysis.
 
-    Priority:
-    1. Webull live watchlist (via OpenAPI — 127 stocks auto-loaded)
-    2. Current Webull positions (official SDK)
-    3. Extra tickers (caller-provided)
-    4. Default universe (only if total < 5)
+    watchlist_mode:
+        "default_plus_mine" (default) — admin's shared list + this
+            user's own additions. For the admin, this is just their
+            own list already (default IS their list).
+        "default_only" — admin's shared list only, ignoring anything
+            this user has personally added.
+
+    No hardcoded fallback list — if the admin's watchlist is empty and
+    this user has no personal additions either, this returns an empty
+    list. That's a real, honest signal ("nothing configured to scan"),
+    not silently substituted with unrelated tickers.
     """
     if user_id is None:
         try:
@@ -42,53 +93,30 @@ def get_scan_universe(
         except Exception:
             pass
 
-    tickers = []
+    tickers: list[str] = []
 
-    # ── Priority 1: Webull live watchlist (OpenAPI) ───────────────────────────
-    if include_watchlist:
-        try:
-            from app.broker.webull_watchlist_api import get_watchlist_tickers
-            wl_tickers = get_watchlist_tickers(user_id=user_id)
-            if wl_tickers:
-                tickers.extend(wl_tickers)
-                print(f"[Scanner] Webull watchlist: {len(wl_tickers)} tickers")
-            else:
-                print("[Scanner] Webull watchlist empty — run setup_token() in webull_watchlist_api")
-        except Exception as e:
-            print(f"[Scanner] Watchlist unavailable: {e}")
+    # ── Priority 1: admin's shared default list ───────────────────────────────
+    admin_list = _get_admin_watchlist()
+    if admin_list:
+        tickers.extend(admin_list)
+        print(f"[Scanner] Default (admin) watchlist: {len(admin_list)} tickers")
+    else:
+        print("[Scanner] ⚠️ Default (admin) watchlist is empty")
 
-    # ── Priority 2: Current Webull positions ──────────────────────────────────
-    if include_positions and user_id:
-        try:
-            from app.broker.webull_connector import WebullConnector
-            wb  = WebullConnector(user_id)
-            pos = wb.get_positions()
-            pos_tickers = [
-                p["symbol"].split()[0]
-                for p in pos
-                if p.get("instrument_type") == "STOCK"
-            ]
-            new = [t for t in pos_tickers if t not in tickers]
-            if new:
-                tickers.extend(new)
-                print(f"[Scanner] Positions: {len(new)} new tickers added")
-        except Exception as e:
-            print(f"[Scanner] Positions unavailable: {e}")
+    # ── Priority 2: this user's own additions ─────────────────────────────────
+    if watchlist_mode == "default_plus_mine" and user_id:
+        mine = _get_user_watchlist(user_id)
+        new  = [t for t in mine if t not in tickers]
+        if new:
+            tickers.extend(new)
+            print(f"[Scanner] My watchlist: {len(new)} additional tickers")
 
-    # ── Priority 3: Extra tickers ─────────────────────────────────────────────
+    # ── Priority 3: extra tickers ─────────────────────────────────────────────
     if extra_tickers:
         for t in extra_tickers:
             t = t.upper().strip()
             if t and t not in tickers:
                 tickers.append(t)
-
-    # ── Priority 4: Default universe if still nearly empty ────────────────────
-    if len(tickers) < 5:
-        filtered = _apply_filters(DEFAULT_UNIVERSE, filters or {})
-        for t in filtered:
-            if t not in tickers:
-                tickers.append(t)
-        print(f"[Scanner] Default universe: {len(filtered)} tickers")
 
     # ── Deduplicate + cap ─────────────────────────────────────────────────────
     seen, result = set(), []
@@ -98,7 +126,14 @@ def get_scan_universe(
             seen.add(t)
             result.append(t)
 
-    print(f"[Scanner] Final universe: {len(result)} tickers")
+    # ── Optional filters — applied to the real universe, not a fallback ──────
+    if filters:
+        result = _apply_filters(result, filters)
+
+    if not result:
+        print("[Scanner] ⚠️ Final universe is EMPTY — no watchlist configured")
+    else:
+        print(f"[Scanner] Final universe: {len(result)} tickers")
     return result
 
 
@@ -136,6 +171,7 @@ def get_scan_universe_mcp(
     min_market_cap: float = 0,
     sectors: list[str] | None = None,
     min_price: float = 0,
+    watchlist_mode: str = "default_plus_mine",
 ) -> list[str]:
     """MCP-friendly wrapper for get_scan_universe."""
     filters = {}
@@ -146,8 +182,7 @@ def get_scan_universe_mcp(
     if min_price > 0:
         filters["min_price"] = min_price
     return get_scan_universe(
-        include_positions=True,
-        include_watchlist=True,
+        watchlist_mode=watchlist_mode,
         filters=filters,
         extra_tickers=extra_tickers or [],
     )

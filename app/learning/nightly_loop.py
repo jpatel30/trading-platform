@@ -7,7 +7,7 @@ Does NOT run on weekends or holidays.
 Steps each night:
     1. Pull today's closed positions (Webull positions that disappeared)
     2. Match against sell_recommendations → update was_correct
-    3. Match against strategy_recommendations → update outcomes
+    3. Recalibrate conviction weights from daily_recommendations
     4. Recalibrate conviction weights (if 10+ closed trades)
     5. Generate nightly learning summary
     6. Store in learning_log
@@ -139,15 +139,17 @@ def recalibrate_conviction_weights(user_id: str) -> dict:
         from collections import defaultdict
 
         with get_session() as s:
+            # was_correct now lives directly on daily_recommendations
+            # (populated by prediction_tracker.log_exit()) — no JOIN needed,
+            # and this correctly sees every trade closed through the
+            # current fill-tracking flow, not just the old
+            # strategy_recommendations path.
             rows = s.execute(text("""
-                SELECT dr.conviction_breakdown, sr.was_correct
-                FROM daily_recommendations dr
-                JOIN strategy_recommendations sr
-                    ON dr.ticker  = sr.symbol
-                    AND dr.date   = sr.rec_date
-                WHERE dr.user_id = :uid
-                  AND sr.was_correct IS NOT NULL
-                  AND dr.conviction_breakdown IS NOT NULL
+                SELECT conviction_breakdown, was_correct
+                FROM daily_recommendations
+                WHERE user_id = :uid
+                  AND was_correct IS NOT NULL
+                  AND conviction_breakdown IS NOT NULL
             """), {"uid": user_id}).fetchall()
 
         if len(rows) < MIN_TRADES_FOR_RECALIBRATION:

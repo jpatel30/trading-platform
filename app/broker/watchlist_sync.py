@@ -129,29 +129,33 @@ def sync_with_webull(user_id: str, force: bool = False) -> dict:
         # Get current DB tickers
         db_tickers = set(get_db_watchlist(user_id))
 
-        # Compare sets
-        to_add    = webull_tickers - db_tickers
-        to_remove = db_tickers - webull_tickers
-
-        added   = add_to_db_watchlist(user_id, list(to_add), source="webull")
-        removed = remove_from_db_watchlist(user_id, list(to_remove))
+        # ADD-ONLY sync. Previously this also deleted anything in the DB
+        # that wasn't present in live Webull (to_remove = db - webull) —
+        # correct under the old design where Webull was the sole source
+        # of truth, but actively wrong now: user_watchlist is the real
+        # source of truth (scanning, and every user without a broker,
+        # depend on it directly). That old behavior meant any manually
+        # added ticker not mirrored in Webull would silently get deleted
+        # on the next sync. Webull can still ADD tickers it finds as a
+        # convenience — it never removes anything anymore.
+        to_add = webull_tickers - db_tickers
+        added  = add_to_db_watchlist(user_id, list(to_add), source="webull")
 
         _last_sync[user_id] = now
 
         result = {
             "status":    "synced",
             "added":     list(to_add),
-            "removed":   list(to_remove),
             "unchanged": len(webull_tickers & db_tickers),
-            "total":     len(webull_tickers),
+            "total":     len(db_tickers) + len(to_add),
             "synced_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
 
-        if to_add or to_remove:
-            print("[Watchlist] Sync: +{} added, -{} removed, {} unchanged".format(
-                len(to_add), len(to_remove), result["unchanged"]))
+        if to_add:
+            print("[Watchlist] Sync: +{} added from Webull, {} unchanged".format(
+                len(to_add), result["unchanged"]))
         else:
-            print("[Watchlist] Sync: {} tickers, no changes".format(len(webull_tickers)))
+            print("[Watchlist] Sync: no new tickers from Webull".format())
 
         return result
 

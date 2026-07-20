@@ -181,7 +181,8 @@ def get_stock_for_horizon(
 ) -> dict:
     """Build stock recommendation for 3m / 6m / 1yr horizon."""
     from app.recommendations.fundamentals import (
-        get_fundamentals, get_dp_accumulation_score, score_fundamentals
+        get_fundamentals, get_dp_accumulation_score, score_fundamentals,
+        analyst_target_reliability,
     )
 
     config = HORIZON_CONFIG.get(horizon, HORIZON_CONFIG["6m"])
@@ -211,7 +212,23 @@ def get_stock_for_horizon(
 
     momentum = _get_momentum(ticker, horizon)
 
-    analyst_target = fundamentals.get("target_mean_price")
+    # Discount the raw analyst mean target by the same reliability factor
+    # smart_stock_scan.py uses for ranking (thin coverage below ~$15 and
+    # wide analyst low/high disagreement both reduce trust) — otherwise a
+    # single-analyst-outlier target inflates the shown target_price even
+    # though it's already discounted out of the fundamental_score gate above.
+    raw_analyst_target = fundamentals.get("target_mean_price")
+    analyst_target      = raw_analyst_target
+    reliability          = 1.0
+    if raw_analyst_target and current_price > 0:
+        reliability = analyst_target_reliability(
+            current_price,
+            fundamentals.get("target_low_price", 0) or 0,
+            fundamentals.get("target_high_price", 0) or 0,
+            raw_analyst_target,
+        )
+        analyst_target = current_price + (raw_analyst_target - current_price) * reliability
+
     momentum_target = current_price * (1 + STOCK_UPSIDE_TARGETS.get(horizon, 0.25))
 
     if analyst_target and analyst_target > current_price:
@@ -266,7 +283,9 @@ def get_stock_for_horizon(
         "fundamental_breakdown": fund_score["breakdown"],
         "dp_score":          dp["score"],
         "dp_note":           dp["note"],
-        "analyst_target":    analyst_target,
+        "analyst_target":    round(analyst_target, 2) if analyst_target else analyst_target,
+        "raw_analyst_target": raw_analyst_target,  # undiscounted, for transparency
+        "analyst_reliability": reliability,
         "analyst_rec":       fundamentals.get("analyst_recommendation"),
         "analyst_count":     fundamentals.get("analyst_count"),
         "revenue_growth":    fundamentals.get("revenue_growth"),
@@ -445,6 +464,47 @@ def scan_for_horizon(
         print("[HorizonScan] No user_id — cannot resolve a watchlist, returning empty universe")
 
     print(f"[HorizonScan] {horizon} — scanning {len(tickers)} tickers...")
+
+    # Pure stock horizons (6m/1yr) delegate to smart_stock_scan.py's
+    # composite fundamentals+velocity+insider pre-filter instead of a naive
+    # per-ticker loop — the same engine the web dashboard's stock scan
+    # already uses (previously only reachable from the web, never MCP), so
+    # get_scan_universe-wide stock picks are the same quality regardless of
+    # channel. "options"/"both" horizons are unaffected — options selection
+    # and 3m's combined options+stock loop are unchanged.
+    if rec_type == "stock" and user_id:
+        from app.recommendations.smart_stock_scan import run_smart_stock_scan
+
+        market_open   = _is_market_open()
+        next_day_flag = not market_open
+        scan_result   = run_smart_stock_scan(
+            user_id, horizon=horizon, budget=budget, top_n=top_n, tickers=tickers,
+        )
+        results = [
+            {
+                "ticker":       stock_rec.get("ticker", ""),
+                "horizon":      horizon,
+                "label":        config["label"],
+                "description":  config["description"],
+                "market_open":  market_open,
+                "next_day":     next_day_flag,
+                "stock_rec":    stock_rec,
+                "primary_rec":  "stock",
+            }
+            for stock_rec in scan_result.get("stocks", [])
+        ]
+        elapsed = round(time.time()-t0, 1)
+        print(f"[HorizonScan] Done in {elapsed}s — {len(results)} passed "
+              f"(smart_stock_scan, {scan_result.get('scored',0)} scored)")
+        return {
+            "horizon":         horizon,
+            "label":           config["label"],
+            "recommendations": results[:top_n],
+            "filtered_count":  max(scan_result.get("scored", 0) - len(results), 0),
+            "total_scanned":   len(tickers),
+            "elapsed":         elapsed,
+            "date":            date.today().isoformat(),
+        }
 
     results  = []
     filtered = []

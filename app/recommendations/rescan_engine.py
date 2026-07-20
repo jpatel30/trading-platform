@@ -2,28 +2,34 @@
 Rescan with Validation — keeps picks consistent through the day.
 
 Flow:
-  1. Load morning picks from daily_recommendations (filtered by horizon + expiry range)
+  1. Load morning picks from daily_recommendations (matched by exact
+     trading_window_days — a scan run with a different window than an
+     earlier one today should NOT reload those as "morning picks")
   2. Get fresh signals for same tickers + watchlist
   3. LLM evaluates each morning pick: INTACT / UPDATED / BROKEN
   4. LLM finds NEW picks from remaining candidates
   5. Merge: sort by conviction descending
   6. Result: stable picks unless market proves them wrong
 
-Rewritten July 2026 — found a THIRD hidden copy of the flow/dark-pool
-scoring bug, living in the nested `_tf` helper used for per-ticker UW
-rotation fill-in (the top-level batch_flow/batch_dp block had already
-been fixed earlier tonight; this nested one was missed since it's not
-a top-level function). Also fixed target_pct being hardcoded to 0 for
-every rescan-generated pick (mark-to-market/backtest math downstream
-never had a real number to work with for these rows), and threaded the
-real user_id into _enrich_ticker (was silently getting 0% velocity in
-the LLM's context — see smart_engine.py rewrite notes).
+Rewritten July 2026 (second pass) — replaced the horizon-bucket string
+("1w"/"1m"/etc, each with its own hardcoded DTE range) with direct
+user inputs: trading_window_days, stop_loss_pct, profit_target_pct.
+Strike/strategy selection is UNCHANGED — still driven by flow/TA/IV
+signals and the R/R + EV gates built earlier this session. The window
+only determines WHICH EXPIRY to target; stop/profit percentages are
+applied directly to the stored recommendation (and, via the existing
+fill-tracking fix, flow straight through to tracked_positions — the
+user's own numbers drive their alerts, not a bucket default).
 """
 import json
 import time
 from datetime import datetime
 
 from app.signals.flow_scoring import compute_flow_score, compute_dp_score
+from app.utils.trade_windows import (
+    round_budget, validate_trading_window, validate_pct,
+    compute_target_date, nearest_friday_to,
+)
 
 
 STATUS_INTACT  = "INTACT"
@@ -32,8 +38,13 @@ STATUS_BROKEN  = "BROKEN"
 STATUS_NEW     = "NEW"
 
 
-def _load_todays_recs(user_id: str, horizon: str = "", min_exp: str = "", max_exp: str = "") -> list[dict]:
-    """Load today's active recommendations from DB."""
+def _load_todays_recs(user_id: str, window_str: str = "") -> list[dict]:
+    """
+    Load today's active recommendations from DB, matched by the exact
+    window string (e.g. '7d') this scan was run with — a scan run with
+    a DIFFERENT window earlier today should not be reloaded as if it
+    were this scan's own morning picks.
+    """
     try:
         from sqlalchemy import text
         from app.db.session import get_session
@@ -43,16 +54,14 @@ def _load_todays_recs(user_id: str, horizon: str = "", min_exp: str = "", max_ex
                        conviction_score, thesis, webull_instructions,
                        legs, entry_debit, webull_limit_price, max_profit, max_loss,
                        risk_reward, invalidation_conditions, key_news,
-                       signal_data, created_at
+                       signal_data, created_at, target_pct, stop_pct
                 FROM daily_recommendations
                 WHERE user_id=:uid AND date=CURRENT_DATE AND status='ACTIVE'
                   AND strategy != 'STOCK'
                   AND legs IS NOT NULL AND jsonb_array_length(legs) > 0
-                  AND (:horizon = '' OR horizon = :horizon)
-                  AND (:min_exp = '' OR expiry >= CAST(:min_exp AS date))
-                  AND (:max_exp = '' OR expiry <= CAST(:max_exp AS date))
+                  AND (:window_str = '' OR horizon = :window_str)
                 ORDER BY conviction_score DESC
-            """), {"uid": user_id, "horizon": horizon, "min_exp": min_exp, "max_exp": max_exp}).fetchall()
+            """), {"uid": user_id, "window_str": window_str}).fetchall()
 
         picks = []
         for r in rows:
@@ -68,6 +77,8 @@ def _load_todays_recs(user_id: str, horizon: str = "", min_exp: str = "", max_ex
                 "max_profit": float(r.max_profit or 0),
                 "max_loss": float(r.max_loss or 0), "risk_reward": float(r.risk_reward or 0),
                 "invalidation": r.invalidation_conditions or "", "key_news": r.key_news or "",
+                "target_pct": float(r.target_pct) if r.target_pct is not None else None,
+                "stop_pct": float(r.stop_pct) if r.stop_pct is not None else None,
                 "market_view": sd.get("market_view", ""), "status": STATUS_INTACT,
                 "status_reason": "", "scan_time": str(r.created_at)[:16] if r.created_at else "",
             })
@@ -93,7 +104,9 @@ def _format_morning_pick(pick: dict) -> str:
 def _build_validation_prompt(
     morning_picks: list[dict], fresh_candidates: list[dict], vix: dict,
     global_news: list[dict], budget: float, today: str,
-    regime: dict | None = None, horizon: str = "1w",
+    regime: dict | None = None,
+    trading_window_days: int = 7,
+    target_expiry: str = "",
 ) -> str:
     if morning_picks:
         mp_block = "\n\n".join(_format_morning_pick(p) for p in morning_picks)
@@ -122,24 +135,7 @@ BROKEN  → price moved significantly AGAINST thesis OR thesis condition violate
             f"\nOVERALL BIAS: {regime.get('overall_bias','?')} — {regime.get('strategy_hint','')}"
         )
 
-    _horizon_labels = {"1w":"1 WEEK","2w":"2 WEEKS","1m":"1 MONTH","3m":"3 MONTHS","6m":"6 MONTHS"}
-    from datetime import date, timedelta
-    _today_dt = date.today()
-    _expiry_guidance = {
-        "1w":  f"MUST use expiry between {(_today_dt+timedelta(3)).strftime('%Y-%m-%d')} and {(_today_dt+timedelta(7)).strftime('%Y-%m-%d')}",
-        "2w":  f"MUST use expiry between {(_today_dt+timedelta(8)).strftime('%Y-%m-%d')} and {(_today_dt+timedelta(14)).strftime('%Y-%m-%d')}",
-        "1m":  f"MUST use expiry between {(_today_dt+timedelta(21)).strftime('%Y-%m-%d')} and {(_today_dt+timedelta(45)).strftime('%Y-%m-%d')}",
-        "3m":  f"MUST use expiry between {(_today_dt+timedelta(60)).strftime('%Y-%m-%d')} and {(_today_dt+timedelta(90)).strftime('%Y-%m-%d')}",
-        "6m":  f"MUST use expiry between {(_today_dt+timedelta(120)).strftime('%Y-%m-%d')} and {(_today_dt+timedelta(180)).strftime('%Y-%m-%d')}",
-    }
-    horizon_label   = _horizon_labels.get(horizon or "1w", "SHORT TERM")
-    expiry_guidance = _expiry_guidance.get(horizon or "1w", "Pick appropriate expiry from candidate list.")
-
-    from datetime import date as _d2, timedelta as _td2
-    _example_offsets = {"1w":5,"2w":11,"1m":30,"3m":75,"6m":150}
-    _example_expiry  = (_d2.today() + _td2(_example_offsets.get(horizon or "1w", 30))).strftime("%Y-%m-%d")
-
-    return f"""You are managing real money. Today is {today}. Budget: ${budget:.0f}.
+    return f"""You are managing real money. Today is {today}. Budget: ${budget:.2f}.
 
 MARKET: VIX {vix.get('current', 17)} ({vix.get('zone','NORMAL')}) | {vix.get('trend','STABLE')}{regime_str}
 NEWS: {news_str}
@@ -151,7 +147,7 @@ NEWS: {news_str}
 
 === YOUR TASK ===
 1. Validate each morning pick (INTACT/UPDATED/BROKEN)
-2. REQUIRED: Always include SPY (this week expiry) and QQQ (next week expiry) in new_picks
+2. REQUIRED: Always include SPY and QQQ in new_picks
    - Decide direction based on VIX trend + market flow
    - Pick best strategy: NAKED_CALL, NAKED_PUT, DEBIT_CALL_SPREAD, DEBIT_PUT_SPREAD, STRADDLE, STRANGLE, IRON_CONDOR
    - If VIX FALLING + bullish flow → CALL strategy; if VIX RISING → PUT or STRADDLE
@@ -159,10 +155,13 @@ NEWS: {news_str}
 4. Return morning_status for existing picks + new_picks ranked by conviction
 
 ⚠️  USE EXACT PRICES SHOWN ABOVE — do NOT use your training data prices.
-SPY trades around $750, QQQ around $720 as of today. Use the price shown in brackets.
 
-HORIZON: {horizon_label}
-{expiry_guidance}
+TARGET EXPIRY: user requested a {trading_window_days}-day trading window
+(today + {trading_window_days} days, rolled to the next open trading day = {target_expiry}).
+For each ticker, pick whichever expiry from that ticker's own listed
+expiries (shown above) is CLOSEST to {target_expiry}. Real listed
+expiries are fixed by the exchange — pick the nearest one available,
+not an arbitrary date.
 
 STRATEGY SELECTION (MANDATORY — pick based on conditions):
   VIX STEEP_CONTANGO + NEUTRAL regime → IRON_CONDOR preferred (sell both sides, collect premium)
@@ -172,11 +171,10 @@ STRATEGY SELECTION (MANDATORY — pick based on conditions):
   SPY/QQQ in NEUTRAL market → IRON_CONDOR is best fit
 
 STRIKE RULES:
-- Debit call spread: buy_strike LOWER than sell_strike (e.g. buy $750C sell $760C)
-- Debit put spread: buy_strike HIGHER than sell_strike (e.g. buy $750P sell $740P)
+- Debit call spread: buy_strike LOWER than sell_strike
+- Debit put spread: buy_strike HIGHER than sell_strike
 - Naked call/put: buy_strike = ATM or slightly OTM, sell_strike = 0
 - Iron condor: buy_strike = lower put, sell_strike = upper call (wider = safer)
-- SPREAD WIDTH: 1W=$2-5, 2W=$5-10, 1M=$10-20, 3M=$20-40
 - Max 8% OTM from current price
 
 Respond ONLY with compact JSON — no prose, no markdown:
@@ -187,19 +185,25 @@ Respond ONLY with compact JSON — no prose, no markdown:
   }},
   "new_picks": [
     {{"ticker": "SPY", "direction": "NEUTRAL", "strategy": "IRON_CONDOR",
-     "expiry": "{_example_expiry}", "buy_strike": 730.0, "sell_strike": 770.0,
+     "expiry": "{target_expiry}", "buy_strike": 730.0, "sell_strike": 770.0,
      "reasoning": "brief", "key_risk": "brief", "confidence": 72}},
     {{"ticker": "X", "direction": "BULLISH", "strategy": "NAKED_CALL",
-     "expiry": "{_example_expiry}", "buy_strike": 0.0, "sell_strike": 0.0,
+     "expiry": "{target_expiry}", "buy_strike": 0.0, "sell_strike": 0.0,
      "reasoning": "brief", "key_risk": "brief", "confidence": 70}}
   ]
 }}"""
 
 
 def rescan_with_validation(
-    user_id: str, budget: float = 2000.0, pre_scanned: list | None = None,
-    sector: str | None = None, cap_size: str | None = None,
-    catalyst: str | None = None, horizon: str = "",
+    user_id: str,
+    budget: float = 2000.0,
+    pre_scanned: list | None = None,
+    sector: str | None = None,
+    cap_size: str | None = None,
+    catalyst: str | None = None,
+    trading_window_days: int = 7,
+    stop_loss_pct: float = 40.0,
+    profit_target_pct: float = 50.0,
 ) -> dict:
     from app.recommendations.smart_engine import (
         _build_earnings_map, _enrich_ticker, _call_smart_llm,
@@ -215,29 +219,38 @@ def rescan_with_validation(
     from app.utils.scan_status import set_scan_status
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
+    from app.recommendations.daily_engine import _check_api_health, _upsert_recommendation
+
     t_start = time.time()
     today   = datetime.now().strftime("%A %B %d, %Y")
 
     set_scan_status(user_id, "queued")
 
-    _horizon_map = {"1w":"1w","2w":"2w","1m":"1m","3m":"3m","6m":"6m",
-                    "17d":"1w","30d":"1m","21d":"2w","90d":"3m","180d":"6m"}
-    _norm_horizon = _horizon_map.get(horizon, horizon) if horizon else ""
+    # Pre-flight data-quality gate — skip a 60-80s scan (LLM call included)
+    # against degraded upstream APIs rather than burning it on a low-quality
+    # result. Ported from the old daily_engine.py scan path.
+    api_health = _check_api_health()
+    if api_health["data_quality"] < 0.5:
+        return {
+            "picks": [], "error": "insufficient_data",
+            "message": f"API health too low ({api_health['data_quality']:.0%}) — retry at {api_health['retry_at']}",
+            "api_health": api_health,
+            "elapsed": round(time.time()-t_start, 1),
+        }
 
-    from datetime import date as _date, timedelta as _td
-    _today_d = _date.today()
-    _expiry_ranges = {
-        "1w":  (_today_d + _td(1),   _today_d + _td(9)),
-        "2w":  (_today_d + _td(8),   _today_d + _td(16)),
-        "1m":  (_today_d + _td(18),  _today_d + _td(50)),
-        "3m":  (_today_d + _td(55),  _today_d + _td(100)),
-        "6m":  (_today_d + _td(110), _today_d + _td(200)),
-    }
-    _range = _expiry_ranges.get(_norm_horizon, (None, None))
-    _min_exp = _range[0].strftime("%Y-%m-%d") if _range[0] else ""
-    _max_exp = _range[1].strftime("%Y-%m-%d") if _range[1] else ""
+    # Validate/normalize the user's real inputs — never silently
+    # substitute a default the user didn't ask for.
+    budget               = round_budget(budget)
+    trading_window_days  = validate_trading_window(trading_window_days, "option")
+    stop_loss_pct        = validate_pct(stop_loss_pct, "stop_loss_pct")
+    profit_target_pct    = validate_pct(profit_target_pct, "profit_target_pct")
 
-    morning_picks = _load_todays_recs(user_id, horizon=_norm_horizon, min_exp=_min_exp, max_exp=_max_exp)
+    target_expiry = compute_target_date(trading_window_days)
+    window_str    = f"{trading_window_days}d"
+    print(f"[Rescan] window={window_str} target_expiry={target_expiry} "
+          f"stop={stop_loss_pct}% target={profit_target_pct}%")
+
+    morning_picks = _load_todays_recs(user_id, window_str=window_str)
     print(f"[Rescan] {len(morning_picks)} morning picks loaded")
     set_scan_status(user_id, "prices")
 
@@ -250,6 +263,20 @@ def rescan_with_validation(
     else:
         from app.scanner.universe import get_scan_universe
         tickers = get_scan_universe(user_id=user_id)
+
+        # Don't recommend buying more of what's already held as a new
+        # entry. Best-effort — a broker-fetch failure should never block
+        # the scan itself.
+        try:
+            from app.broker.webull_connector import WebullConnector
+            portfolio_syms = {p["symbol"] for p in WebullConnector(user_id).get_positions()}
+            tickers_filtered = [t for t in tickers if t not in portfolio_syms]
+            removed = len(tickers) - len(tickers_filtered)
+            if removed > 0:
+                print(f"[Rescan] Removed {removed} portfolio tickers from buy universe")
+            tickers = tickers_filtered
+        except Exception as e:
+            print(f"[Rescan] Portfolio filter failed: {e} — using full universe")
 
     vix         = _build_vix_context()
     global_news = _build_global_news()
@@ -303,20 +330,12 @@ def rescan_with_validation(
     else:
         picks = quick_scan(tickers, user_id=user_id, top_n=15)
 
-    def _next_friday(weeks=0):
-        from datetime import date, timedelta
-        today = date.today()
-        days = (4 - today.weekday()) % 7 or 7
-        return (today + timedelta(days=days + weeks*7)).strftime("%Y-%m-%d")
-
     import yfinance as _yf
     _spy_p = _yf.Ticker("SPY").fast_info.last_price or 0
     _qqq_p = _yf.Ticker("QQQ").fast_info.last_price or 0
 
-    _horizon_weeks = {"1w":0,"2w":1,"1m":3,"3m":8,"6m":20}
-    _idx_weeks = _horizon_weeks.get(_norm_horizon or "1w", 1)
-    _spy_exp = _next_friday(_idx_weeks)
-    _qqq_exp = _next_friday(_idx_weeks + 1)
+    _spy_exp = nearest_friday_to(target_expiry)
+    _qqq_exp = nearest_friday_to(target_expiry)
 
     index_candidates = [
         {"ticker": "SPY", "direction": "UNKNOWN", "price": _spy_p, "confidence": 75,
@@ -326,7 +345,8 @@ def rescan_with_validation(
          "change_pct": 0, "flow_score": 0, "dp_score": 0, "sweeps": 0,
          "alert_count": 0, "score": 1.0, "signals": ["index"], "forced_expiry": _qqq_exp},
     ]
-    print(f"[Rescan] SPY=${_spy_p:.2f} exp={_spy_exp} | QQQ=${_qqq_p:.2f} exp={_qqq_exp} (horizon={_norm_horizon})")
+    print(f"[Rescan] SPY=${_spy_p:.2f} exp={_spy_exp} | QQQ=${_qqq_p:.2f} exp={_qqq_exp} "
+          f"(window={trading_window_days}d, target={target_expiry})")
     set_scan_status(user_id, "enriching")
 
     for ip in index_candidates:
@@ -352,8 +372,11 @@ def rescan_with_validation(
     print(f"[Rescan] Enriched {len(enriched)} candidates in {time.time()-t_start:.1f}s")
     set_scan_status(user_id, "llm_thinking")
 
-    prompt = _build_validation_prompt(morning_picks, enriched, vix, global_news, budget, today,
-                                       regime=regime, horizon=_norm_horizon or "1w")
+    prompt = _build_validation_prompt(
+        morning_picks, enriched, vix, global_news, budget, today,
+        regime=regime, trading_window_days=trading_window_days,
+        target_expiry=target_expiry,
+    )
     llm_result = _call_smart_llm(prompt)
     set_scan_status(user_id, "llm_done")
 
@@ -407,7 +430,7 @@ def rescan_with_validation(
         rec = {
             "ticker": ticker, "direction": llm_pick.get("direction", "BULLISH"),
             "strategy": llm_pick.get("strategy", "DEBIT_CALL_SPREAD"),
-            "expiry": llm_pick.get("expiry", ""), "dte": llm_pick.get("dte", 17),
+            "expiry": llm_pick.get("expiry", ""), "dte": llm_pick.get("dte", trading_window_days),
             "buy_strike": llm_pick.get("buy_strike", 0), "sell_strike": llm_pick.get("sell_strike", 0),
             "reasoning": llm_pick.get("reasoning", ""), "key_risk": llm_pick.get("key_risk", ""),
             "catalyst": llm_pick.get("catalyst", ""), "confidence": llm_pick.get("confidence", 65),
@@ -418,30 +441,43 @@ def rescan_with_validation(
             trade["status"]        = STATUS_NEW
             trade["status_reason"] = "Fresh pick"
             trade["confidence"]    = rec["confidence"]
+            # These get written to the DB below via _upsert_recommendation —
+            # also carry them on the returned object itself so the caller
+            # (and this session's own verification) can actually see them,
+            # instead of only existing silently inside the DB row.
+            trade["target_pct"]    = profit_target_pct
+            trade["stop_pct"]      = -stop_loss_pct
             final.append(trade)
 
             try:
-                from app.recommendations.daily_engine import _upsert_recommendation
                 legs = trade.get("legs", [])
-                # target_pct now real (risk_reward × 100), not hardcoded 0 —
-                # mark-to-market/backtest need an actual number here.
-                rr_pct = round((trade.get("risk_reward") or 0) * 100, 1)
+                entry_basis = abs(trade.get("entry_debit", 0))
                 _upsert_recommendation(user_id, {
-                    "ticker": ticker, "horizon": _norm_horizon or trade.get("horizon","1w"),
+                    "ticker": ticker, "horizon": window_str,
                     "direction": trade.get("direction",""),
                     "conviction_score": trade.get("confidence",65),
                     "conviction_tier": "HIGH" if trade.get("confidence",0)>=75 else "MODERATE",
                     "act_now": trade.get("confidence",0)>=70, "position_size_guidance": "standard",
                     "thesis": rec.get("reasoning",""),
-                    "entry_zone_low": abs(trade.get("entry_debit",0)),
-                    "entry_zone_high": abs(trade.get("entry_debit",0))*1.05,
-                    "entry_trigger": "AT_MARKET", "target_price": 0, "target_pct": rr_pct,
-                    "stop_price": 0, "stop_pct": -40.0,
-                    "timeframe": f"{trade.get('dte',17)} days",
+                    "entry_zone_low": entry_basis,
+                    "entry_zone_high": entry_basis*1.05,
+                    "entry_trigger": "AT_MARKET",
+                    # Real user inputs — not a derived risk_reward figure,
+                    # not a horizon-bucket default. These flow straight
+                    # through to tracked_positions on confirm_execution.
+                    # target_price/stop_price computed from entry_basis so
+                    # format_daily_recommendations() shows real dollar
+                    # figures instead of a hardcoded $0.
+                    "target_price": round(entry_basis * (1 + profit_target_pct/100), 2),
+                    "target_pct": profit_target_pct,
+                    "stop_price": round(entry_basis * (1 - stop_loss_pct/100), 2),
+                    "stop_pct": -stop_loss_pct,
+                    "timeframe": f"{trading_window_days} days",
                     "invalidation_conditions": rec.get("key_risk",""),
                     "strategy": trade.get("strategy",""), "expiry": trade.get("expiry",""),
-                    "dte": trade.get("dte",17), "legs": legs, "entry_debit": trade.get("entry_debit",0),
-                    "webull_limit_price": trade.get("webull_limit_price",0),
+                    "dte": trade.get("dte",trading_window_days), "legs": legs,
+                    "entry_debit": trade.get("entry_debit",0),
+                    "webull_limit_price": trade.get("webull_limit_price", 0),
                     "total_cost": trade.get("total_cost",0),
                     "max_profit": trade.get("max_profit_per_contract",0),
                     "max_loss": trade.get("max_loss_per_contract",0),
@@ -495,4 +531,6 @@ def rescan_with_validation(
     return {
         "picks": final, "market_view": llm_result.get("market_view",""),
         "source": "rescan_validated", "elapsed": elapsed, "vix": vix.get("current"), "date": today,
+        "trading_window_days": trading_window_days, "target_expiry": target_expiry,
+        "stop_loss_pct": stop_loss_pct, "profit_target_pct": profit_target_pct,
     }

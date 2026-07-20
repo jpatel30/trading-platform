@@ -45,6 +45,10 @@ class Settings(BaseSettings):
     mcp_server_host: str = "0.0.0.0"
     mcp_server_port: int = 8765
     mcp_api_key: str = ""
+    # "stdio" (default): local Claude Desktop subprocess, single user, no
+    # bearer auth needed. "http": remote, one shared process serving many
+    # customers - each authenticated per-request via ApiKeyTokenVerifier.
+    mcp_transport: str = "stdio"
 
 
 settings = Settings()

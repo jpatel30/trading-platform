@@ -34,10 +34,12 @@ Rewritten July 2026 (second pass) — two fixes:
    the ~30s runtime (previously this function never called
    set_scan_status at all).
 
-Note: this fixes WHICH tickers reach Phase 2 (top 10) and their
-fund_score. It does NOT touch the flat 8% stop / target_pct / R:R
-display math for whichever tickers DO surface — that lives in
-get_stock_for_horizon (horizon_engine.py), a separate file.
+The reliability discount now lives in fundamentals.py
+(analyst_target_reliability()), shared with get_stock_for_horizon
+(horizon_engine.py) — originally this fixed only WHICH tickers reach
+Phase 2 and their fund_score here, leaving the target_price shown to
+the user (computed in horizon_engine.py, a separate file) undiscounted;
+both now use the same function.
 """
 import time
 import logging
@@ -45,6 +47,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from app.signals.flow_scoring import compute_flow_score, compute_dp_score
 from app.utils.scan_status import set_scan_status
+from app.recommendations.fundamentals import analyst_target_reliability
 
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 
@@ -121,41 +124,6 @@ def _fetch_velocity_realtime(ticker: str) -> dict:
         return {"score": 50, "velocity": 0, "direction": "NEUTRAL"}
 
 
-def _reliability_factor(price: float, low: float, high: float, mean: float) -> float:
-    """
-    0.0-1.0 confidence multiplier for an analyst target, using only
-    data already fetched — no extra network calls.
-
-      Price level:  thin analyst coverage, wide bid/ask spreads, and
-                     outsized single-analyst-outlier risk make mean
-                     targets on sub-$15 names systematically less
-                     trustworthy. Ramps 0.35 (<=$3) to 1.0 (>=$15),
-                     not a hard cutoff — a $12 stock still counts,
-                     just partially discounted.
-      Dispersion:   if analyst low/high disagree widely relative to
-                     the mean, "consensus" is barely a consensus.
-                     Tight agreement (<=30% spread/mean) = full trust;
-                     150%+ spread = heavily discounted.
-    """
-    if not mean or mean <= 0:
-        return 0.5
-
-    if price >= 15:
-        price_factor = 1.0
-    elif price >= 3:
-        price_factor = 0.35 + (price - 3) / 12 * 0.65
-    else:
-        price_factor = 0.35
-
-    if low and high and high > low:
-        spread_pct = (high - low) / mean
-        dispersion_factor = max(0.3, 1.0 - max(0, spread_pct - 0.3) / 1.2)
-    else:
-        dispersion_factor = 0.6  # unknown spread — moderate discount, not full trust
-
-    return round(price_factor * dispersion_factor, 3)
-
-
 def _score_ticker(ticker, fd, target, velocity, insider) -> dict:
     """Pure math — zero network calls, zero timeouts."""
     price = fd.get("price", 0)
@@ -189,7 +157,7 @@ def _score_ticker(ticker, fd, target, velocity, insider) -> dict:
                         "reason": f"overvalued {raw_upside_pct:.1f}%"}
             low  = target.get("low", 0)  if isinstance(target, dict) else 0
             high = target.get("high", 0) if isinstance(target, dict) else 0
-            reliability = _reliability_factor(price, low, high, mean)
+            reliability = analyst_target_reliability(price, low, high, mean)
             upside_pct  = raw_upside_pct * reliability  # discounted — this is what scores
             upside_score = min(max(upside_pct, 0), 100)
             fund_score   = upside_score*0.40 + 40*0.30 + 30*0.20 + 50*0.10
@@ -213,14 +181,22 @@ def _score_ticker(ticker, fd, target, velocity, insider) -> dict:
 
 
 def run_smart_stock_scan(user_id, horizon="6m", budget=5000.0, top_n=5,
-                          watchlist_mode="default_plus_mine"):
-    from app.scanner.universe import get_scan_universe
+                          watchlist_mode="default_plus_mine", tickers=None):
+    """
+    tickers: optional explicit universe override. A caller that already
+    resolved the watchlist (e.g. horizon_engine.scan_for_horizon, which
+    needs the same tickers for its options half too) can pass it directly
+    instead of forcing a second get_scan_universe() lookup. Default None
+    preserves the original behavior of resolving it here.
+    """
     from app.signals.velocity_tracker import get_velocity_scores
 
     t_start = time.time()
     set_scan_status(user_id, "queued")
 
-    tickers = get_scan_universe(user_id=user_id, watchlist_mode=watchlist_mode)
+    if tickers is None:
+        from app.scanner.universe import get_scan_universe
+        tickers = get_scan_universe(user_id=user_id, watchlist_mode=watchlist_mode)
     print(f"[StockScan] {len(tickers)} tickers | {horizon} | ${budget:,.0f}")
 
     set_scan_status(user_id, "fundamentals")

@@ -9,7 +9,13 @@ Last updated: July 2026
 ```
 User (Claude Desktop / StockBros Browser)
     |
-    |-- Claude Desktop --> MCP Server (stdio, single-user today)
+    |-- Claude Desktop --> MCP Server
+    |     stdio: local admin usage, one process per user (unchanged)
+    |     HTTP (MCP_TRANSPORT=http): hosted, one shared process serving
+    |       many customers - each request authenticated independently
+    |       via ApiKeyTokenVerifier (app/mcp_server/auth.py) against
+    |       user_api_keys, resolved fresh per call, never cached across
+    |       customers - see "Multi-User / MCP Access Notes" below
     |
     |-- Browser --> FastAPI :8001 --+
                                     |
@@ -36,8 +42,21 @@ engine do not depend on it. See "Watchlist Architecture" below.
 
 ## Data Flow - Options Recommendation Run
 
+Single engine for both channels - the MCP tool get_daily_recommendations
+and the web dashboard's "Scan" button both call
+rescan_engine.py::rescan_with_validation() directly, no separate
+MCP-only scoring path. (An earlier version of this doc described
+daily_engine.py as a "fallback path if the smart engine fails" - that
+was never true for MCP, which called it unconditionally as its only
+engine, and the one place on the web side that *did* fall back to it
+was itself dead code, always throwing before reaching rescan_engine at
+all - see REMAINING_ITEMS.md.) The two features daily_engine's old scan
+had that rescan_engine lacked - portfolio-position exclusion from new
+BUY candidates, and a pre-flight API health check - are now inside
+rescan_with_validation() itself.
+
 ```
-Trigger (dashboard "Scan" button, or scheduled)
+Trigger (dashboard "Scan" button, MCP get_daily_recommendations, or scheduled)
     |
     |-- Pre-fetch (shared, once):
     |     VIX + market regime (VIX term structure, put/call ratio)
@@ -197,13 +216,30 @@ app/
                           coverage / wide analyst disagreement /
                           low share price all reduce trust in a
                           raw upside percent - this was the actual
-                          mechanism behind picks clustering under $30)
-    daily_engine.py      Older orchestrator, still the fallback
-                          path if the smart engine fails
-    horizon_engine.py    Per-horizon options/stock logic; stock
-                          universe now delegates to
-                          scanner.universe.get_scan_universe()
-                          rather than a second parallel implementation
+                          mechanism behind picks clustering under $30).
+                          Backs both the web's stock-scan branch AND
+                          horizon_engine.py::scan_for_horizon's stock
+                          horizons (6m/1yr) - previously web-only.
+    daily_engine.py      Recommendation storage, lifecycle
+                          (invalidation), and formatting - shared by
+                          MCP and web. No longer runs its own scan
+                          (run_daily_recommendations, scored via
+                          conviction.py's older 12-factor system, was
+                          retired - see Conviction Scoring below).
+    horizon_engine.py    Per-horizon options/stock logic.
+                          get_stock_for_horizon() is the single shared
+                          recommendation builder for every stock caller
+                          (single-ticker tools AND smart_stock_scan.py's
+                          Phase 2) - includes the same analyst-target
+                          reliability discount as smart_stock_scan.py
+                          (fundamentals.py::analyst_target_reliability,
+                          shared). scan_for_horizon() delegates stock-
+                          horizon watchlist scans to smart_stock_scan.py
+                          rather than its own per-ticker loop; options
+                          horizons still call get_options_for_horizon()
+                          per ticker. Stock universe delegates to
+                          scanner.universe.get_scan_universe() rather
+                          than a second parallel implementation.
     mark_to_market.py    P&L calculation for every stored
                           recommendation. Credit-strategy P&L% is
                           computed against max_loss (real capital
@@ -212,8 +248,16 @@ app/
                           had been inflating iron condor returns.
                           calculate_backtest_stats() excludes rows
                           flagged excluded_from_stats.
-    conviction.py        12-factor conviction scoring (0-100)
-    fundamentals.py      yfinance fundamentals + analyst targets
+    conviction.py        12-factor conviction scoring (0-100). Orphaned
+                          this session - its only caller
+                          (run_daily_recommendations) was retired; no
+                          remaining imports anywhere in app/. Left in
+                          place rather than deleted; see REMAINING_ITEMS.md.
+    fundamentals.py      yfinance fundamentals + analyst targets.
+                          analyst_target_reliability() (moved here from
+                          smart_stock_scan.py) is the shared reliability
+                          discount used by both smart_stock_scan.py's
+                          ranking and horizon_engine.py's target_price.
 
   strategy/
     engine.py            Trade math: strike selection, cost, R:R,
@@ -255,7 +299,10 @@ app/
                           docker-compose but nothing imports it.
 
   mcp_server/
-    server.py            59 MCP tools - see MCP_TOOLS.md
+    server.py            61 MCP tools - see MCP_TOOLS.md
+    auth.py               ApiKeyTokenVerifier - per-request bearer-token
+                          verification for HTTP transport (user_api_keys,
+                          same hash-and-lookup as the local MCP_API_KEY)
 
   db/
     session.py           SQLAlchemy session management
@@ -365,13 +412,16 @@ daily_recommendations --< learning_log (aggregate, via nightly loop)
 
 ---
 
-## Conviction Scoring (12 factors, 0-100)
+## Conviction Scoring (12 factors, 0-100) - ORPHANED
 
-This is recommendations/conviction.py's scoring system, used by the
-older daily_engine.py path. It is distinct from quick_scan.py's
-5-signal convergence scanner (price momentum, flow, dark pool, TA, OI
-buildup) used by the current rescan_engine.py/smart_engine.py path -
-the two systems are not unified.
+This was recommendations/conviction.py's scoring system, used by the
+old daily_engine.py::run_daily_recommendations() scan path (removed
+this session - see REMAINING_ITEMS.md). It was distinct from and never
+unified with quick_scan.py's 5-signal convergence scanner (price
+momentum, flow, dark pool, TA, OI buildup), which both MCP and web now
+share via rescan_engine.py/smart_engine.py. conviction.py has no
+remaining importers in app/ - kept documented here for now since the
+file itself hasn't been deleted.
 
 ```
 Factor              Weight  Source
@@ -487,11 +537,24 @@ the scan.
 
 ## Multi-User / MCP Access Notes
 
-get_current_user_id() in utils/current_user.py resolves identity via
-a process-level cached value tied to one MCP_API_KEY - correct and
-safe for a single local Claude Desktop instance today, but a real
-constraint before letting other users connect directly to a shared
-MCP server (see REMAINING_ITEMS.md): multiple simultaneous users
-through the same server process would all resolve to whichever
-identity was cached first. The web dashboard's API layer does not
-have this limitation - it resolves user_id per-request via JWT.
+get_current_user_id() in utils/current_user.py no longer caches
+identity at process/module level. Under HTTP transport it reads the
+per-request AccessToken FastMCP resolves via ApiKeyTokenVerifier
+(mcp_server/auth.py), which independently verifies each request's
+bearer token against user_api_keys - safe for one shared server
+process serving many simultaneous customers, each seeing only their
+own data. Under stdio (local Claude Desktop) there's no HTTP request
+to read from, so it falls back to resolving the local MCP_API_KEY the
+same way it always did - still correct since stdio is one process per
+user by construction.
+
+Customer MCP keys are minted automatically on account creation (new
+user via invite-code signup in /api/auth/login, app/api/main.py) using
+the same generate_api_key()/create_api_key() the admin's own key uses,
+returned once in plaintext for StockBros to show the customer. There is
+no self-serve "regenerate a lost key" endpoint yet.
+
+Transport is chosen via the mcp_transport setting ("stdio" default,
+"http" for hosted - MCP_TRANSPORT env var). Going from HTTP-capable
+code to an actual reachable hosted server is still open - see
+REMAINING_ITEMS.md.

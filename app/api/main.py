@@ -91,6 +91,7 @@ class LoginResponse(BaseModel):
     user_id:      str
     display_name: str
     email:        Optional[str] = None
+    mcp_api_key:  Optional[str] = None  # plaintext, only ever present on account creation
 
 class AddToWatchlistRequest(BaseModel):
     ticker: str
@@ -154,6 +155,8 @@ async def login_with_invite(req: InviteLoginRequest):
                 ORDER BY created_at LIMIT 1
             """), {"email": invite_email, "invited_by": invite.invited_by}).fetchone()
 
+            is_new_user = existing is None
+
             if existing:
                 # User already exists — just log them in
                 user_id      = str(existing.id)
@@ -184,12 +187,26 @@ async def login_with_invite(req: InviteLoginRequest):
                 WHERE id = :id
             """), {"id": invite.id})
 
+        # Mint the user's MCP (Claude Desktop) key once, at account creation.
+        # Shown in plaintext exactly this one time - only its SHA-256 hash is
+        # ever stored (user_api_keys), same as every other key on this
+        # platform - so it can't be recovered later, only rotated.
+        mcp_key = None
+        if is_new_user:
+            from app.utils.api_keys import generate_api_key
+            from app.db.queries.user_api_keys import create_api_key
+
+            plaintext, key_hash = generate_api_key()
+            create_api_key(user_id, key_hash, label="stockbros-signup")
+            mcp_key = plaintext
+
         token = create_token(user_id, email or "")
         return LoginResponse(
             token        = token,
             user_id      = user_id,
             display_name = display_name,
             email        = email,
+            mcp_api_key  = mcp_key,
         )
 
     except HTTPException:
@@ -304,9 +321,13 @@ async def get_me(user_id: str = Depends(get_current_user)):
         from app.db.session import get_session
         with get_session() as s:
             row = s.execute(text(
-                "SELECT display_name, email, created_at FROM users WHERE id=:uid"
+                "SELECT display_name, email, is_admin, created_at FROM users WHERE id=:uid"
             ), {"uid": user_id}).fetchone()
-        return {"user_id": user_id, "display_name": row.display_name if row else "Trader"}
+        return {
+            "user_id": user_id,
+            "display_name": row.display_name if row else "Trader",
+            "is_admin": bool(row.is_admin) if row else False,
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -550,12 +571,15 @@ async def get_daily_recs(
     cap_size:  str | None = None,
     catalyst:  str | None = None,
     watchlist_mode: str = "default_plus_mine",
+    # Real user inputs — take priority over the horizon-bucket mapping
+    # below when provided. None = fall back to a horizon-derived default.
+    trading_window_days: int | None = None,
+    stop_loss_pct:       float | None = None,
+    profit_target_pct:   float | None = None,
     user_id: str = Depends(get_current_user)
 ):
     try:
-        from app.recommendations.daily_engine import (
-            run_daily_recommendations, get_active_recommendations
-        )
+        from app.recommendations.daily_engine import get_active_recommendations
         # Always check cache first — instant response
         cached = get_active_recommendations(user_id)
         if cached and not force_refresh:
@@ -631,6 +655,7 @@ async def get_daily_recs(
 
             # ── OPTIONS scan (default) ────────────────────────────────────────
             from app.recommendations.rescan_engine import rescan_with_validation
+            from app.recommendations.horizon_engine import HORIZON_CONFIG
             from app.scanner.quick_scan import quick_scan
             from app.scanner.universe import get_scan_universe
 
@@ -644,18 +669,32 @@ async def get_daily_recs(
                     get_scan_universe(user_id=user_id, watchlist_mode=watchlist_mode),
                     user_id=user_id, top_n=15
                 )
+
+            # rescan_with_validation takes real trading_window_days/stop_loss_pct/
+            # profit_target_pct inputs, not a horizon bucket string — this endpoint
+            # still accepts `horizon` for existing callers, mapped to a window via
+            # the same DTE ranges horizon_engine.py already defines, so there's
+            # only one copy of "what does '1m' mean in days" in the codebase.
+            if trading_window_days is None:
+                cfg = HORIZON_CONFIG.get(horizon, HORIZON_CONFIG["1m"])
+                trading_window_days = (cfg["dte_min"] + cfg["dte_max"]) // 2
+            rescan_kwargs = dict(
+                user_id=user_id, budget=budget,
+                pre_scanned=picks,
+                sector=sector, cap_size=cap_size, catalyst=catalyst,
+                trading_window_days=trading_window_days,
+            )
+            if stop_loss_pct is not None:
+                rescan_kwargs["stop_loss_pct"] = stop_loss_pct
+            if profit_target_pct is not None:
+                rescan_kwargs["profit_target_pct"] = profit_target_pct
+
             # rescan_with_validation is fully synchronous (blocking HTTP calls
             # to Ollama, yfinance, ThreadPoolExecutor waits, sync DB sessions)
             # and takes ~60-80s. Run it off the event loop so /api/scan/status
             # polls (and every other request) do not queue up "pending" behind
             # it for the entire duration.
-            result = await run_in_threadpool(
-                rescan_with_validation,
-                user_id=user_id, budget=budget,
-                pre_scanned=picks,
-                sector=sector, cap_size=cap_size, catalyst=catalyst,
-                horizon=horizon,
-            )
+            result = await run_in_threadpool(rescan_with_validation, **rescan_kwargs)
             recs = result.get("picks", [])
             return {
                 "recommendations": recs,
@@ -664,9 +703,12 @@ async def get_daily_recs(
                 "source":          result.get("source","rescan"),
                 "count":           len(recs),
             }
+        except HTTPException:
+            raise
         except Exception as e:
-            print(f"[API] Smart engine failed: {e}, falling back")
-            return run_daily_recommendations(user_id, force_refresh=True)
+            raise HTTPException(status_code=500, detail=f"Scan failed: {e}")
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -914,8 +956,16 @@ async def monitor_status(user_id: str = Depends(get_current_user)):
 
 @app.get("/api/watchlist", tags=["Watchlist"])
 async def get_watchlist(user_id: str = Depends(get_current_user)):
-    from app.broker.watchlist_sync import get_db_watchlist
-    return {"tickers": get_db_watchlist(user_id)}
+    # Returns the admin's shared default list and this user's own
+    # additions SEPARATELY, using the same helpers get_scan_universe()
+    # relies on. For the admin, these are literally the same rows on
+    # both sides — that's expected, not a bug, since the admin's own
+    # watchlist IS the shared default.
+    from app.scanner.universe import _get_admin_watchlist, _get_user_watchlist
+    return {
+        "default": sorted(_get_admin_watchlist()),
+        "mine":     sorted(_get_user_watchlist(user_id)),
+    }
 
 
 @app.post("/api/watchlist/add", tags=["Watchlist"])

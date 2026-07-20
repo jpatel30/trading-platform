@@ -23,10 +23,14 @@ from app.market_data.polygon_client import (
     get_bars, get_bulk_previous_close,
     get_previous_close, get_ticker_details,
 )
+from app.mcp_server.auth import ApiKeyTokenVerifier
 from app.technical_analysis.engine import get_technical_profile
+from app.utils.config import settings
 from app.utils.current_user import get_current_user_id
 
-mcp = FastMCP("Personal Trading Intelligence Platform")
+# auth is only enforced under HTTP transport (see run_async in fastmcp) -
+# stdio has no bearer token to check, so this is inert for local usage.
+mcp = FastMCP("Personal Trading Intelligence Platform", auth=ApiKeyTokenVerifier())
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -474,9 +478,19 @@ def get_portfolio_additions() -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 
 @mcp.tool()
-def get_daily_recommendations(force_refresh: bool = False) -> dict:
+def get_daily_recommendations(
+    force_refresh: bool = False,
+    budget: float = 2000.0,
+    trading_window_days: int = 7,
+    stop_loss_pct: float = 40.0,
+    profit_target_pct: float = 50.0,
+) -> dict:
     """
-    Today's high-conviction trading thesis — the main daily recommendation.
+    Today's high-conviction options trading thesis — the main daily
+    recommendation. Runs the same scan engine as the StockBros web
+    dashboard's "Scan" button (rescan_engine.py/smart_engine.py) — there
+    is no separate MCP-only scoring path, so the same watchlist on the
+    same day gives the same picks regardless of which channel asks.
 
     Call this when user says ANY of:
     - "What should I trade today?"
@@ -484,22 +498,68 @@ def get_daily_recommendations(force_refresh: bool = False) -> dict:
     - "What are the best picks today?"
     - "Show me today's thesis"
 
-    Returns top 5 picks with conviction score (0-100), thesis, entry zone,
-    target, stop, and invalidation conditions. Only surfaces picks >= 70/100.
+    Returns top picks with conviction score (0-100), thesis, entry zone,
+    target, stop, and invalidation conditions. Only surfaces picks >= 70/100
+    (use scan_watchlist for the raw, ungated scan).
 
     After returning, if any pick has act_now=True, ALWAYS ask:
     "Did you execute [ticker]? Tell me how many contracts at what price."
 
     Args:
-        force_refresh: True to re-run scanner (default: use today's cached recs)
+        force_refresh:        True to re-run the scanner (default: use
+                               today's cached recs)
+        budget:                amount to invest, in dollars
+        trading_window_days:  target holding window in days — drives which
+                               expiry gets selected (default 7)
+        stop_loss_pct:         stop-loss as a positive percent, e.g. 40 for -40%
+        profit_target_pct:     profit target as a positive percent
     """
     from app.recommendations.daily_engine import (
-        run_daily_recommendations, format_daily_recommendations
+        get_active_recommendations, format_daily_recommendations
     )
-    result = run_daily_recommendations(
-        user_id       = get_current_user_id(),
-        force_refresh = force_refresh
+    from app.recommendations.rescan_engine import rescan_with_validation
+
+    MIN_CONVICTION_TO_SURFACE = 70
+    user_id = get_current_user_id()
+
+    def _gate(recs: list[dict]) -> tuple[list[dict], list[dict]]:
+        passed   = [r for r in recs if (r.get("conviction_score") or 0) >= MIN_CONVICTION_TO_SURFACE]
+        filtered = [r for r in recs if (r.get("conviction_score") or 0) <  MIN_CONVICTION_TO_SURFACE]
+        return passed, filtered
+
+    if not force_refresh:
+        existing = get_active_recommendations(user_id)
+        if existing:
+            passed, filtered = _gate(existing)
+            result = {
+                "recommendations": passed,
+                "filtered_out":    filtered,
+                "source":          "cached",
+                "date":            datetime.now().strftime("%Y-%m-%d"),
+            }
+            result["formatted"] = format_daily_recommendations(result)
+            return result
+
+    scan_result = rescan_with_validation(
+        user_id              = user_id,
+        budget               = budget,
+        trading_window_days  = trading_window_days,
+        stop_loss_pct        = stop_loss_pct,
+        profit_target_pct    = profit_target_pct,
     )
+    if scan_result.get("error"):
+        return scan_result
+
+    existing         = get_active_recommendations(user_id)
+    passed, filtered = _gate(existing)
+    result = {
+        "recommendations": passed,
+        "filtered_out":    filtered,
+        "source":          scan_result.get("source", "fresh"),
+        "market_view":     scan_result.get("market_view", ""),
+        "elapsed":         scan_result.get("elapsed"),
+        "date":            datetime.now().strftime("%Y-%m-%d"),
+    }
     result["formatted"] = format_daily_recommendations(result)
     return result
 
@@ -1167,4 +1227,7 @@ def get_sell_signal_compliance() -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    mcp.run()
+    if settings.mcp_transport == "http":
+        mcp.run(transport="http", host=settings.mcp_server_host, port=settings.mcp_server_port)
+    else:
+        mcp.run()

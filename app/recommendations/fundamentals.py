@@ -49,6 +49,50 @@ def get_fundamentals(ticker: str) -> dict:
         return {"error": str(e)}
 
 
+def analyst_target_reliability(price: float, low: float, high: float, mean: float) -> float:
+    """
+    0.0-1.0 confidence multiplier for an analyst target, using only data
+    already available from get_fundamentals()/_fetch_analyst_target() — no
+    extra network calls.
+
+      Price level:  thin analyst coverage, wide bid/ask spreads, and
+                     outsized single-analyst-outlier risk make mean
+                     targets on sub-$15 names systematically less
+                     trustworthy. Ramps 0.35 (<=$3) to 1.0 (>=$15), not a
+                     hard cutoff — a $12 stock still counts, just
+                     partially discounted.
+      Dispersion:   if analyst low/high disagree widely relative to the
+                     mean, "consensus" is barely a consensus. Tight
+                     agreement (<=30% spread/mean) = full trust; 150%+
+                     spread = heavily discounted.
+
+    Concrete motivating case: EVTL showed +517% upside on 5 analysts at a
+    $1.62 share price — a mean target that thin and that close to zero is
+    dominated by single-analyst-outlier risk, not a real consensus.
+    Originally found and fixed only for smart_stock_scan.py's watchlist
+    ranking; moved here so every caller of get_fundamentals() (single-
+    ticker recommendations included) gets the same discount, not just
+    watchlist-wide scans.
+    """
+    if not mean or mean <= 0:
+        return 0.5
+
+    if price >= 15:
+        price_factor = 1.0
+    elif price >= 3:
+        price_factor = 0.35 + (price - 3) / 12 * 0.65
+    else:
+        price_factor = 0.35
+
+    if low and high and high > low:
+        spread_pct = (high - low) / mean
+        dispersion_factor = max(0.3, 1.0 - max(0, spread_pct - 0.3) / 1.2)
+    else:
+        dispersion_factor = 0.6  # unknown spread — moderate discount, not full trust
+
+    return round(price_factor * dispersion_factor, 3)
+
+
 def get_dp_accumulation_score(ticker: str) -> dict:
     """
     Calculate institutional accumulation score from dark pool prints.
@@ -130,9 +174,18 @@ def score_fundamentals(
     total     = 0
 
     # ── Analyst target upside (25 pts) ──────────────────────────────────────
+    # Discounted by reliability (price level + analyst low/high dispersion)
+    # before scoring — an undiscounted mean target on a thin-coverage,
+    # low-priced stock can show triple-digit "upside" that's really
+    # single-analyst-outlier noise. See analyst_target_reliability().
     target_mean = fundamentals.get("target_mean_price")
     if target_mean and price > 0:
-        upside_pct = (target_mean - price) / price * 100
+        raw_upside_pct = (target_mean - price) / price * 100
+        reliability = analyst_target_reliability(
+            price, fundamentals.get("target_low_price", 0) or 0,
+            fundamentals.get("target_high_price", 0) or 0, target_mean,
+        )
+        upside_pct = raw_upside_pct * reliability
         if upside_pct >= 50:
             pts = 25
         elif upside_pct >= 30:
@@ -146,7 +199,8 @@ def score_fundamentals(
         breakdown["analyst_upside"] = {
             "score": round(upside_pct, 1),
             "points": pts,
-            "note": f"{upside_pct:.1f}% to analyst mean ${target_mean:.0f} "
+            "note": f"{upside_pct:.1f}% (reliability-discounted from {raw_upside_pct:.1f}%) "
+                    f"to analyst mean ${target_mean:.0f} "
                     f"({fundamentals.get('analyst_count', 0)} analysts, "
                     f"{fundamentals.get('analyst_recommendation', 'N/A')})"
         }

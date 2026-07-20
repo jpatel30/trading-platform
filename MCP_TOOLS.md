@@ -3,7 +3,7 @@
 All tools available via Claude Desktop MCP integration.
 Server: python3 -m app.mcp_server.server
 
-Total: 59 tools across 9 categories.
+Total: 61 tools across 9 categories.
 
 ---
 
@@ -29,6 +29,7 @@ Total: 59 tools across 9 categories.
 | get_ticker_info | ticker | name, market cap, sector | |
 | analyze_ticker | ticker, days=300 | full TA profile | MA, RSI, MACD, trend |
 | get_market_overview | - | VIX, market tide, sector flow | |
+| get_market_regime | - | overall bias + strategy hint from VIX term structure + put/call ratio | Contrarian PCR read + VIX9D-vs-VIX30 inversion check |
 | get_market_context | ticker | full RAG context (price, earnings, macro, news, sector) | Used by LLM; also useful standalone for research |
 
 ## Options Flow
@@ -38,6 +39,7 @@ Total: 59 tools across 9 categories.
 | get_options_flow | ticker=None, min_premium=500000, sweeps_only=False | unusual sweeps | |
 | get_dark_pool | ticker=None, min_premium=0 | block trades | |
 | get_gex | ticker | gamma exposure by strike/expiry | |
+| get_oi_buildup | ticker | OI buildup score -100 to +100, days building, top contract | LEADING indicator (multi-day accumulation) distinct from same-day flow (reactive) |
 | get_ticker_signal | ticker | combined flow + dp + direction + confidence | Call before get_strategy_recommendation |
 
 ## News & Calendar
@@ -63,12 +65,12 @@ Scan whole watchlist, routed by horizon    -> scan_for_horizon
 
 | Tool | Parameters | Returns | Notes |
 |---|---|---|---|
-| get_daily_recommendations | force_refresh=False | cached or fresh recs, gated >=70/100 | Main daily entry point |
+| get_daily_recommendations | force_refresh=False, budget=2000.0, trading_window_days=7, stop_loss_pct=40.0, profit_target_pct=50.0 | cached or fresh recs, gated >=70/100 | Main daily entry point. Runs the exact same engine (rescan_engine.py/smart_engine.py) as the web dashboard's Scan button - no separate MCP-only scoring path |
 | invalidate_recommendation | ticker, reason | success bool | Fires Discord alert |
 | get_recommendation_history | days_back=7 | past recs with status | |
 | get_recommendation_history_detailed | days_back=30 | history grouped by date, with mark-to-market P&L | Answers "how have my recommendations performed?" |
 | get_horizon_recommendation | ticker, horizon="1m", budget=2000 | single-ticker, single-horizon, options or stock | |
-| scan_for_horizon | horizon="1m", budget=2000, top_n=5 | top picks for one horizon, watchlist-only universe | |
+| scan_for_horizon | horizon="1m", budget=2000, top_n=5 | top picks for one horizon, watchlist-only universe | Stock horizons (6m/1yr) use the same fundamentals+velocity+insider composite pre-filter as the web dashboard's stock scan (smart_stock_scan.py) - previously a weaker, unfiltered per-ticker loop |
 | get_strategy_recommendation | ticker, budget, max_loss=None, profit_target=None, min_dte=4, max_dte=365 | full options trade plan | Single-ticker deep dive ONLY - use get_daily_recommendations for the gated daily flow |
 | get_stock_recommendation | ticker, horizon="6m", budget=2000 | stock thesis + target | |
 | get_portfolio_additions | - | existing winners worth adding to | |
@@ -88,7 +90,7 @@ default_only mode - they answer different questions, not the same one.
 | force_sync_watchlist | - | immediate broker-to-DB sync diff | Add-only - never deletes from your DB list |
 | add_to_watchlist | ticker, notes="", sector="" | success | |
 | remove_from_watchlist | ticker | success | |
-| scan_watchlist | top_n=5 | raw two-tier convergence scan, NO conviction gate | For filtered daily picks use get_daily_recommendations instead |
+| scan_watchlist | top_n=5 | raw two-tier convergence scan, NO conviction gate | Each pick includes a conflict flag (confidence capped at 58 when strong signals disagree). For filtered daily picks use get_daily_recommendations instead |
 
 ## Position Monitor & Alerts
 
@@ -182,10 +184,8 @@ stock default.
 
 ## Known Gaps (tracked in REMAINING_ITEMS.md)
 
-- Market regime (VIX term structure + PCR), OI buildup, and the
-  signal-conflict flag - all built and live in the web dashboard's
-  scan pipeline - are not yet exposed as their own MCP tools.
-- get_current_user_id() resolves via a single cached value per MCP
-  server process - correct for one local user today, a real
-  constraint before multiple users could safely share one running
-  MCP server instance.
+- Multi-user MCP identity resolution is fixed (per-request bearer-token
+  auth via ApiKeyTokenVerifier, no process-level cache) and customer
+  keys are minted automatically on signup - but there's no hosted
+  server actually reachable yet (MCP_TRANSPORT=http needs a real
+  deployment target) and no self-serve "regenerate a lost key" endpoint.

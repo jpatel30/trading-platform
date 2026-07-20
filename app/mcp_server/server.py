@@ -247,6 +247,34 @@ def get_market_overview() -> dict:
 
 
 @mcp.tool()
+def get_market_regime() -> dict:
+    """
+    Combined market regime — VIX term structure + put/call ratio.
+    Answers: is this a good day to buy premium, sell premium, or wait?
+
+    VIX term structure: VIX9D vs VIX30. Inverted (VIX9D > VIX30) means
+    near-term fear is spiking — caution. Steep contango (VIX9D well
+    below VIX30) means calm short-term conditions.
+
+    Put/call ratio: contrarian read on options positioning. Extreme
+    complacency (low PCR) is a bearish contrarian signal; extreme fear
+    (high PCR) is a bullish contrarian signal.
+
+    Returns overall_bias (STRONGLY_BULLISH to STRONGLY_BEARISH, or
+    CAUTION if VIX is meaningfully inverted) plus a strategy_hint
+    (e.g. "Iron condors or straddles" for NEUTRAL regimes).
+
+    Call when user says ANY of:
+    - "What's the market regime right now?"
+    - "Is this a good day to sell premium?"
+    - "What's VIX doing?"
+    - Before recommending a strategy type when regime context would help
+    """
+    from app.signals.market_regime import get_full_market_regime
+    return get_full_market_regime()
+
+
+@mcp.tool()
 def get_options_flow(
     ticker: str | None = None,
     min_premium: float = 500000,
@@ -307,6 +335,30 @@ def get_gex(ticker: str) -> dict:
         "top_gex_strikes": top_strikes,
         "gex_by_expiry":   by_expiry[:10],
     }
+
+
+@mcp.tool()
+def get_oi_buildup(ticker: str) -> dict:
+    """
+    Open interest buildup signal for a ticker — a LEADING indicator,
+    distinct from flow alerts (which are reactive to trades happening
+    right now). Detects sustained multi-day accumulation of new
+    positions, weighted by aggressive ask-side buying and how many
+    consecutive days OI has been building.
+
+    Score -100 (strong bearish buildup) to +100 (strong bullish
+    buildup). max_days_building shows how long this has been
+    persistent — a 15-day build is a much stronger signal than a
+    1-day blip.
+
+    Call when user says ANY of:
+    - "Is there institutional buildup in NVDA?"
+    - "Show me OI accumulation for TSLA"
+    - "Is smart money positioning in this name before same-day flow
+      would show it?"
+    """
+    from app.signals.oi_flow import get_oi_buildup_signal
+    return get_oi_buildup_signal(ticker.upper())
 
 
 @mcp.tool()
@@ -739,14 +791,19 @@ def scan_watchlist(top_n: int = 5) -> dict:
     ROUTING NOTE: This returns raw scanner picks WITHOUT conviction gate
     or portfolio filter. For filtered daily recommendations use
     get_daily_recommendations() which applies the full quality pipeline.
-    DAILY SCAN — Two-Tier Convergence Scanner on full 126-ticker watchlist.
+    DAILY SCAN — Two-Tier Convergence Scanner on your full watchlist
+    (admin default + your own additions).
 
-    Tier 1 (~30s): Scores ALL 126 tickers on price momentum + options flow
-    + dark pool. Selects top_n where signals CONVERGE.
+    Tier 1: Scores every ticker on price momentum, options flow, dark
+    pool, TA, and OI buildup (5 signals). Selects top_n where signals
+    CONVERGE. Each returned pick includes a "conflict" field — True
+    when strong signals (flow/dark-pool/OI) meaningfully disagree with
+    each other; confidence is automatically capped at 58 in that case
+    rather than letting convergence math hide a real disagreement.
 
-    Tier 2 (~60-90s per ticker): Deep LLM strategy analysis on top picks.
-    Running all 126 would take 190+ minutes — the pre-filter finds the
-    highest-probability setups from the full universe.
+    Tier 2: Deep LLM strategy analysis on top picks — the pre-filter
+    finds the highest-probability setups so this doesn't have to run
+    against every ticker in the universe.
 
     Args:
         top_n: picks to deep-analyze (default 5, max 15)

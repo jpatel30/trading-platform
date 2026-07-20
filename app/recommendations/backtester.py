@@ -195,6 +195,7 @@ def backtest_entry_quality(user_id: str) -> dict:
                 WHERE user_id = :uid
                   AND was_correct IS NOT NULL
                   AND actual_pnl_pct IS NOT NULL
+                  AND (excluded_from_stats IS NULL OR excluded_from_stats = FALSE)
             """), {"uid": user_id}).fetchall()
 
         if len(rows) < 5:
@@ -265,6 +266,7 @@ def backtest_conviction_gate(user_id: str) -> dict:
                 FROM daily_recommendations
                 WHERE user_id = :uid
                   AND was_correct IS NOT NULL
+                  AND (excluded_from_stats IS NULL OR excluded_from_stats = FALSE)
             """), {"uid": user_id}).fetchall()
 
         if len(rows) < 10:

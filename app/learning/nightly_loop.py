@@ -150,6 +150,7 @@ def recalibrate_conviction_weights(user_id: str) -> dict:
                 WHERE user_id = :uid
                   AND was_correct IS NOT NULL
                   AND conviction_breakdown IS NOT NULL
+                  AND (excluded_from_stats IS NULL OR excluded_from_stats = FALSE)
             """), {"uid": user_id}).fetchall()
 
         if len(rows) < MIN_TRADES_FOR_RECALIBRATION:

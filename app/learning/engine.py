@@ -146,6 +146,7 @@ def analyze_strategy_performance(user_id: str) -> dict:
                 FROM daily_recommendations
                 WHERE user_id   = :uid
                   AND was_correct IS NOT NULL
+                  AND (excluded_from_stats IS NULL OR excluded_from_stats = FALSE)
             """), {"uid": user_id}).fetchall()
 
         if not rows:

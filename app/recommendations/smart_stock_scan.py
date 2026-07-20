@@ -212,14 +212,15 @@ def _score_ticker(ticker, fd, target, velocity, insider) -> dict:
     }
 
 
-def run_smart_stock_scan(user_id, horizon="6m", budget=5000.0, top_n=5):
+def run_smart_stock_scan(user_id, horizon="6m", budget=5000.0, top_n=5,
+                          watchlist_mode="default_plus_mine"):
     from app.scanner.universe import get_scan_universe
     from app.signals.velocity_tracker import get_velocity_scores
 
     t_start = time.time()
     set_scan_status(user_id, "queued")
 
-    tickers = get_scan_universe(user_id=user_id)
+    tickers = get_scan_universe(user_id=user_id, watchlist_mode=watchlist_mode)
     print(f"[StockScan] {len(tickers)} tickers | {horizon} | ${budget:,.0f}")
 
     set_scan_status(user_id, "fundamentals")

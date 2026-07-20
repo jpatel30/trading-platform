@@ -98,24 +98,18 @@ STOCK_UPSIDE_TARGETS = {
 # Stock Universe (watchlist + portfolio only — no hardcoded supplement)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def get_stock_universe(user_id: str) -> list[str]:
-    """Watchlist + current portfolio positions. No hardcoded ticker list."""
-    tickers = set()
-
-    try:
-        from app.broker.watchlist_sync import get_db_watchlist
-        tickers.update(get_db_watchlist(user_id))
-    except Exception:
-        pass
-
-    try:
-        from app.broker.webull_connector import WebullConnector
-        positions = WebullConnector(user_id).get_positions()
-        tickers.update(p["symbol"] for p in positions)
-    except Exception:
-        pass
-
-    return list(tickers)
+def get_stock_universe(user_id: str, watchlist_mode: str = "default_plus_mine") -> list[str]:
+    """
+    Delegates entirely to scanner.universe.get_scan_universe() — the
+    single shared source of truth for the scan universe, already used
+    by the options scanner. This used to be a second, parallel
+    implementation with its own separate watchlist lookup (via
+    watchlist_sync.get_db_watchlist) — folded into one to avoid
+    exactly the kind of two-systems drift found elsewhere tonight
+    (recommendations tables, the original watchlist duplication).
+    """
+    from app.scanner.universe import get_scan_universe
+    return get_scan_universe(user_id=user_id, watchlist_mode=watchlist_mode)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

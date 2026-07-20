@@ -549,6 +549,7 @@ async def get_daily_recs(
     sector:    str | None = None,
     cap_size:  str | None = None,
     catalyst:  str | None = None,
+    watchlist_mode: str = "default_plus_mine",
     user_id: str = Depends(get_current_user)
 ):
     try:
@@ -584,7 +585,8 @@ async def get_daily_recs(
                 # genuinely unprocessed for the full scan duration.
                 scan_result = await run_in_threadpool(
                     run_smart_stock_scan,
-                    user_id=user_id, horizon=horizon, budget=budget, top_n=5
+                    user_id=user_id, horizon=horizon, budget=budget, top_n=5,
+                    watchlist_mode=watchlist_mode,
                 )
                 results = scan_result.get("stocks", [])
                 for rec in results:
@@ -638,7 +640,9 @@ async def get_daily_recs(
                 picks = None
             else:
                 picks = await run_in_threadpool(
-                    quick_scan, get_scan_universe(user_id=user_id), user_id=user_id, top_n=15
+                    quick_scan,
+                    get_scan_universe(user_id=user_id, watchlist_mode=watchlist_mode),
+                    user_id=user_id, top_n=15
                 )
             # rescan_with_validation is fully synchronous (blocking HTTP calls
             # to Ollama, yfinance, ThreadPoolExecutor waits, sync DB sessions)

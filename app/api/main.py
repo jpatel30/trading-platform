@@ -118,6 +118,29 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
         raise HTTPException(status_code=401, detail="Invalid or expired token")
 
 
+def _require_admin(user_id: str) -> None:
+    """
+    Raises 403 if user_id is not an admin. Shared by get_current_admin_user_id
+    (for endpoints that are admin-only outright) and by any endpoint that
+    only conditionally gates a specific param on admin (e.g. history-grouped's
+    all_users) - one place to check users.is_admin instead of re-implementing
+    the query at each new admin-gated spot.
+    """
+    from sqlalchemy import text
+    from app.db.session import get_session
+    with get_session() as s:
+        row = s.execute(text("SELECT is_admin FROM users WHERE id=:uid"), {"uid": user_id}).fetchone()
+    if not row or not row.is_admin:
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+
+def get_current_admin_user_id(user_id: str = Depends(get_current_user)) -> str:
+    """Drop-in Depends() replacement for get_current_user on endpoints
+    that are admin-only outright (403s otherwise)."""
+    _require_admin(user_id)
+    return user_id
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Request / Response Models
 # ─────────────────────────────────────────────────────────────────────────────
@@ -832,11 +855,17 @@ async def trigger_daily_snapshot(user_id: str = Depends(get_current_user)):
 async def get_history_grouped(
     days_back: int = 30,
     force_remark: bool = False,
+    all_users: bool = False,
     user_id: str = Depends(get_current_user)
 ):
     """
     Recommendation history grouped by date with mark-to-market P&L.
     Lazy-refresh: re-marks if existing marks are >15 min stale.
+
+    all_users=True (admin only, 403 otherwise): every user's
+    recommendations for the date range instead of just the caller's own,
+    each pick tagged with user_id/display_name, plus a by_user summary
+    (net_pnl/win_rate per customer) alongside the existing by_date one.
     """
     try:
         from sqlalchemy import text
@@ -844,13 +873,18 @@ async def get_history_grouped(
         from app.recommendations.mark_to_market import mark_all_active_recommendations
         from datetime import datetime, timezone
 
+        if all_users:
+            _require_admin(user_id)
+
+        scope_filter = "" if all_users else "AND dr.user_id = :uid"
+
         with get_session() as s:
-            staleness = s.execute(text("""
+            staleness = s.execute(text(f"""
                 SELECT MIN(last_marked_at) as oldest_mark,
                        COUNT(*) FILTER (WHERE last_marked_at IS NULL) as unmarked
-                FROM daily_recommendations
-                WHERE user_id=:uid AND date >= CURRENT_DATE - :days
-                  AND status != 'INVALIDATED'
+                FROM daily_recommendations dr
+                WHERE date >= CURRENT_DATE - :days
+                  AND status != 'INVALIDATED' {scope_filter}
             """), {"uid": user_id, "days": days_back}).fetchone()
 
         needs_remark = force_remark
@@ -863,24 +897,41 @@ async def get_history_grouped(
                     needs_remark = True
 
         if needs_remark:
-            mark_all_active_recommendations(user_id, days_back)
+            if all_users:
+                # Mirrors the nightly scheduled job's own per-user loop
+                # (main.py's _run_nightly_learning) - mark_all_active_
+                # recommendations only ever marks its one given user_id.
+                with get_session() as s:
+                    active_users = s.execute(text(
+                        "SELECT id FROM users WHERE is_active = TRUE"
+                    )).fetchall()
+                for u in active_users:
+                    try:
+                        mark_all_active_recommendations(str(u.id), days_back)
+                    except Exception as e:
+                        print(f"[HistoryGrouped] Remark failed for {str(u.id)[:8]}: {e}")
+            else:
+                mark_all_active_recommendations(user_id, days_back)
 
         with get_session() as s:
-            rows = s.execute(text("""
-                SELECT id, ticker, direction, strategy, horizon, expiry,
-                       conviction_score, conviction_tier, thesis, legs,
-                       entry_debit, entry_zone_low, entry_zone_high,
-                       current_value, current_pnl_dollars, current_pnl_pct,
-                       mark_type, last_marked_at, status, date, created_at
-                FROM daily_recommendations
-                WHERE user_id = :uid AND date >= CURRENT_DATE - :days
-                ORDER BY date DESC, conviction_score DESC
+            rows = s.execute(text(f"""
+                SELECT dr.id, dr.user_id, u.display_name,
+                       dr.ticker, dr.direction, dr.strategy, dr.horizon, dr.expiry,
+                       dr.conviction_score, dr.conviction_tier, dr.thesis, dr.legs,
+                       dr.entry_debit, dr.entry_zone_low, dr.entry_zone_high,
+                       dr.current_value, dr.current_pnl_dollars, dr.current_pnl_pct,
+                       dr.mark_type, dr.last_marked_at, dr.status, dr.date, dr.created_at
+                FROM daily_recommendations dr
+                JOIN users u ON u.id = dr.user_id
+                WHERE dr.date >= CURRENT_DATE - :days {scope_filter}
+                ORDER BY dr.date DESC, dr.conviction_score DESC
             """), {"uid": user_id, "days": days_back}).fetchall()
 
         grouped: dict = {}
+        by_user_agg: dict = {}
         for r in rows:
-            d = str(r.date)
-            grouped.setdefault(d, []).append({
+            pnl_dollars = float(r.current_pnl_dollars) if r.current_pnl_dollars is not None else None
+            pick = {
                 "id":              str(r.id),
                 "ticker":          r.ticker,
                 "direction":       r.direction,
@@ -893,12 +944,33 @@ async def get_history_grouped(
                 "legs":            r.legs or [],
                 "entry_value":     float(r.entry_debit or r.entry_zone_low or 0),
                 "current_value":   float(r.current_value) if r.current_value is not None else None,
-                "pnl_dollars":     float(r.current_pnl_dollars) if r.current_pnl_dollars is not None else None,
+                "pnl_dollars":     pnl_dollars,
                 "pnl_pct":         float(r.current_pnl_pct) if r.current_pnl_pct is not None else None,
                 "mark_type":       r.mark_type,
                 "last_marked_at":  str(r.last_marked_at) if r.last_marked_at else None,
                 "status":          r.status,
-            })
+            }
+            if all_users:
+                # Not needed for the normal per-user view - implicitly "you".
+                pick["user_id"]      = str(r.user_id)
+                pick["display_name"] = r.display_name or "Trader"
+
+            d = str(r.date)
+            grouped.setdefault(d, []).append(pick)
+
+            if all_users:
+                uid = str(r.user_id)
+                agg = by_user_agg.setdefault(uid, {
+                    "user_id": uid, "display_name": r.display_name or "Trader",
+                    "net_pnl": 0.0, "total_picks": 0, "marked_picks": 0,
+                    "winners": 0, "losers": 0,
+                })
+                agg["total_picks"] += 1
+                if pnl_dollars is not None:
+                    agg["marked_picks"] += 1
+                    agg["net_pnl"] += pnl_dollars
+                    if pnl_dollars > 0: agg["winners"] += 1
+                    elif pnl_dollars < 0: agg["losers"] += 1
 
         result = []
         for date, picks in sorted(grouped.items(), reverse=True):
@@ -917,7 +989,100 @@ async def get_history_grouped(
                 "win_rate":      round(winners/len(marked)*100, 1) if marked else None,
             })
 
-        return {"history": result}
+        response = {"history": result}
+        if all_users:
+            by_user = []
+            for agg in by_user_agg.values():
+                agg["net_pnl"]  = round(agg["net_pnl"], 2)
+                agg["win_rate"] = round(agg["winners"]/agg["marked_picks"]*100, 1) if agg["marked_picks"] else None
+                by_user.append(agg)
+            by_user.sort(key=lambda x: x["net_pnl"], reverse=True)
+            response["by_user"] = by_user
+        return response
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/recommendations/open-positions", tags=["Recommendations"])
+async def get_open_positions(user_id: str = Depends(get_current_user)):
+    """
+    Confirmed-filled positions, sourced from daily_recommendations - this
+    is every user's equivalent of "portfolio" (broker connection is
+    admin-only; see ARCHITECTURE.md's "Broker Connection Is Optional").
+    Applies to the admin too - confirming a fill here is separate from
+    their real Webull account.
+
+    Note: tracked_positions also records a fill (used by
+    position_monitor.py for alerting) but has no thesis/legs/mark-to-
+    market P&L, so this reads from daily_recommendations instead - two
+    tables recording overlapping fill facts is the same shape of issue
+    as the retired strategy_recommendations duplication, worth a look
+    eventually, not fixed here.
+    """
+    try:
+        from sqlalchemy import text
+        from app.db.session import get_session
+        from app.recommendations.mark_to_market import mark_all_active_recommendations
+        from datetime import datetime, timezone
+
+        # Same lazy-refresh staleness pattern as history-grouped, scoped
+        # to open positions instead of a date range.
+        with get_session() as s:
+            staleness = s.execute(text("""
+                SELECT MIN(last_marked_at) as oldest_mark,
+                       COUNT(*) FILTER (WHERE last_marked_at IS NULL) as unmarked
+                FROM daily_recommendations
+                WHERE user_id = :uid AND user_executed = TRUE
+                  AND status = 'ACTIVE' AND closed_at IS NULL
+            """), {"uid": user_id}).fetchone()
+
+        needs_remark = False
+        if staleness:
+            if staleness.unmarked and staleness.unmarked > 0:
+                needs_remark = True
+            elif staleness.oldest_mark:
+                age_min = (datetime.now(timezone.utc) - staleness.oldest_mark).total_seconds() / 60
+                if age_min > 15:
+                    needs_remark = True
+
+        if needs_remark:
+            mark_all_active_recommendations(user_id)
+
+        with get_session() as s:
+            rows = s.execute(text("""
+                SELECT id, ticker, direction, strategy, legs, expiry, dte,
+                       actual_entry_price, actual_qty, executed_at,
+                       target_pct, stop_pct, thesis,
+                       current_value, current_pnl_dollars, current_pnl_pct, mark_type
+                FROM daily_recommendations
+                WHERE user_id = :uid AND user_executed = TRUE
+                  AND status = 'ACTIVE' AND closed_at IS NULL
+                ORDER BY executed_at DESC
+            """), {"uid": user_id}).fetchall()
+
+        positions = [{
+            "id":                  str(r.id),
+            "ticker":              r.ticker,
+            "direction":           r.direction,
+            "strategy":            r.strategy,
+            "legs":                r.legs or [],
+            "expiry":              str(r.expiry) if r.expiry else None,
+            "dte":                 r.dte,
+            "actual_entry_price":  float(r.actual_entry_price) if r.actual_entry_price is not None else None,
+            "actual_qty":          r.actual_qty,
+            "executed_at":         str(r.executed_at) if r.executed_at else None,
+            "target_pct":          float(r.target_pct) if r.target_pct is not None else None,
+            "stop_pct":            float(r.stop_pct) if r.stop_pct is not None else None,
+            "thesis":              r.thesis,
+            "current_value":       float(r.current_value) if r.current_value is not None else None,
+            "current_pnl_dollars": float(r.current_pnl_dollars) if r.current_pnl_dollars is not None else None,
+            "current_pnl_pct":     float(r.current_pnl_pct) if r.current_pnl_pct is not None else None,
+            "mark_type":           r.mark_type,
+        } for r in rows]
+
+        return {"positions": positions, "count": len(positions)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

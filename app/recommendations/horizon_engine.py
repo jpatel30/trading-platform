@@ -93,6 +93,14 @@ STOCK_UPSIDE_TARGETS = {
     "1yr": 0.50,
 }
 
+# Option C decision this session: no conviction/fundamental gate tied to
+# window length. Options already has real R/R + EV gates as its quality
+# filter (strategy/engine.py::_execute_trade_math) regardless of window;
+# stock has no direct equivalent, so it keeps ONE fixed floor instead of
+# HORIZON_CONFIG's old per-bucket min_fundamental (55/60/55 for 3m/6m/1yr)
+# now that trading_window_days can be any value, not just those 3 buckets.
+STOCK_MIN_FUNDAMENTAL = 60
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Stock Universe (watchlist + portfolio only — no hardcoded supplement)
@@ -121,17 +129,30 @@ def get_options_for_horizon(
     horizon: str,
     budget: float,
     user_id: str | None = None,
+    trading_window_days: int | None = None,
+    stop_loss_pct: float | None = None,
+    profit_target_pct: float | None = None,
 ) -> dict:
-    """Build options recommendation for 1w / 1m / 3m horizon."""
-    from app.strategy.engine import build_recommendation
+    """
+    Build an options recommendation for a target trading window.
+
+    trading_window_days/stop_loss_pct/profit_target_pct are real user
+    inputs, following the same pattern rescan_engine.py's options engine
+    already uses — when omitted, trading_window_days falls back to the
+    horizon bucket's DTE-range midpoint (so existing callers that only
+    pass `horizon` keep working unchanged).
+    """
+    from app.strategy.engine import build_recommendation, _get_all_expiries
     from app.options_flow.unusual_whales import get_signal_package
     from app.options_flow.signals import score_signal_package
     from app.market_data.uw_market_data import get_bars
     from app.technical_analysis.engine import get_technical_profile
+    from app.utils.trade_windows import compute_target_date
 
-    config    = HORIZON_CONFIG.get(horizon, HORIZON_CONFIG["1m"])
-    dte_min   = config["dte_min"]
-    dte_max   = config["dte_max"]
+    config = HORIZON_CONFIG.get(horizon, HORIZON_CONFIG["1m"])
+
+    if trading_window_days is None:
+        trading_window_days = (config["dte_min"] + config["dte_max"]) // 2
 
     from_date = (datetime.now()-timedelta(days=300)).strftime('%Y-%m-%d')
     to_date   = datetime.now().strftime('%Y-%m-%d')
@@ -139,18 +160,20 @@ def get_options_for_horizon(
     ta        = get_technical_profile(ticker, bars) if bars else {}
     signal    = score_signal_package(get_signal_package(ticker))
 
-    from app.strategy.engine import _get_all_expiries
-    all_exp  = _get_all_expiries(ticker)
-    today_dt = datetime.now()
-    valid    = [
-        (exp, (datetime.strptime(exp, "%Y-%m-%d") - today_dt).days)
-        for exp in all_exp
-        if dte_min <= (datetime.strptime(exp, "%Y-%m-%d") - today_dt).days <= dte_max
-    ]
-    if not valid:
-        return {"error": f"No expiry found between {dte_min}-{dte_max} DTE for {ticker}"}
-    best_exp, best_dte = sorted(valid, key=lambda x: abs(x[1] - (dte_min+dte_max)//2))[0]
-    print(f"[Horizon] {ticker} {horizon}: using expiry {best_exp} ({best_dte} DTE)")
+    # Nearest REAL listed expiry to the target date — same approach
+    # rescan_engine.py uses for SPY/QQQ (nearest_friday_to), but against
+    # this ticker's actual listed expiries instead of an assumed weekly
+    # Friday cadence (most individual stocks don't have weekly options).
+    target_expiry_date = compute_target_date(trading_window_days)
+    all_exp = _get_all_expiries(ticker)
+    if not all_exp:
+        return {"error": f"No listed expiries found for {ticker}"}
+
+    target_dt = datetime.strptime(target_expiry_date, "%Y-%m-%d")
+    best_exp  = min(all_exp, key=lambda exp: abs((datetime.strptime(exp, "%Y-%m-%d") - target_dt).days))
+    best_dte  = (datetime.strptime(best_exp, "%Y-%m-%d") - datetime.now()).days
+    print(f"[Horizon] {ticker} {horizon}: target {target_expiry_date} "
+          f"({trading_window_days}d window) -> nearest listed expiry {best_exp} ({best_dte} DTE)")
 
     rec = build_recommendation(
         ticker      = ticker,
@@ -158,14 +181,26 @@ def get_options_for_horizon(
         flow_signal = signal,
         budget      = budget,
         user_id     = user_id,
-        min_dte     = best_dte - 1,
+        min_dte     = max(best_dte - 1, 0),
         max_dte     = best_dte + 1,
     )
 
     if rec:
-        rec["horizon"]      = horizon
-        rec["horizon_label"] = config["label"]
-        rec["rec_type"]     = "options"
+        rec["horizon"]             = horizon
+        rec["horizon_label"]       = config["label"]
+        rec["rec_type"]            = "options"
+        rec["trading_window_days"] = trading_window_days
+
+        # User-driven stop/target take priority over whatever R/R-derived
+        # dollar target_profit/stop_loss the strategy engine computed —
+        # mirrors rescan_engine.py's new-pick path
+        # (trade["target_pct"] = profit_target_pct, trade["stop_pct"] = -stop_loss_pct).
+        best = rec.get("best")
+        if best is not None:
+            if profit_target_pct is not None:
+                best["target_pct"] = profit_target_pct
+            if stop_loss_pct is not None:
+                best["stop_pct"] = -stop_loss_pct
     return rec
 
 
@@ -178,8 +213,18 @@ def get_stock_for_horizon(
     horizon: str,
     budget: float,
     current_price: float | None = None,
+    trading_window_days: int | None = None,
+    stop_loss_pct: float | None = None,
+    profit_target_pct: float | None = None,
 ) -> dict:
-    """Build stock recommendation for 3m / 6m / 1yr horizon."""
+    """
+    Build a stock recommendation for a target trading window.
+
+    trading_window_days/stop_loss_pct/profit_target_pct are real user
+    inputs — when omitted, falls back to the horizon bucket's own
+    STOCK_UPSIDE_TARGETS/stop_pct/momentum-lookback defaults, so existing
+    callers that only pass `horizon` keep working unchanged.
+    """
     from app.recommendations.fundamentals import (
         get_fundamentals, get_dp_accumulation_score, score_fundamentals,
         analyst_target_reliability,
@@ -201,7 +246,7 @@ def get_stock_for_horizon(
     dp           = get_dp_accumulation_score(ticker)
     fund_score   = score_fundamentals(fundamentals, dp, current_price)
 
-    min_fund = config.get("min_fundamental", 55)
+    min_fund = STOCK_MIN_FUNDAMENTAL
     if fund_score["fundamental_score"] < min_fund:
         return {
             "filtered": True,
@@ -210,7 +255,7 @@ def get_stock_for_horizon(
             "horizon":  horizon,
         }
 
-    momentum = _get_momentum(ticker, horizon)
+    momentum = _get_momentum(ticker, horizon, trading_window_days)
 
     # Discount the raw analyst mean target by the same reliability factor
     # smart_stock_scan.py uses for ranking (thin coverage below ~$15 and
@@ -229,7 +274,10 @@ def get_stock_for_horizon(
         )
         analyst_target = current_price + (raw_analyst_target - current_price) * reliability
 
-    momentum_target = current_price * (1 + STOCK_UPSIDE_TARGETS.get(horizon, 0.25))
+    if profit_target_pct is not None:
+        momentum_target = current_price * (1 + profit_target_pct / 100)
+    else:
+        momentum_target = current_price * (1 + STOCK_UPSIDE_TARGETS.get(horizon, 0.25))
 
     if analyst_target and analyst_target > current_price:
         target_price = max(analyst_target, momentum_target)
@@ -240,7 +288,7 @@ def get_stock_for_horizon(
 
     target_pct = round((target_price - current_price) / current_price * 100, 1)
 
-    stop_pct   = config["stop_pct"]
+    stop_pct   = -stop_loss_pct if stop_loss_pct is not None else config["stop_pct"]
     stop_price = round(current_price * (1 + stop_pct / 100), 2)
 
     shares = int(budget / current_price)
@@ -250,7 +298,7 @@ def get_stock_for_horizon(
 
     thesis = _generate_stock_thesis(
         ticker, horizon, config, fundamentals, dp, fund_score,
-        current_price, target_price, target_pct, momentum
+        current_price, target_price, target_pct, momentum, stop_pct
     )
 
     try:
@@ -277,6 +325,7 @@ def get_stock_for_horizon(
         "ticker":            ticker,
         "horizon":           horizon,
         "horizon_label":     config["label"],
+        "trading_window_days": trading_window_days,
         "rec_type":          "stock",
         "direction":         "BULLISH",
         "fundamental_score": fund_score["fundamental_score"],
@@ -314,10 +363,28 @@ def get_stock_for_horizon(
     }
 
 
-def _get_momentum(ticker: str, horizon: str) -> dict:
+def _lookback_period_for_days(days: int) -> str:
+    """Closest yfinance history(period=...) bucket for a day count.
+
+    yfinance only accepts a fixed set of period strings (no arbitrary
+    "Nd"), so this rounds trading_window_days to the nearest supported
+    bucket rather than passing the raw day count straight through.
+    """
+    if days <= 7:   return "5d"
+    if days <= 30:  return "1mo"
+    if days <= 90:  return "3mo"
+    if days <= 180: return "6mo"
+    if days <= 365: return "1y"
+    return "2y"
+
+
+def _get_momentum(ticker: str, horizon: str, trading_window_days: int | None = None) -> dict:
     try:
         import yfinance as yf
-        lookback = {"3m": "3mo", "6m": "6mo", "1yr": "1y"}.get(horizon, "3mo")
+        if trading_window_days is not None:
+            lookback = _lookback_period_for_days(trading_window_days)
+        else:
+            lookback = {"3m": "3mo", "6m": "6mo", "1yr": "1y"}.get(horizon, "3mo")
         hist     = yf.Ticker(ticker).history(period=lookback)
         if hist.empty:
             return {"score": 50, "note": "No price history"}
@@ -348,7 +415,7 @@ def _generate_stock_thesis(
     ticker: str, horizon: str, config: dict,
     fundamentals: dict, dp: dict, fund_score: dict,
     current_price: float, target_price: float, target_pct: float,
-    momentum: dict,
+    momentum: dict, stop_pct: float,
 ) -> str:
     rev_g   = fundamentals.get("revenue_growth", 0) or 0
     peg     = fundamentals.get("peg_ratio")
@@ -374,7 +441,7 @@ def _generate_stock_thesis(
     parts.append(
         f"Momentum: {momentum.get('note', 'N/A')}. "
         f"Entry near ${current_price:.2f}, target ${target_price:.2f}, "
-        f"stop ${current_price * (1 + config['stop_pct']/100):.2f} ({config['stop_pct']}%)."
+        f"stop ${current_price * (1 + stop_pct/100):.2f} ({stop_pct}%)."
     )
 
     return " ".join(parts)
@@ -389,7 +456,16 @@ def get_horizon_recommendation(
     horizon: str,
     budget:  float = 2000,
     user_id: str | None = None,
+    trading_window_days: int | None = None,
+    stop_loss_pct: float | None = None,
+    profit_target_pct: float | None = None,
 ) -> dict:
+    """
+    trading_window_days/stop_loss_pct/profit_target_pct pass straight
+    through to get_options_for_horizon/get_stock_for_horizon - no new
+    logic here beyond the existing options/stock/both routing. Omitted
+    (None) preserves the old horizon-bucket-only behavior.
+    """
     config = HORIZON_CONFIG.get(horizon)
     if not config:
         return {"error": f"Unknown horizon '{horizon}'. Valid: {list(HORIZON_CONFIG.keys())}"}
@@ -415,18 +491,34 @@ def get_horizon_recommendation(
     rec_type = config["type"]
 
     if rec_type == "options":
-        rec = get_options_for_horizon(ticker, horizon, budget, user_id)
+        rec = get_options_for_horizon(
+            ticker, horizon, budget, user_id,
+            trading_window_days=trading_window_days,
+            stop_loss_pct=stop_loss_pct, profit_target_pct=profit_target_pct,
+        )
         result["options_rec"] = rec
         result["primary_rec"] = "options"
 
     elif rec_type == "stock":
-        rec = get_stock_for_horizon(ticker, horizon, budget)
+        rec = get_stock_for_horizon(
+            ticker, horizon, budget,
+            trading_window_days=trading_window_days,
+            stop_loss_pct=stop_loss_pct, profit_target_pct=profit_target_pct,
+        )
         result["stock_rec"] = rec
         result["primary_rec"] = "stock"
 
     elif rec_type == "both":
-        options_rec = get_options_for_horizon(ticker, horizon, budget, user_id)
-        stock_rec   = get_stock_for_horizon(ticker, horizon, budget)
+        options_rec = get_options_for_horizon(
+            ticker, horizon, budget, user_id,
+            trading_window_days=trading_window_days,
+            stop_loss_pct=stop_loss_pct, profit_target_pct=profit_target_pct,
+        )
+        stock_rec = get_stock_for_horizon(
+            ticker, horizon, budget,
+            trading_window_days=trading_window_days,
+            stop_loss_pct=stop_loss_pct, profit_target_pct=profit_target_pct,
+        )
         result["options_rec"] = options_rec
         result["stock_rec"]   = stock_rec
 
@@ -449,8 +541,17 @@ def scan_for_horizon(
     budget:  float = 2000,
     top_n:   int   = 5,
     user_id: str | None = None,
+    trading_window_days: int | None = None,
+    stop_loss_pct: float | None = None,
+    profit_target_pct: float | None = None,
 ) -> dict:
-    """Scan the user's actual watchlist + portfolio for horizon recommendations."""
+    """
+    Scan the user's actual watchlist + portfolio for horizon recommendations.
+
+    trading_window_days/stop_loss_pct/profit_target_pct just pass through
+    to whichever of run_smart_stock_scan/get_horizon_recommendation this
+    scans with per candidate - no new logic of its own.
+    """
     import time
 
     config     = HORIZON_CONFIG.get(horizon, HORIZON_CONFIG["1m"])
@@ -479,6 +580,8 @@ def scan_for_horizon(
         next_day_flag = not market_open
         scan_result   = run_smart_stock_scan(
             user_id, horizon=horizon, budget=budget, top_n=top_n, tickers=tickers,
+            trading_window_days=trading_window_days,
+            stop_loss_pct=stop_loss_pct, profit_target_pct=profit_target_pct,
         )
         results = [
             {
@@ -511,7 +614,11 @@ def scan_for_horizon(
 
     for ticker in tickers:
         try:
-            rec = get_horizon_recommendation(ticker, horizon, budget, user_id)
+            rec = get_horizon_recommendation(
+                ticker, horizon, budget, user_id,
+                trading_window_days=trading_window_days,
+                stop_loss_pct=stop_loss_pct, profit_target_pct=profit_target_pct,
+            )
 
             if rec_type in ("options", "both"):
                 options_rec = rec.get("options_rec", {})

@@ -181,13 +181,21 @@ def _score_ticker(ticker, fd, target, velocity, insider) -> dict:
 
 
 def run_smart_stock_scan(user_id, horizon="6m", budget=5000.0, top_n=5,
-                          watchlist_mode="default_plus_mine", tickers=None):
+                          watchlist_mode="default_plus_mine", tickers=None,
+                          trading_window_days=None, stop_loss_pct=None,
+                          profit_target_pct=None):
     """
     tickers: optional explicit universe override. A caller that already
     resolved the watchlist (e.g. horizon_engine.scan_for_horizon, which
     needs the same tickers for its options half too) can pass it directly
     instead of forcing a second get_scan_universe() lookup. Default None
     preserves the original behavior of resolving it here.
+
+    trading_window_days/stop_loss_pct/profit_target_pct: real user inputs,
+    passed straight through to Phase 2's get_stock_for_horizon() call per
+    candidate. trading_window_days falls back to the horizon bucket's own
+    default (via get_stock_for_horizon itself) when omitted - horizon
+    still routes/labels the scan here, same as before.
     """
     from app.signals.velocity_tracker import get_velocity_scores
 
@@ -319,7 +327,11 @@ def run_smart_stock_scan(user_id, horizon="6m", budget=5000.0, top_n=5,
         if ticker in seen: continue
         seen.add(ticker)
         try:
-            rec = get_stock_for_horizon(ticker, horizon, budget, current_price=cand["price"])
+            rec = get_stock_for_horizon(
+                ticker, horizon, budget, current_price=cand["price"],
+                trading_window_days=trading_window_days,
+                stop_loss_pct=stop_loss_pct, profit_target_pct=profit_target_pct,
+            )
             if rec and not rec.get("filtered"):
                 rec.update({
                     "composite_score": cand["composite"], "velocity": cand["velocity"],

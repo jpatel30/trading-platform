@@ -15,10 +15,13 @@ import json
 from datetime import datetime, timedelta
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi import FastAPI, HTTPException, Depends, status, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+
+from app.broker.base import BrokerNotConnectedError
 
 try:
     from jose import JWTError, jwt
@@ -46,6 +49,43 @@ app.add_middleware(
     allow_methods     = ["*"],
     allow_headers     = ["*"],
 )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Broker-not-connected — centralized, not per-endpoint
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Broker connection (Webull) is admin-only by design (see ARCHITECTURE.md's
+# "Broker Connection Is Optional") - every non-admin user hits
+# BrokerNotConnectedError on every broker-touching endpoint, always, not as
+# an edge case. A single handler here means a new call site added later
+# can't reintroduce an uncaught 500 the way four separate per-endpoint
+# try/excepts already did - the same class of "same fix needed in N places"
+# duplication (flow_scoring, excluded_from_stats) already cleaned up
+# elsewhere this session. 200, not 500: this is an expected, normal state
+# for most users, not a server error - shaped per endpoint with a
+# `no_broker` flag so the frontend can distinguish it from "connected but
+# genuinely zero positions/signals" unambiguously.
+#
+# Each broker-touching endpoint must let BrokerNotConnectedError propagate
+# past its own try/except (via `except BrokerNotConnectedError: raise`
+# before any blanket `except Exception`) for this handler to ever see it.
+@app.exception_handler(BrokerNotConnectedError)
+async def broker_not_connected_handler(request: Request, exc: BrokerNotConnectedError):
+    path = request.url.path
+    if path == "/api/sell-signals":
+        body = {"no_broker": True, "signals": [], "pnl": {}}
+    elif path == "/api/portfolio/check-fills":
+        body = {"no_broker": True, "new_fills": [], "positions_count": 0, "recs_count": 0}
+    else:
+        # /api/portfolio, /api/portfolio/active-bets, and any future
+        # broker-touching endpoint default to the full portfolio shape.
+        body = {
+            "no_broker": True, "positions": [], "balances": {}, "pnl": {},
+            "bets": [], "source": "no_broker",
+        }
+    return JSONResponse(status_code=200, content=body)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # JWT Auth
@@ -539,6 +579,8 @@ async def get_portfolio(
             "bets":          bets,
             "source":        source,
         }
+    except BrokerNotConnectedError:
+        raise  # handled globally - see broker_not_connected_handler
     except Exception as e:
         import traceback
         print(f"[Portfolio API Error] {traceback.format_exc()}")
@@ -553,6 +595,8 @@ async def get_active_bets_api(user_id: str = Depends(get_current_user)):
         broker    = get_broker(user_id)
         positions = broker.get_positions()
         return get_active_bets(positions, user_id=user_id)
+    except BrokerNotConnectedError:
+        raise  # handled globally - see broker_not_connected_handler
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -601,17 +645,42 @@ async def get_daily_recs(
             # ── STOCK scan ────────────────────────────────────────────────
             if scan_type == "stocks":
                 from app.recommendations.smart_stock_scan import run_smart_stock_scan
+                from app.recommendations.horizon_engine import HORIZON_CONFIG
                 from starlette.concurrency import run_in_threadpool
+
+                # Same shim style as the options branch below:
+                # run_smart_stock_scan (and get_stock_for_horizon beneath it)
+                # take real trading_window_days/stop_loss_pct/profit_target_pct
+                # inputs now, not just a horizon bucket. Unlike the options
+                # engine (which dropped horizon entirely), get_stock_for_horizon
+                # still has its own horizon-aware fallback (STOCK_UPSIDE_TARGETS,
+                # config stop_pct, momentum lookback) for when trading_window_days
+                # is None - only derive a number here when HORIZON_CONFIG
+                # actually has a DTE range to derive from (the "3m" bucket);
+                # for pure stock horizons (6m/1yr, no dte_min/dte_max) leave it
+                # None so that better per-horizon fallback runs downstream
+                # instead of a synthetic day count guessed here.
+                stock_trading_window_days = trading_window_days
+                if stock_trading_window_days is None:
+                    cfg = HORIZON_CONFIG.get(horizon, {})
+                    if "dte_min" in cfg:
+                        stock_trading_window_days = (cfg["dte_min"] + cfg["dte_max"]) // 2
+                stock_scan_kwargs = dict(
+                    user_id=user_id, horizon=horizon, budget=budget, top_n=5,
+                    watchlist_mode=watchlist_mode,
+                    trading_window_days=stock_trading_window_days,
+                )
+                if stop_loss_pct is not None:
+                    stock_scan_kwargs["stop_loss_pct"] = stop_loss_pct
+                if profit_target_pct is not None:
+                    stock_scan_kwargs["profit_target_pct"] = profit_target_pct
+
                 # run_smart_stock_scan is fully synchronous (yfinance calls,
                 # ThreadPoolExecutor().result() waits, ~30-40s runtime) — same
                 # blocking-event-loop issue fixed for the options branch last
                 # session. Without this, /api/scan/status polls queue as
                 # genuinely unprocessed for the full scan duration.
-                scan_result = await run_in_threadpool(
-                    run_smart_stock_scan,
-                    user_id=user_id, horizon=horizon, budget=budget, top_n=5,
-                    watchlist_mode=watchlist_mode,
-                )
+                scan_result = await run_in_threadpool(run_smart_stock_scan, **stock_scan_kwargs)
                 results = scan_result.get("stocks", [])
                 for rec in results:
                     ticker = rec.get("ticker","")
@@ -1017,6 +1086,8 @@ async def get_sell_signals(user_id: str = Depends(get_current_user)):
         broker    = get_broker(user_id)
         positions = broker.get_positions()
         return evaluate_sell_signals(positions)
+    except BrokerNotConnectedError:
+        raise  # handled globally - see broker_not_connected_handler
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -1123,6 +1194,8 @@ async def check_fills(user_id: str = Depends(get_current_user)):
             "positions_count": len(positions),
             "recs_count": len(recs),
         }
+    except BrokerNotConnectedError:
+        raise  # handled globally - see broker_not_connected_handler
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

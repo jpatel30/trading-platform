@@ -950,7 +950,24 @@ def build_recommendation(
         llm_decision = _deterministic_strategy(direction, confidence, uw_avg_iv, spot, dte, call_strikes, put_strikes, atr)
         llm_decision["expiry"] = exp
         llm_decision["reasoning"] = f"LLM trade rejected (bad R/R) — using deterministic rules. {llm_decision['reasoning']}"
-        trade = _execute_trade_math(llm_decision, ticker, spot, budget, max_loss)
+        try:
+            trade = _execute_trade_math(llm_decision, ticker, spot, budget, max_loss)
+        except ValueError as e2:
+            # Both the LLM's strikes AND the deterministic fallback failed
+            # the R/R or EV gate — no viable trade at this budget/expiry,
+            # not a crash. Same graceful-return pattern as the BLOCKED/
+            # INSUFFICIENT_DATA/NO_EXPIRIES cases above, instead of letting
+            # a second ValueError propagate uncaught to the caller.
+            _log_llm_decision(ticker, llm_decision, str(e2), "REJECTED")
+            print(f"[Strategy] Deterministic fallback also rejected: {e2}")
+            return {
+                "signal": "NO_VIABLE_TRADE", "ticker": ticker,
+                "reason": (
+                    f"No strike selection cleared the R/R or EV gate at this "
+                    f"budget/expiry — LLM: {e} | deterministic fallback: {e2}"
+                ),
+                "warnings": [],
+            }
         _log_llm_decision(ticker, llm_decision, f"R/R={trade.get('risk_reward')}", "ACCEPTED")
 
     for leg in trade["legs"]:

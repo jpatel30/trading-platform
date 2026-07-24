@@ -53,27 +53,16 @@ def _iv_context(ticker: str) -> tuple:
     """(current atm_iv, 5-day trend as % rate of change) from iv_history —
     the rate of change over the last 5 RECORDED days, not just current
     level. Returns (None, None) if there's no history yet for this
-    ticker (e.g. the after-hours batch hasn't run for it yet)."""
-    try:
-        from sqlalchemy import text
-        from app.db.session import get_session
-        with get_session() as s:
-            rows = s.execute(text("""
-                SELECT recorded_at, atm_iv FROM iv_history
-                WHERE ticker = :t AND atm_iv IS NOT NULL
-                ORDER BY recorded_at DESC LIMIT 5
-            """), {"t": ticker.upper()}).fetchall()
-        if not rows:
-            return None, None
-        current = float(rows[0].atm_iv)
-        if len(rows) < 5:
-            return current, None
-        oldest = float(rows[-1].atm_iv)
-        trend  = round((current - oldest) / oldest * 100, 2) if oldest else None
-        return current, trend
-    except Exception as e:
-        print(f"[PaperTrade] IV context failed for {ticker}: {e}")
-        return None, None
+    ticker (e.g. the after-hours batch hasn't run for it yet).
+
+    Thin adapter over signals/iv_expansion.py::get_iv_expansion_signal() —
+    that's the single shared place this rate-of-change is computed now
+    (previously duplicated here); this function just extracts the two
+    raw values this module's callers already expect."""
+    from app.signals.iv_expansion import get_iv_expansion_signal
+    result = get_iv_expansion_signal(ticker)
+    trend = None if result.get("insufficient_history") else result.get("raw_change_pct")
+    return result.get("current_iv"), trend
 
 
 def _daily_snapshot_context(ticker: str) -> dict:

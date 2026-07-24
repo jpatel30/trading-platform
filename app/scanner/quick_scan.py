@@ -40,6 +40,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, date
 
+from app.signals.iv_expansion import get_iv_expansion_signal
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TIER 1: Fast Signal Pre-Filter
@@ -648,6 +650,13 @@ def quick_scan(
         signals    = []
         directions = []
 
+        # Anti-chasing pre-filter: a move that already happened today
+        # (|change_pct| >= 5%) has nothing left to predict — applied
+        # BEFORE scoring, not as a signal of its own, so it can't be
+        # outvoted by flow/dp/oi convergence.
+        if abs(change_pct) >= 5:
+            continue
+
         # Signal 1: Price momentum (threshold varies: 1.5% live, 0.5% on closed days)
         if abs(change_pct) >= mom_threshold:
             direction = "BULLISH" if change_pct > 0 else "BEARISH"
@@ -685,6 +694,16 @@ def quick_scan(
             oi_dir = "BULLISH" if oi_score > 0 else "BEARISH"
             signals.append(f"oi_buildup {oi_score:+.0f}% {oi_days}d")
             directions.append(oi_dir)
+
+        # Signal 6: IV expansion (leading indicator — reads iv_history,
+        # zero added API cost). Directionally NEUTRAL by design (rising
+        # IV means a BIGGER expected move, not which way) — adds context/
+        # visibility, doesn't cast a bull/bear vote like signals 1-5.
+        iv_result = get_iv_expansion_signal(ticker)
+        if not iv_result.get("insufficient_history") and iv_result.get("score") is not None \
+                and abs(iv_result["score"]) >= 15:
+            signals.append(f"{iv_result['signal'].lower()} {iv_result['score']:+.0f}%")
+
         if len(signals) < min_convergence:
             continue
 
@@ -739,6 +758,8 @@ def quick_scan(
             "alert_count": flow_data.get("alert_count", 0),
             "oi_score":    oi.get("score", 0),
             "oi_days":     oi.get("days", 0),
+            "iv_expansion_score":  iv_result.get("score"),
+            "iv_expansion_signal": iv_result.get("signal"),
             "conflict":    conflict,
         })
 

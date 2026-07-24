@@ -152,6 +152,15 @@ def _enrich_ticker(
     except Exception:
         result["oi_score"], result["oi_signal"], result["oi_max_days"] = 0, "NEUTRAL", 0
 
+    try:
+        from app.signals.iv_expansion import get_iv_expansion_signal
+        iv_exp = get_iv_expansion_signal(ticker)
+        result["iv_exp_score"]  = iv_exp.get("score")
+        result["iv_exp_signal"] = iv_exp.get("signal", "INSUFFICIENT_HISTORY")
+        result["iv_exp_days"]   = iv_exp.get("days_of_data", 0)
+    except Exception:
+        result["iv_exp_score"], result["iv_exp_signal"], result["iv_exp_days"] = None, "INSUFFICIENT_HISTORY", 0
+
     # Velocity — must use the REAL user_id, not pick.get("user_id",""),
     # which is always "" since scanner picks never carry that key.
     try:
@@ -221,6 +230,14 @@ def _compress_ticker(t: dict) -> str:
     earn_str = (f"EARNINGS {earn}d (move±{t.get('expected_move', 0):.1f}%)"
                 if earn < 60 else "no near earnings")
 
+    # Surfaced separately (not inline in the f-string below) since the
+    # LLM needs to actually see when there isn't enough real history yet
+    # to trust this signal, rather than a fabricated/defaulted score.
+    if t.get("iv_exp_signal") == "INSUFFICIENT_HISTORY":
+        iv_exp_str = f"insufficient_history({t.get('iv_exp_days', 0)}d)"
+    else:
+        iv_exp_str = f"{t.get('iv_exp_score', 0):+.0f}({t.get('iv_exp_signal', '')})"
+
     return (
         f"[{t['ticker']} | {t['direction']} | ${t['price']:.2f} | "
         f"{t.get('change_pct', 0):+.1f}% | "
@@ -233,6 +250,7 @@ def _compress_ticker(t: dict) -> str:
         f"  News: {news_str}"
         f" GEX:{'NEG' if t.get('gex_negative') else 'POS'} Vel:{t.get('velocity',0):+.0f}% Insider:{t.get('insider_signal','N')}"
         f" OI:{t.get('oi_score',0):+.0f}({t.get('oi_signal','NEUTRAL')},{t.get('oi_max_days',0)}d)"
+        f" IVexp:{iv_exp_str}"
         f"{' ⚠️SIGNALS_CONFLICT' if t.get('conflict') else ''}"
     )
 

@@ -366,31 +366,52 @@ async def startup_event():
             id="nightly_learning", replace_existing=True,
         )
 
+        def _get_paper_trade_admin_user_id():
+            """
+            Paper trading (Phase 4/5) is a single platform-level signal-
+            generation exercise, not a per-customer feature - it must run
+            exactly ONCE per scheduled fire, always against the admin
+            account (the same account whose watchlist already backs
+            get_scan_universe()'s shared default universe), never fanned
+            out across every real active customer. Looping over
+            `SELECT id FROM users WHERE is_active=TRUE` was the actual bug
+            behind today's apparent "double fire" - with 2 active users
+            (1 admin + 1 real beta customer), that loop silently ran the
+            same job twice, once per account, producing two job_run_log
+            rows that looked like a scheduler misfire but were actually
+            working exactly as (wrongly) designed.
+            """
+            from sqlalchemy import text
+            from app.db.session import get_session
+            with get_session() as s:
+                row = s.execute(text(
+                    "SELECT id FROM users WHERE is_admin=TRUE AND is_active=TRUE LIMIT 1"
+                )).fetchone()
+            return str(row.id) if row else None
+
         def _run_paper_trade_open_options():
             try:
-                from sqlalchemy import text
-                from app.db.session import get_session
                 from app.recommendations.paper_trading import run_paper_trade_open_options
-                with get_session() as s:
-                    users = s.execute(text("SELECT id FROM users WHERE is_active=TRUE")).fetchall()
-                for u in users:
-                    result = run_paper_trade_open_options(str(u.id))
-                    print(f"[Scheduler] Paper trade open (options): {result.get('confirmed')} confirmed, "
-                          f"{result.get('empty')} empty, {result.get('errored')} errored")
+                uid = _get_paper_trade_admin_user_id()
+                if not uid:
+                    print("[Scheduler] Paper trade open (options) skipped: no admin user found")
+                    return
+                result = run_paper_trade_open_options(uid)
+                print(f"[Scheduler] Paper trade open (options): {result.get('confirmed')} confirmed, "
+                      f"{result.get('empty')} empty, {result.get('errored')} errored")
             except Exception as e:
                 print(f"[Scheduler] Paper trade open (options) failed: {e}")
 
         def _run_paper_trade_open_stocks():
             try:
-                from sqlalchemy import text
-                from app.db.session import get_session
                 from app.recommendations.paper_trading import run_paper_trade_open_stocks
-                with get_session() as s:
-                    users = s.execute(text("SELECT id FROM users WHERE is_active=TRUE")).fetchall()
-                for u in users:
-                    result = run_paper_trade_open_stocks(str(u.id))
-                    print(f"[Scheduler] Paper trade open (stocks): {result.get('confirmed')} confirmed, "
-                          f"{result.get('empty')} empty, {result.get('errored')} errored")
+                uid = _get_paper_trade_admin_user_id()
+                if not uid:
+                    print("[Scheduler] Paper trade open (stocks) skipped: no admin user found")
+                    return
+                result = run_paper_trade_open_stocks(uid)
+                print(f"[Scheduler] Paper trade open (stocks): {result.get('confirmed')} confirmed, "
+                      f"{result.get('empty')} empty, {result.get('errored')} errored")
             except Exception as e:
                 print(f"[Scheduler] Paper trade open (stocks) failed: {e}")
 
@@ -407,16 +428,15 @@ async def startup_event():
 
         def _run_paper_trade_close():
             try:
-                from sqlalchemy import text
-                from app.db.session import get_session
                 from app.recommendations.paper_trading import run_paper_trade_close
-                with get_session() as s:
-                    users = s.execute(text("SELECT id FROM users WHERE is_active=TRUE")).fetchall()
-                for u in users:
-                    result = run_paper_trade_close(str(u.id))
-                    print(f"[Scheduler] Paper trade close: {result.get('closed')} closed, "
-                          f"{result.get('wins')}W/{result.get('losses')}L, "
-                          f"${result.get('total_pnl_dollars')} pnl, {result.get('errored')} errored")
+                uid = _get_paper_trade_admin_user_id()
+                if not uid:
+                    print("[Scheduler] Paper trade close skipped: no admin user found")
+                    return
+                result = run_paper_trade_close(uid)
+                print(f"[Scheduler] Paper trade close: {result.get('closed')} closed, "
+                      f"{result.get('wins')}W/{result.get('losses')}L, "
+                      f"${result.get('total_pnl_dollars')} pnl, {result.get('errored')} errored")
             except Exception as e:
                 print(f"[Scheduler] Paper trade close failed: {e}")
 

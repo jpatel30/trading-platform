@@ -5,7 +5,6 @@ Last updated: July 2026
 Last updated: July 2026. Full technical narrative (root causes, exact fixes, line-by-line verification) for completed work lives in git log commit messages - this doc stays a scannable status/priority list, not a technical diary.
 
 Priority Order (Remaining)
-Root-cause today's scheduler double-fire bug
 Build per-combo idempotency (ticker+window+budget+day)
 Build shared retry-queue mechanism (batch + paper-trade jobs)
 Wire iv_history into prediction (IV-expansion signal)
@@ -35,43 +34,41 @@ Add mobile push notifications
 Build a public invite page
 Descriptions
 
-1. Root-cause today's scheduler double-fire bug No second launchd job matches paper_trade - rules out a duplicate external trigger. paper_trade_open_stocks fired twice today, 105s apart (06:40:00 success/20, 06:41:45 failed/"7 of 20 futures unfinished"). Likely the same in-process APScheduler fragility already known to silently miss a run under --reload, this time double-firing instead. Needs uvicorn/APScheduler log inspection to confirm, not more DB queries.
+1. Build per-combo idempotency Key on ticker+window+budget+day so a job firing twice (whatever the cause) can never again silently create duplicate positions. Still relevant even after today's scheduler-firing diagnosis - a good structural backstop, not a substitute for it. Hard prerequisite for #4.
 
-2. Build per-combo idempotency Structural fix for #1 (and any future cause of the same symptom): key on ticker+window+budget+day so a job firing twice can never again silently create duplicate positions. Directly explains today's RGTI showing 24 tracked_positions rows (six 4-budget sets) instead of the expected 5. Hard prerequisite for #5.
+2. Shared retry-queue mechanism One utility, used by after_hours_batch's per-ticker loop AND paper_trade_open_stocks's Phase-1 composite-ranking fetch (analyst-target/velocity/insider - all use as_completed() with a hard timeout and no retry): run the normal pass, collect exactly which items failed/timed out, wait a short buffer, retry once, log clearly whatever still fails (no infinite loop). A transient network timeout there still fails the whole run today (now honestly reported instead of silently disappearing - see git log for the scheduler double-fire investigation - but still a full-run failure rather than a graceful retry).
 
-3. Shared retry-queue mechanism One utility, used by after_hours_batch's per-ticker loop AND paper_trade_open's per-combo pool: run the normal pass, collect exactly which items failed/timed out, wait a short buffer, retry once, log clearly whatever still fails (no infinite loop). Would have directly prevented today's "7 unfinished futures" from half-writing into a job that reported itself a total failure.
+3. Wire iv_history into prediction The existing "predictive IV-expansion" signal: catch IV expanding ahead of a price move, distinct from OI buildup and from momentum (inherently reactive). Paired with a simple anti-chasing rule - don't recommend a ticker that's already moved >=5% today.
 
-4. Wire iv_history into prediction The existing "predictive IV-expansion" signal: catch IV expanding ahead of a price move, distinct from OI buildup and from momentum (inherently reactive). Paired with a simple anti-chasing rule - don't recommend a ticker that's already moved >=5% today.
+4. Expand scheduling to multiple times/day, capped at ~20 total Morning/mid-day/afternoon/near-close, simulating "if I checked right now, what would I find." CORRECTED: the ~20 target is TOTAL unique picks across the whole day, combined across every run - not ~20 per run (which would have meant up to ~100/day, mostly repeats of the same tickers). Each later run needs to know what earlier runs already opened today and either skip a ticker/combo already represented, or only add something genuinely new - the same underlying coordination problem as #1's idempotency, just at the "total daily volume" level instead of the "exact combo" level, so #1 should solve both together rather than as two separate mechanisms. Deliberately last - only safe once #1 and #2 are real, otherwise this multiplies today's exact bug on purpose. Open question, not yet decided: is ~20 split evenly across options/stock (~10 each), or ~20 total combined across both types?
 
-5. Expand scheduling to multiple times/day, capped at ~20 total Morning/mid-day/afternoon/near-close, simulating "if I checked right now, what would I find." CORRECTED: the ~20 target is TOTAL unique picks across the whole day, combined across every run - not ~20 per run (which would have meant up to ~100/day, mostly repeats of the same tickers). Each later run needs to know what earlier runs already opened today and either skip a ticker/combo already represented, or only add something genuinely new - the same underlying coordination problem as #2's idempotency, just at the "total daily volume" level instead of the "exact combo" level, so #2 should solve both together rather than as two separate mechanisms. Deliberately last - only safe once #2 and #3 are real, otherwise this multiplies today's exact bug on purpose. Open question, not yet decided: is ~20 split evenly across options/stock (~10 each), or ~20 total combined across both types?
+5. Fix check_fills() Auto-detects fills by comparing live Webull positions against today's recommendations - matches on bare ticker only, not strike/expiry/type. Already caused one real mislabeled fill (an existing MSTR position auto-matched to an unrelated recommendation). DB rows cleaned up; root cause not yet fixed.
 
-6. Fix check_fills() Auto-detects fills by comparing live Webull positions against today's recommendations - matches on bare ticker only, not strike/expiry/type. Already caused one real mislabeled fill (an existing MSTR position auto-matched to an unrelated recommendation). DB rows cleaned up; root cause not yet fixed.
+6. Returning-user login path login_with_invite() is the only way in and requires a still-pending invite_code every time. Once accepted, the only way back in is a manual DB reset. Blocks inviting real beta users, who have no database access.
 
-7. Returning-user login path login_with_invite() is the only way in and requires a still-pending invite_code every time. Once accepted, the only way back in is a manual DB reset. Blocks inviting real beta users, who have no database access.
+7. MCP key regeneration Keys mint once at account creation with no way to reissue if lost. create_api_key() already supports multiple active keys per user - just needs a self-serve endpoint.
 
-8. MCP key regeneration Keys mint once at account creation with no way to reissue if lost. create_api_key() already supports multiple active keys per user - just needs a self-serve endpoint.
+8. Cloud deployment Cloudflare tunnel or Railway.app. Directly unblocks #9 - multi-tenant MCP access is fully built and tested but has nowhere to actually run for a real customer yet.
 
-9. Cloud deployment Cloudflare tunnel or Railway.app. Directly unblocks #10 - multi-tenant MCP access is fully built and tested but has nowhere to actually run for a real customer yet.
+9. Hosted MCP server MCP_TRANSPORT=http + ApiKeyTokenVerifier exist and are wired in, purely blocked on #8.
 
-10. Hosted MCP server MCP_TRANSPORT=http + ApiKeyTokenVerifier exist and are wired in, purely blocked on #9.
+10. get_bars() wrapper bug Silently ignores the multiplier argument, only maps minute/hour/day/ week timespans - multiplier=5 would NOT actually fetch 5-minute bars through it. intraday_entry.py already works around this by calling unusual_whales.get_ohlc() directly; the wrapper itself is still a trap for any future caller.
 
-11. get_bars() wrapper bug Silently ignores the multiplier argument, only maps minute/hour/day/ week timespans - multiplier=5 would NOT actually fetch 5-minute bars through it. intraday_entry.py already works around this by calling unusual_whales.get_ohlc() directly; the wrapper itself is still a trap for any future caller.
+11. Wire unused UW data into scoring Economic calendar and net-flow-by-expiry are never called - plausible real signal upgrades. Congress trades and insider-ownership-pct tools exist but don't feed conviction scoring or the LLM prompt at all.
 
-12. Wire unused UW data into scoring Economic calendar and net-flow-by-expiry are never called - plausible real signal upgrades. Congress trades and insider-ownership-pct tools exist but don't feed conviction scoring or the LLM prompt at all.
+12. ETF scoring in stock scans Currently a technicals-only stand-in since ETFs don't have analyst targets/PEG/revenue-growth. Works, but a real fund-appropriate model (expense ratio, index-tracking quality) would be better.
 
-13. ETF scoring in stock scans Currently a technicals-only stand-in since ETFs don't have analyst targets/PEG/revenue-growth. Works, but a real fund-appropriate model (expense ratio, index-tracking quality) would be better.
+13. 3m "both" horizon's stock half Still uses horizon_engine.py's naive per-ticker loop, not smart_stock_scan.py's composite pre-filter (unlike pure 6m/1yr stock scans). Narrow, not urgent.
 
-14. 3m "both" horizon's stock half Still uses horizon_engine.py's naive per-ticker loop, not smart_stock_scan.py's composite pre-filter (unlike pure 6m/1yr stock scans). Narrow, not urgent.
+14. monitor_config table Schema exists with plausible columns (is_active, check_interval, total_alerts_fired) but usage by position_monitor.py not yet confirmed either way.
 
-15. monitor_config table Schema exists with plausible columns (is_active, check_interval, total_alerts_fired) but usage by position_monitor.py not yet confirmed either way.
+15. ChromaDB Running in docker-compose.yml, zero imports anywhere in the codebase. Either remove the container, or wire it into real RAG instead of context_builder.py's current direct-API-call approach.
 
-16. ChromaDB Running in docker-compose.yml, zero imports anywhere in the codebase. Either remove the container, or wire it into real RAG instead of context_builder.py's current direct-API-call approach.
+16. conviction.py cleanup Orphaned - its only caller (the old daily_engine.py path) was retired this session. No remaining importers. Delete it or repurpose it.
 
-17. conviction.py cleanup Orphaned - its only caller (the old daily_engine.py path) was retired this session. No remaining importers. Delete it or repurpose it.
+17. tracked_positions.daily_rec_id Column exists in schema, not yet populated by the current fill- tracking flow (which matches by ticker + fill-price proximity instead). A more direct link; low priority, current approach already works and is tested.
 
-18. tracked_positions.daily_rec_id Column exists in schema, not yet populated by the current fill- tracking flow (which matches by ticker + fill-price proximity instead). A more direct link; low priority, current approach already works and is tested.
-
-19. Revisit paper-trading calibration assumptions All of these resolve the same way - once the reliability fixes above land and a real week or two of trading-hours data accumulates, not before:
+18. Revisit paper-trading calibration assumptions All of these resolve the same way - once the reliability fixes above land and a real week or two of trading-hours data accumulates, not before:
 
 Phase 4 grid sizing (windows/budgets) - untuned, watch job_run_log yield over time
 STOCK_MIN_FUNDAMENTAL=60 - rejected every stock candidate on the one (after-hours) night tested; top priority to revisit ONLY if it recurs on a real trading day
@@ -82,24 +79,25 @@ RSI/MACD/EMA9 entry-timing rule thresholds - standard convention, unvalidated ag
 MIN_SAMPLE_SIZE=5, window-length buckets, and the 15-min wrong- entry tiebreak - confirmed implemented exactly as specified; the open question is whether they're the RIGHT numbers, not whether they were built
 Whether paper trades actually use the discussed 40%/50% options / 15%/25% stock stop/target defaults - never explicitly re-confirmed
 The -355.6% loss from Phase 5's first real run - very likely a BSM-estimate-vs-live-price artifact (pre-market synthetic entry price vs a real close price), mechanism proven correct, magnitude needs re-checking on a real market-hours run
+job_run_log has no user_id column - fine now that paper-trade jobs run once against the admin account (not looped per user), but any OTHER job that still loops over active users (after_hours_batch, velocity_snapshot, nightly_learning, weekly_strategy_review) produces indistinguishable rows per user if it ever needs the same kind of forensic reconstruction paper-trading's scheduler investigation required
 
-20. Real broker connections Robinhood/IBKR/Tastytrade - factory.py's abstraction and SnapTrade plumbing are ready; the actual OAuth/positions/orders code for each isn't written yet.
+19. Real broker connections Robinhood/IBKR/Tastytrade - factory.py's abstraction and SnapTrade plumbing are ready; the actual OAuth/positions/orders code for each isn't written yet.
 
-21. Versioned migrations Schema changes this session (fill-tracking columns, excluded_from_stats, users.is_admin, the strategy_recommendations rename, all the paper- trading tables) only exist as commands run directly against the live DB, not as files in db/migrations/.
+20. Versioned migrations Schema changes this session (fill-tracking columns, excluded_from_stats, users.is_admin, the strategy_recommendations rename, all the paper- trading tables) only exist as commands run directly against the live DB, not as files in db/migrations/.
 
-22. requirements.txt typo black>=24.0% should be black>=24.0. Flagged previously, never verified fixed.
+21. requirements.txt typo black>=24.0% should be black>=24.0. Flagged previously, never verified fixed.
 
-23. Open-source readiness sweep .env.example, public README setup video, a hardcoded-user-ID check across the codebase.
+22. Open-source readiness sweep .env.example, public README setup video, a hardcoded-user-ID check across the codebase.
 
-24. Architecture diagrams Two diagrams (backend + frontend), suitable for a public write-up. Deliberately deferred until the architecture stops moving quarter to quarter.
+23. Architecture diagrams Two diagrams (backend + frontend), suitable for a public write-up. Deliberately deferred until the architecture stops moving quarter to quarter.
 
-25. Interview talking points No dependencies, can happen anytime.
+24. Interview talking points No dependencies, can happen anytime.
 
-26. WebSocket real-time updates
+25. WebSocket real-time updates
 
-27. Mobile push notifications PWA service worker.
+26. Mobile push notifications PWA service worker.
 
-28. Public invite page
+27. Public invite page
 
 Completed (see git log for full commit-level detail)
 Multi-user MCP access - per-request identity resolution, HTTP transport, auto-minted customer keys, StockBros key-reveal screen
@@ -122,6 +120,7 @@ IRON_CONDOR strike-order bug fixed (missing swap branch, produced structurally i
 Paper-trade-close job built - real mark-to-market pricing, not a naive (exit-entry)/entry calc; found/fixed 2 real mark_to_market.py bugs (option-chain limit truncation, zero-bid legs wrongly treated as unpriceable) that blocked ANY option mark-to-market, not just paper trades
 Fixed a separate, pre-existing production bug found along the way: log_outcome/log_exit naming mismatch was breaking every real trade exit (web and MCP) with an ImportError
 Weekly strategy review (Phase 6) built - turns paper-trade outcomes into falsifiable per-bucket win-rate stats, verified against the first real week of data (correctly reported "insufficient sample" everywhere, as it should for n=4)
+Scheduler "double-fire" diagnosed and fixed - NOT a scheduler misfire (restart, sleep/wake, coalesce/max_instances were all directly ruled out with real evidence); the paper-trade jobs were looping over every active user instead of firing once, so 2 active users produced 2 job_run_log rows that looked like a duplicate fire. Fixed: these jobs now run exactly once, always against the admin account. Also found and fixed a real, separate bug along the way: _intraday_context() (used by both open jobs) had no try/except, so any transient failure there silently aborted the entire run mid-loop with zero job_run_log trace, even though earlier windows' confirmed trades were already real DB rows - now resilient, with per-window defense-in-depth on top
 Rule-based intraday entry-timing signal (5-min/15-min) built, observational only; found/fixed a real bug where every intraday bar timestamp was computing to 0
 After-hours batch job built - real daily history for TA/ fundamentals/insider activity/IV across the whole watchlist; found and fixed 4 stacked bugs in EDGAR insider-activity fetching that had made it 100% non-functional since it was built
 Architecture Decisions Locked

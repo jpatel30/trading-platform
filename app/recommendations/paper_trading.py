@@ -99,11 +99,30 @@ def _daily_snapshot_context(ticker: str) -> dict:
 
 
 def _intraday_context(ticker: str, direction: str) -> dict:
+    """
+    get_intraday_signal() has no internal try/except (a real network call
+    to get_ohlc(), plus ta-lib math on the result) and this function had
+    none either — unlike its siblings (_iv_context, _daily_snapshot_context),
+    which both degrade to safe defaults on failure. A single transient
+    failure here (flaky API call, edge-case bar data) would propagate
+    all the way out of the per-window loop in run_paper_trade_open_options/
+    _stocks, silently aborting the ENTIRE run for every remaining window —
+    losing whatever was already confirmed in earlier windows from
+    job_run_log's view even though those DB rows are real. Matches the
+    resilient pattern of its siblings now.
+    """
     from app.signals.intraday_entry import get_intraday_signal
-    return {
-        "5min":  get_intraday_signal(ticker, direction, "5min"),
-        "15min": get_intraday_signal(ticker, direction, "15min"),
-    }
+    try:
+        signal_5min = get_intraday_signal(ticker, direction, "5min")
+    except Exception as e:
+        print(f"[PaperTrade] Intraday 5min signal failed for {ticker}: {e}")
+        signal_5min = {"ticker": ticker, "timeframe": "5min", "error": str(e), "any_rule_fired": False}
+    try:
+        signal_15min = get_intraday_signal(ticker, direction, "15min")
+    except Exception as e:
+        print(f"[PaperTrade] Intraday 15min signal failed for {ticker}: {e}")
+        signal_15min = {"ticker": ticker, "timeframe": "15min", "error": str(e), "any_rule_fired": False}
+    return {"5min": signal_5min, "15min": signal_15min}
 
 
 def _lookup_recommendation_id(user_id: str, ticker: str, horizon: str) -> str | None:
@@ -313,11 +332,26 @@ def run_paper_trade_open_options(user_id: str) -> dict:
         ticker   = top_pick["ticker"]
         direction = top_pick.get("direction", "NEUTRAL")
 
-        # Shared per-window context - same ticker for all 4 budgets, so
-        # fetched once and reused rather than 4x.
-        iv_level, iv_trend = _iv_context(ticker)
-        daily_ctx  = _daily_snapshot_context(ticker)
-        intraday   = _intraday_context(ticker, direction)
+        # Whole-window defense-in-depth: everything below (context fetch +
+        # all 4 budgets) is now wrapped at the window level too, not just
+        # per-budget. An uncaught exception anywhere in here used to
+        # propagate straight out of the entire function, silently aborting
+        # every remaining window with zero job_run_log trace even though
+        # earlier windows' confirmed combos were already real DB rows —
+        # this window is now just marked errored and the loop continues.
+        try:
+            # Shared per-window context - same ticker for all 4 budgets, so
+            # fetched once and reused rather than 4x.
+            iv_level, iv_trend = _iv_context(ticker)
+            daily_ctx  = _daily_snapshot_context(ticker)
+            intraday   = _intraday_context(ticker, direction)
+        except Exception as e:
+            errored += len(OPTIONS_BUDGETS)
+            for budget in OPTIONS_BUDGETS:
+                combo_results.append({"window": window, "budget": budget, "outcome": "error",
+                                       "detail": f"context fetch failed: {e}"})
+            print(f"[PaperTrade] Options window={window} context fetch failed: {e}")
+            continue
 
         for budget in OPTIONS_BUDGETS:
             try:
@@ -505,9 +539,22 @@ def run_paper_trade_open_stocks(user_id: str) -> dict:
             continue
 
         direction = top_pick.get("direction", "BULLISH")
-        iv_level, iv_trend = _iv_context(ticker)
-        daily_ctx  = _daily_snapshot_context(ticker)
-        intraday   = _intraday_context(ticker, direction)
+
+        # Whole-window defense-in-depth (same reasoning as the options
+        # function): an uncaught exception in context fetching used to
+        # propagate straight out of the entire function, silently
+        # aborting every remaining window with zero job_run_log trace.
+        try:
+            iv_level, iv_trend = _iv_context(ticker)
+            daily_ctx  = _daily_snapshot_context(ticker)
+            intraday   = _intraday_context(ticker, direction)
+        except Exception as e:
+            errored += len(STOCK_BUDGETS)
+            for budget in STOCK_BUDGETS:
+                combo_results.append({"window": window, "budget": budget, "outcome": "error",
+                                       "detail": f"context fetch failed: {e}"})
+            print(f"[PaperTrade] Stock window={window} context fetch failed: {e}")
+            continue
 
         for budget in STOCK_BUDGETS:
             try:

@@ -386,6 +386,66 @@ no win/loss ever got produced for Phase 6 to eventually learn from.
   Desktop user actually invokes) is unchanged - only the broken internal
   import was wrong.
 
+### Weekly strategy review (Phase 6 - turns paper-trade outcomes into falsifiable stats)
+Reads daily_recommendations + paper_trade_context (both already had
+everything needed - no new data capture). Every number is a plain
+Python/SQL aggregation (counts, means, win rates) - the one optional LLM
+call only phrases already-computed numbers as a sentence, never
+estimates or produces a number itself.
+- New tables: strategy_rule_performance (one row per bucket per week -
+  the queryable history a future prompt-injection step would read from
+  once there's enough of it) and weekly_review_log (one row per week -
+  overall stats + wrong-trade/wrong-entry counts + optional LLM summary).
+  Both use ON CONFLICT upserts keyed on (user_id, bucket_name, week_start)
+  and (user_id, week_start) respectively, so re-running the same week
+  updates in place instead of duplicating.
+- New app/learning/weekly_review.py::run_weekly_strategy_review(user_id,
+  week_start=None, week_end=None) - defaults to the just-completed
+  Mon-Fri. Scheduled Sunday 6:00pm ET (needs the full week behind it;
+  same in-process APScheduler caveat as every other scheduled job here).
+- Buckets implemented as a list of (group_name, row→label-or-None)
+  functions (BUCKET_GROUPS) - generalizes the boolean-predicate idea to
+  also cover the multi-way splits this needs (window_length is 3-way,
+  which_strategy_rule_fired is N-way): which_strategy_rule_fired,
+  oi_persistence (>=10 days vs <10), iv_trend (expanding vs flat/
+  contracting), intraday_5min_confirmed, intraday_15min_confirmed,
+  window_length (<=7 / 8-30 / >30 days), and conviction_tier crossed
+  with intraday_5min_confirmed (the direct test of whether entry timing
+  adds anything on top of conviction alone). MIN_SAMPLE_SIZE=5 - anything
+  below that gets sufficient_sample=False and is reported as
+  "insufficient data (n=X)," never a bare percentage.
+- iv_trend's "expanding" threshold (+5% relative rate-of-change) is
+  **provisional, flagged as such in code** - zero real iv_5day_trend
+  values exist anywhere in the system yet to calibrate against (every
+  paper_trade_context row so far has it NULL; no ticker has accumulated
+  5 days of iv_history yet). Revisit once real trend data exists.
+- The 5-min vs 15-min comparison - the empirical answer to an open
+  question from Phase 3 - is surfaced as its own dedicated top-level
+  `timeframe_comparison` key with an explicit verdict string, not left
+  buried in the generic bucket dump.
+- Wrong-trade vs wrong-entry (losses only): wrong_entry = the relevant
+  timeframe's entry signal DID confirm (any_rule_fired=True) but the
+  trade still lost anyway; wrong_trade = it never confirmed at all.
+  Judgment call, flagged in code: when both 5-min and 15-min signals were
+  captured for a losing trade, 15-min is treated as "the" relevant one
+  (longer lookback = a stronger claim than a 5-min blip).
+- Verified live against the only real week of data that exists so far
+  (2026-07-20 to 2026-07-24, 4 closed paper trades from Phase 4/5
+  testing): every single bucket correctly came back sufficient_sample=
+  False (n=4) - the honest result for week one, not a bug. iv_trend
+  bucket came back empty ({}) since iv_5day_trend was NULL on all 4 rows
+  (correctly excluded rather than miscounted as "flat"). timeframe_
+  comparison correctly reported "insufficient data on at least one
+  timeframe to compare yet" rather than fabricating a winner from n=0.
+  wrong_trade_count=4, wrong_entry_count=0, independently cross-checked
+  against a direct `SELECT count(*) FROM daily_recommendations WHERE
+  was_correct=FALSE` query for the same week/user (=4) - sum (4) equals,
+  and does not exceed, the real loss count. Re-ran for the identical
+  week afterward: still exactly 6 bucket rows and 1 weekly_review_log
+  row (confirmed update-in-place, not duplication). LLM summary
+  correctly described every bucket as insufficient data rather than
+  reporting a percentage from n=4.
+
 ### Rule-based intraday entry-timing signal (5-min/15-min, observational)
 Sits between the overnight daily thesis and the actual paper trade open
 (Phase 4) - doesn't gate anything in this build, just logs what the

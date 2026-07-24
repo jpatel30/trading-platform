@@ -426,9 +426,30 @@ async def startup_event():
             id="paper_trade_close", replace_existing=True,
         )
 
+        def _run_weekly_strategy_review():
+            try:
+                from sqlalchemy import text
+                from app.db.session import get_session
+                from app.learning.weekly_review import run_weekly_strategy_review
+                with get_session() as s:
+                    users = s.execute(text("SELECT id FROM users WHERE is_active=TRUE")).fetchall()
+                for u in users:
+                    result = run_weekly_strategy_review(str(u.id))
+                    print(f"[Scheduler] Weekly strategy review: {result.get('overall', {}).get('sample_size')} "
+                          f"trades, win_rate={result.get('overall', {}).get('win_rate')}")
+            except Exception as e:
+                print(f"[Scheduler] Weekly strategy review failed: {e}")
+
+        scheduler.add_job(
+            _run_weekly_strategy_review,
+            CronTrigger(day_of_week="sun", hour=18, minute=0, timezone=et),
+            id="weekly_strategy_review", replace_existing=True,
+        )
+
         scheduler.start()
         print("[Scheduler] ✅ velocity@4:15PM ET | learning@4:30PM ET | "
-              "paper-trade-open@6:40AM PT | paper-trade-close@12:55PM PT (weekdays)")
+              "paper-trade-open@6:40AM PT | paper-trade-close@12:55PM PT (weekdays) | "
+              "weekly-strategy-review@6:00PM ET (Sun)")
     except Exception as e:
         print(f"[Startup] Scheduler failed: {e}")
 

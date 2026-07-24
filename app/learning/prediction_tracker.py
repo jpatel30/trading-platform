@@ -30,6 +30,8 @@ def confirm_execution(
     qty: int,
     recommendation_id: str | None = None,
     source: str = "recommendation",
+    trading_window_days: int | None = None,
+    budget: float | None = None,
 ) -> dict:
     """
     User confirms they executed a recommended trade.
@@ -60,6 +62,14 @@ def confirm_execution(
     same combo within one run — an actual double-run (e.g. a mid-run
     restart) is the same in-process-scheduler reliability gap already
     tracked elsewhere, not something this guard can solve anyway.
+
+    trading_window_days / budget: only meaningful (and only ever passed)
+    for source='auto_paper' — stored directly on tracked_positions so a
+    DB-level partial unique index on (source, symbol, entry_date,
+    trading_window_days, budget) WHERE source='auto_paper' can enforce
+    "never open the exact same combo twice in one day" as a real
+    structural backstop, independent of paper_trading.py's own
+    app-level pre-check. Left NULL for real fills.
     """
     try:
         from sqlalchemy import text
@@ -173,12 +183,15 @@ def confirm_execution(
             if existing:
                 s.execute(text("""
                     UPDATE tracked_positions
-                    SET qty                = :qty,
-                        source             = :source,
-                        check_interval_min = 15,
-                        is_active          = TRUE
+                    SET qty                 = :qty,
+                        source              = :source,
+                        check_interval_min  = 15,
+                        is_active           = TRUE,
+                        trading_window_days = :window,
+                        budget              = :budget
                     WHERE id = :id
-                """), {"id": existing.id, "qty": qty, "source": source})
+                """), {"id": existing.id, "qty": qty, "source": source,
+                       "window": trading_window_days, "budget": budget})
                 tracked_position_id = str(existing.id)
                 print(f"[Tracker] Updated tracked_position for {symbol}")
             else:
@@ -186,16 +199,17 @@ def confirm_execution(
                     INSERT INTO tracked_positions (
                         user_id, symbol, source, entry_date,
                         entry_price, qty, target_pct, stop_pct,
-                        check_interval_min
+                        check_interval_min, trading_window_days, budget
                     ) VALUES (
                         :uid, :sym, :source, CURRENT_DATE,
-                        :entry, :qty, :tgt, :stp, 15
+                        :entry, :qty, :tgt, :stp, 15, :window, :budget
                     )
                     RETURNING id
                 """), {
                     "uid": user_id, "sym": symbol, "source": source,
                     "entry": entry_price, "qty": qty,
                     "tgt": real_target_pct, "stp": real_stop_pct,
+                    "window": trading_window_days, "budget": budget,
                 }).fetchone()
                 tracked_position_id = str(new_row.id) if new_row else None
                 print(f"[Tracker] Created tracked_position for {symbol}")

@@ -125,6 +125,30 @@ def _intraday_context(ticker: str, direction: str) -> dict:
     return {"5min": signal_5min, "15min": signal_15min}
 
 
+def _already_opened_today(user_id: str, symbol: str, trading_window_days: int, budget: float) -> bool:
+    """
+    Per-day uniqueness guard: has this EXACT (ticker, window, budget)
+    combo already been opened today? Deliberately narrow — the same
+    ticker legitimately winning multiple DIFFERENT windows in one clean
+    run (e.g. RGTI winning both the 30-day and 90-day stock window) is
+    correct grid behavior and must NOT be blocked by this check, only
+    the exact same combo repeated is a real duplicate. Checked at the
+    cheap, final per-budget commit step, right before confirm_execution()
+    — not at the scan/enrichment level, so the existing once-per-window
+    scan+enrich+LLM-call reuse across the 4 budgets is untouched.
+    """
+    from sqlalchemy import text
+    from app.db.session import get_session
+    with get_session() as s:
+        row = s.execute(text("""
+            SELECT id FROM tracked_positions
+            WHERE user_id = :uid AND symbol = :sym AND source = 'auto_paper'
+              AND entry_date = CURRENT_DATE
+              AND trading_window_days = :window AND budget = :budget
+        """), {"uid": user_id, "sym": symbol, "window": trading_window_days, "budget": budget}).fetchone()
+        return row is not None
+
+
 def _lookup_recommendation_id(user_id: str, ticker: str, horizon: str) -> str | None:
     from sqlalchemy import text
     from app.db.session import get_session
@@ -303,6 +327,7 @@ def run_paper_trade_open_options(user_id: str) -> dict:
     combo_results = []
     confirmed     = 0
     errored       = 0
+    skipped_duplicates = 0
 
     for window in OPTIONS_WINDOWS:
         try:
@@ -378,6 +403,19 @@ def run_paper_trade_open_options(user_id: str) -> dict:
                                            "detail": "zero contracts sized"})
                     continue
 
+                # Per-day uniqueness guard - check BEFORE doing any further
+                # work (rec_id lookup/store) for this exact (ticker, window,
+                # budget) combo. Does NOT block the same ticker winning a
+                # DIFFERENT window (that's correct grid behavior) - only the
+                # identical combo repeated today.
+                if _already_opened_today(user_id, ticker, window, budget):
+                    skipped_duplicates += 1
+                    combo_results.append({"window": window, "budget": budget, "outcome": "skipped_duplicate",
+                                           "ticker": ticker,
+                                           "detail": "already opened today for this exact (ticker, window, budget) combo"})
+                    print(f"[PaperTrade] Skipped duplicate: {ticker} window={window} budget={budget} already opened today")
+                    continue
+
                 # Reuse the recommendation row rescan_with_validation already
                 # stored for the reference budget (bare "{window}d" horizon,
                 # no budget suffix) if it's really there; otherwise (or for
@@ -392,6 +430,7 @@ def run_paper_trade_open_options(user_id: str) -> dict:
                 confirm_result = confirm_execution(
                     user_id=user_id, symbol=ticker, entry_price=entry_price, qty=qty,
                     recommendation_id=rec_id, source="auto_paper",
+                    trading_window_days=window, budget=budget,
                 )
                 if not confirm_result.get("confirmed") and confirm_result.get("status") != "already_tracked":
                     errored += 1
@@ -423,10 +462,12 @@ def run_paper_trade_open_options(user_id: str) -> dict:
     _log_job_run(
         "paper_trade_open_options", started_at, status, confirmed, errored,
         {"combos": combo_results, "confirmed": confirmed, "empty": empty_count, "errored": errored,
+         "skipped_duplicates": skipped_duplicates,
          "error_summary": None if errored == 0 else f"{errored} combo(s) errored"},
     )
     return {"job": "paper_trade_open_options", "confirmed": confirmed, "empty": empty_count,
-            "errored": errored, "combos": combo_results, "status": status}
+            "errored": errored, "skipped_duplicates": skipped_duplicates,
+            "combos": combo_results, "status": status}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -484,6 +525,7 @@ def run_paper_trade_open_stocks(user_id: str) -> dict:
     combo_results = []
     confirmed     = 0
     errored       = 0
+    skipped_duplicates = 0
 
     # Phase 1 (composite fundamentals+velocity+insider ranking) is
     # window-independent — run ONCE for the whole grid, not once per
@@ -558,6 +600,19 @@ def run_paper_trade_open_stocks(user_id: str) -> dict:
 
         for budget in STOCK_BUDGETS:
             try:
+                # Per-day uniqueness guard - check BEFORE any further work
+                # (recommendation store) for this exact (ticker, window,
+                # budget) combo. Does NOT block the same ticker winning a
+                # DIFFERENT window (correct grid behavior) - only the
+                # identical combo repeated today.
+                if _already_opened_today(user_id, ticker, window, budget):
+                    skipped_duplicates += 1
+                    combo_results.append({"window": window, "budget": budget, "outcome": "skipped_duplicate",
+                                           "ticker": ticker,
+                                           "detail": "already opened today for this exact (ticker, window, budget) combo"})
+                    print(f"[PaperTrade] Skipped duplicate: {ticker} window={window} budget={budget} already opened today")
+                    continue
+
                 trade = top_pick if budget == STOCK_BUDGETS[0] else _resize_stock_trade(top_pick, budget)
 
                 rec_id = _store_stock_recommendation(user_id, window, budget, trade, f"{window} days")
@@ -572,6 +627,7 @@ def run_paper_trade_open_stocks(user_id: str) -> dict:
                 confirm_result = confirm_execution(
                     user_id=user_id, symbol=ticker, entry_price=entry_price, qty=qty,
                     recommendation_id=rec_id, source="auto_paper",
+                    trading_window_days=window, budget=budget,
                 )
                 if not confirm_result.get("confirmed") and confirm_result.get("status") != "already_tracked":
                     errored += 1
@@ -602,10 +658,12 @@ def run_paper_trade_open_stocks(user_id: str) -> dict:
     _log_job_run(
         "paper_trade_open_stocks", started_at, status, confirmed, errored,
         {"combos": combo_results, "confirmed": confirmed, "empty": empty_count, "errored": errored,
+         "skipped_duplicates": skipped_duplicates,
          "error_summary": None if errored == 0 else f"{errored} combo(s) errored"},
     )
     return {"job": "paper_trade_open_stocks", "confirmed": confirmed, "empty": empty_count,
-            "errored": errored, "combos": combo_results, "status": status}
+            "errored": errored, "skipped_duplicates": skipped_duplicates,
+            "combos": combo_results, "status": status}
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -615,9 +615,23 @@ def get_ohlc(ticker: str, candle_size: str = "1d", limit: int = 300) -> list[dic
             # Only regular session bars
             if b.get("market_time") != "r":
                 continue
-            date_str = b.get("date", "")
-            ts = int(_dt.datetime.strptime(
-                date_str[:10], "%Y-%m-%d").timestamp() * 1000) if date_str else 0
+            # Daily/weekly candles carry "date" (e.g. "2026-07-23");
+            # intraday candles (5m/15m/1h/1m) carry "start_time"/
+            # "end_time" instead and "date" is absent - previously fell
+            # straight to ts=0 for every intraday bar, which made the
+            # sort below a no-op (all-equal keys), silently leaving
+            # intraday bars in the API's actual order - confirmed
+            # descending/newest-first, the opposite of what any RSI/
+            # MACD-style calc assumes.
+            date_str  = b.get("date", "")
+            start_str = b.get("start_time", "")
+            if date_str:
+                ts = int(_dt.datetime.strptime(date_str[:10], "%Y-%m-%d").timestamp() * 1000)
+            elif start_str:
+                ts = int(_dt.datetime.strptime(
+                    start_str.rstrip("Z"), "%Y-%m-%dT%H:%M:%S").timestamp() * 1000)
+            else:
+                ts = 0
             result.append({
                 "c":  float(b.get("close", 0) or 0),
                 "h":  float(b.get("high",  0) or 0),

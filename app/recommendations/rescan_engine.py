@@ -163,12 +163,15 @@ expiries (shown above) is CLOSEST to {target_expiry}. Real listed
 expiries are fixed by the exchange — pick the nearest one available,
 not an arbitrary date.
 
-STRATEGY SELECTION (MANDATORY — pick based on conditions):
-  VIX STEEP_CONTANGO + NEUTRAL regime → IRON_CONDOR preferred (sell both sides, collect premium)
-  Strong directional flow + conviction >80 → NAKED_CALL or NAKED_PUT
-  Moderate directional + IV rank <50 → DEBIT_CALL_SPREAD or DEBIT_PUT_SPREAD
-  Direction unclear + big move expected → STRADDLE or STRANGLE
-  SPY/QQQ in NEUTRAL market → IRON_CONDOR is best fit
+STRATEGY SELECTION (MANDATORY — pick based on conditions, and name which
+one you used in "strategy_rule" — this is read downstream by the
+paper-trade weekly review to find out which selection rule actually
+correlates with wins, so it must be one of these exact tags):
+  VIX_CONTANGO_NEUTRAL_IRON_CONDOR   — VIX STEEP_CONTANGO + NEUTRAL regime → IRON_CONDOR (sell both sides, collect premium)
+  STRONG_FLOW_HIGH_CONVICTION_NAKED  — Strong directional flow + conviction >80 → NAKED_CALL or NAKED_PUT
+  MODERATE_DIRECTIONAL_LOW_IV_DEBIT  — Moderate directional + IV rank <50 → DEBIT_CALL_SPREAD or DEBIT_PUT_SPREAD
+  UNCLEAR_DIRECTION_BIG_MOVE_STRADDLE — Direction unclear + big move expected → STRADDLE or STRANGLE
+  INDEX_NEUTRAL_IRON_CONDOR          — SPY/QQQ in NEUTRAL market → IRON_CONDOR is best fit
 
 STRIKE RULES:
 - Debit call spread: buy_strike LOWER than sell_strike
@@ -186,10 +189,12 @@ Respond ONLY with compact JSON — no prose, no markdown:
   "new_picks": [
     {{"ticker": "SPY", "direction": "NEUTRAL", "strategy": "IRON_CONDOR",
      "expiry": "{target_expiry}", "buy_strike": 730.0, "sell_strike": 770.0,
-     "reasoning": "brief", "key_risk": "brief", "confidence": 72}},
+     "reasoning": "brief", "key_risk": "brief", "confidence": 72,
+     "strategy_rule": "INDEX_NEUTRAL_IRON_CONDOR"}},
     {{"ticker": "X", "direction": "BULLISH", "strategy": "NAKED_CALL",
      "expiry": "{target_expiry}", "buy_strike": 0.0, "sell_strike": 0.0,
-     "reasoning": "brief", "key_risk": "brief", "confidence": 70}}
+     "reasoning": "brief", "key_risk": "brief", "confidence": 70,
+     "strategy_rule": "STRONG_FLOW_HIGH_CONVICTION_NAKED"}}
   ]
 }}"""
 
@@ -370,6 +375,7 @@ def rescan_with_validation(
         reverse=True
     )
     print(f"[Rescan] Enriched {len(enriched)} candidates in {time.time()-t_start:.1f}s")
+    enriched_by_ticker = {c["ticker"]: c for c in enriched}
     set_scan_status(user_id, "llm_thinking")
 
     prompt = _build_validation_prompt(
@@ -447,6 +453,19 @@ def rescan_with_validation(
             # instead of only existing silently inside the DB row.
             trade["target_pct"]    = profit_target_pct
             trade["stop_pct"]      = -stop_loss_pct
+            # Which STRATEGY SELECTION rule the LLM says it followed (see
+            # the prompt above) - read by the paper-trade-open job to find
+            # out empirically which rule actually correlates with wins.
+            trade["strategy_rule"] = llm_pick.get("strategy_rule", "")
+            # Same signal snapshot already computed for the LLM prompt -
+            # attach it to the pick itself so callers (the paper-trade-open
+            # job specifically) don't need to re-fetch or re-derive it.
+            enrich_ctx = enriched_by_ticker.get(ticker, {})
+            trade["flow_score"] = enrich_ctx.get("flow_score", 0)
+            trade["dp_score"]   = enrich_ctx.get("dp_score", 0)
+            trade["oi_score"]   = enrich_ctx.get("oi_score", 0)
+            trade["oi_max_days"] = enrich_ctx.get("oi_max_days", 0)
+            trade["iv_current"] = enrich_ctx.get("iv_current", 0)
             final.append(trade)
 
             try:

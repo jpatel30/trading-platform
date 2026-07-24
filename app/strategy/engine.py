@@ -648,6 +648,23 @@ def _execute_trade_math(
             f"rejecting as corrupted trade math. entry={entry} width={spread_width}"
         )
 
+    # A real position can never have zero or negative max loss/profit —
+    # that's not just an unlikely trade, it's structurally impossible
+    # (e.g. an iron condor whose credit received exceeds its own wing
+    # width). The R/R gate below only rejects LOW risk/reward, so an
+    # absurdly-high ratio produced by broken legs sails straight through
+    # it uncaught — confirmed live: swapped IRON_CONDOR buy/sell strikes
+    # (see the auto-correction added in smart_engine.py) produced exactly
+    # this, credit ($318) bigger than wing width ($250), max_loss=-$68.
+    # That specific cause is fixed at the source now; this is the general
+    # backstop for the same failure shape from any future/other path.
+    if max_l_c <= 0 or max_p_c <= 0:
+        raise ValueError(
+            f"Structurally impossible trade: max_profit_per_contract={max_p_c} "
+            f"max_loss_per_contract={max_l_c} (neither can be <= 0) — "
+            f"entry={entry} width={spread_width} strategy={strategy}"
+        )
+
     # ── Position sizing — never silently exceed budget ─────────────────────
     if size_by > budget * 1.1:
         raise ValueError(

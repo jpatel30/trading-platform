@@ -27,14 +27,36 @@ def get_insider_activity(ticker: str, days: int = 5) -> dict:
     """
     Fetch recent Form 4 filings for a ticker.
     Returns summary: has_buy, has_sell, total_value, key_transactions
+
+    Two bugs fixed here (found via a live 131-ticker run + direct EDGAR
+    API testing where 0/131 tickers ever showed any insider signal,
+    including routine sells - not plausible sparsity, a systemic parse
+    failure):
+      1. dateRange=custom with startdt but no enddt does not actually
+         scope results - a "last N days" query was returning hits from
+         as far back as 2003. enddt (today) is required for the range
+         to apply.
+      2. Every hit was then read via src.get("accession_no", "") to
+         build the filing's accession number - that field does not
+         exist in EDGAR's response at all (the real field is "adsh").
+         `if not accession: continue` silently dropped every single
+         hit, unconditionally, regardless of #1.
+    Also replaced the two-step "fetch an index page, guess which .xml
+    file is the real filing" approach in the old _parse_form4 with a
+    direct fetch: the search hit's own "_id" field already contains
+    the exact primary document filename ("{adsh}:{filename}"), and
+    "_source.ciks" already contains the issuer's CIK (last element) -
+    both needed to build the one real Archives URL directly, verified
+    against a live filing (Apple, Form 4, May 2026).
     """
     try:
-        since = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+        since  = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+        until  = datetime.now().strftime("%Y-%m-%d")
 
         url = (
             f"https://efts.sec.gov/LATEST/search-index"
             f"?q=%22{ticker}%22&dateRange=custom"
-            f"&startdt={since}&forms=4"
+            f"&startdt={since}&enddt={until}&forms=4"
         )
         r = requests.get(url, headers=HEADERS, timeout=5)
         if r.status_code != 200:
@@ -46,28 +68,41 @@ def get_insider_activity(ticker: str, days: int = 5) -> dict:
         buys, sells = [], []
         for hit in hits[:20]:
             src = hit.get("_source", {})
-            # Verify it's for our ticker
-            tickers_in_filing = src.get("period_of_report", "")
-            entity = src.get("entity_name", "").upper()
-            if ticker.upper() not in src.get("file_num","") and ticker.upper() not in str(src):
+
+            adsh = src.get("adsh", "")
+            ciks = src.get("ciks", [])
+            doc_id = hit.get("_id", "")
+            if not adsh or not ciks or ":" not in doc_id:
                 continue
 
-            # Get transaction details from filing
-            filing_url = src.get("file_date","")
-            accession  = src.get("accession_no","").replace("-","")
-            if not accession:
+            issuer_cik = ciks[-1].lstrip("0") or "0"   # issuer is consistently last
+            filename   = doc_id.split(":", 1)[1]
+            accession_nodashes = adsh.replace("-", "")
+
+            filing = _parse_form4(issuer_cik, accession_nodashes, filename)
+
+            # Verify it's actually for our ticker using the filing's own
+            # issuerTradingSymbol - display_names varies by filing era
+            # (older filings show "(TICKER)", current ones only show
+            # "(CIK ...)"), so it isn't a reliable filter; the ticker
+            # symbol inside the filing itself always is. The search
+            # query already does most of the narrowing - this is a
+            # correctness check, not the primary filter.
+            if filing["issuer_ticker"] and filing["issuer_ticker"].upper() != ticker.upper():
                 continue
 
-            transactions = _parse_form4(accession)
-            for tx in transactions:
+            role      = filing["owner_name"]
+            is_csuite = filing["is_officer"] and _is_csuite(filing["officer_title"])
+
+            for tx in filing["transactions"]:
                 if tx["transaction_code"] in ("P",):  # P = Purchase
                     buys.append({
                         "date":   tx.get("date",""),
                         "shares": tx.get("shares",0),
                         "price":  tx.get("price",0),
                         "value":  tx.get("value",0),
-                        "role":   src.get("entity_name",""),
-                        "is_csuite": _is_csuite(src.get("entity_name","")),
+                        "role":   role,
+                        "is_csuite": is_csuite,
                     })
                 elif tx["transaction_code"] in ("S",):  # S = Sale
                     sells.append({
@@ -75,8 +110,8 @@ def get_insider_activity(ticker: str, days: int = 5) -> dict:
                         "shares": tx.get("shares",0),
                         "price":  tx.get("price",0),
                         "value":  tx.get("value",0),
-                        "role":   src.get("entity_name",""),
-                        "is_csuite": _is_csuite(src.get("entity_name","")),
+                        "role":   role,
+                        "is_csuite": is_csuite,
                     })
 
         total_buy_value  = sum(b["value"] for b in buys)
@@ -100,36 +135,65 @@ def get_insider_activity(ticker: str, days: int = 5) -> dict:
         return _empty()
 
 
-def _parse_form4(accession_no: str) -> list[dict]:
-    """Parse a Form 4 filing XML for transaction details."""
+_EMPTY_FILING = {
+    "issuer_ticker": "", "owner_name": "", "is_officer": False,
+    "officer_title": "", "transactions": [],
+}
+
+
+def _parse_form4(issuer_cik: str, accession_no: str, filename: str) -> dict:
+    """
+    Fetch and parse a Form 4 filing XML.
+
+    issuer_cik/accession_no/filename come straight from the search hit
+    (issuer CIK from _source.ciks, accession from _source.adsh, filename
+    from _id) - a direct, single fetch of the known real document,
+    replacing a previous two-step "fetch an index page, then guess
+    which .xml file inside it is the real filing" approach that used
+    accession_no[:10] as a stand-in for CIK (it isn't one - that's the
+    filing AGENT's CIK, not the issuer's, and doesn't resolve).
+    """
     try:
-        cik_url = f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&filenum={accession_no}&type=4&dateb=&owner=include&count=10&search_text="
-        # Simpler: use the index file
-        url = f"https://www.sec.gov/Archives/edgar/data/{accession_no[:10]}/{accession_no}/{accession_no}-index.json"
-        r = requests.get(url, headers=HEADERS, timeout=3)
-        if r.status_code != 200:
-            return []
-
-        idx = r.json()
-        # Find the .xml file
-        for item in idx.get("directory", {}).get("item", []):
-            if item.get("name","").endswith(".xml") and "form4" in item.get("name","").lower():
-                xml_url = f"https://www.sec.gov/Archives/edgar/data/{accession_no[:10]}/{accession_no}/{item['name']}"
-                return _parse_xml(xml_url)
-        return []
+        xml_url = f"https://www.sec.gov/Archives/edgar/data/{issuer_cik}/{accession_no}/{filename}"
+        return _parse_xml(xml_url)
     except Exception:
-        return []
+        return dict(_EMPTY_FILING)
 
 
-def _parse_xml(url: str) -> list[dict]:
-    """Parse Form 4 XML for transaction table."""
+def _parse_xml(url: str) -> dict:
+    """
+    Parse a Form 4 XML: issuer ticker (for verifying the search hit
+    actually matches the requested ticker - EDGAR's search-hit metadata
+    doesn't reliably carry this, but every filing's own XML does),
+    reporting-owner name/officer-title (for C-suite weighting - the
+    search hit has no entity_name field at all, despite the old code
+    reading one), and the non-derivative transaction table.
+    """
     try:
         import xml.etree.ElementTree as ET
         r = requests.get(url, headers=HEADERS, timeout=3)
         if r.status_code != 200:
-            return []
+            return dict(_EMPTY_FILING)
 
         root = ET.fromstring(r.content)
+
+        issuer_ticker = (root.findtext("issuer/issuerTradingSymbol") or "").strip()
+        owner_name    = (root.findtext(
+            "reportingOwner/reportingOwnerId/rptOwnerName") or "").strip()
+        is_officer    = (root.findtext(
+            "reportingOwner/reportingOwnerRelationship/isOfficer") or "").strip().lower() == "true"
+        # Form 4 carries isOfficer and isDirector as separate flags -
+        # officerTitle is only populated when isOfficer is true, but a
+        # board member filing purely as a director (isOfficer=false)
+        # still counts as C-suite per the CSUITE set below (it includes
+        # the bare word "director"/"chairman").
+        is_director   = (root.findtext(
+            "reportingOwner/reportingOwnerRelationship/isDirector") or "").strip().lower() == "true"
+        officer_title = (root.findtext(
+            "reportingOwner/reportingOwnerRelationship/officerTitle") or "").strip()
+        if is_director and not officer_title:
+            officer_title = "director"
+
         txns = []
         for tx in root.findall(".//nonDerivativeTransaction"):
             code  = (tx.findtext("transactionCoding/transactionCode") or "").strip()
@@ -144,9 +208,14 @@ def _parse_xml(url: str) -> list[dict]:
                 value = 0
             txns.append({"transaction_code": code, "date": date,
                          "shares": shares, "price": price, "value": value})
-        return txns
+
+        return {
+            "issuer_ticker": issuer_ticker, "owner_name": owner_name,
+            "is_officer": is_officer or is_director, "officer_title": officer_title,
+            "transactions": txns,
+        }
     except Exception:
-        return []
+        return dict(_EMPTY_FILING)
 
 
 def _is_csuite(role: str) -> bool:

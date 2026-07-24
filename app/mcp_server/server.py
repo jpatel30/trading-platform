@@ -1163,7 +1163,7 @@ def log_outcome(
         exit_price:  price received per share/contract e.g. 93.29
         exit_reason: TAKE_PROFIT / STOP_LOSS / MANUAL / EXPIRED
     """
-    from app.learning.prediction_tracker import log_outcome as _log
+    from app.learning.prediction_tracker import log_exit as _log
     return _log(get_current_user_id(), symbol, exit_price, exit_reason)
 
 

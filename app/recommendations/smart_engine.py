@@ -351,6 +351,27 @@ def _execute_smart_rec(rec: dict, budget: float, user_id: str | None) -> dict | 
     if not spot or not buy_str:
         return None
 
+    # Sanity check: strikes should never be wildly divorced from the real
+    # spot price. Confirmed live: a 60-day SPY IRON_CONDOR came back with
+    # short strikes ~40% below the real $738 spot — not a strike-ordering
+    # bug (order was already correct), the strikes themselves were
+    # nonsensical, almost certainly the local LLM falling back on stale
+    # training-data price memory despite the prompt's explicit "USE EXACT
+    # PRICES SHOWN" and "Max 8% OTM from current price" rules — nothing
+    # downstream actually enforced either rule in code. A generous 25%
+    # band catches a hallucinated/stale price while still allowing a
+    # legitimately wide, longer-dated condor or strangle. NAKED_CALL/PUT
+    # intentionally has sell_strike=0 (per the prompt), so only buy_strike
+    # (the real strike) is checked for those.
+    MAX_STRIKE_PCT_FROM_SPOT = 0.25
+    strikes_to_check = (buy_str,) if strategy in ("NAKED_CALL", "NAKED_PUT") else (buy_str, sell_str)
+    for k in strikes_to_check:
+        if k and abs(k - spot) / spot > MAX_STRIKE_PCT_FROM_SPOT:
+            print(f"[SmartMath] Rejected {ticker} {strategy}: strike ${k} is "
+                  f"{abs(k - spot) / spot:.0%} from real spot ${spot} — likely a "
+                  f"hallucinated/stale price, not real market data")
+            return None
+
     if "DEBIT_CALL_SPREAD" in strategy and buy_str > sell_str:
         buy_str, sell_str = sell_str, buy_str
         print(f"[SmartMath] Auto-corrected CALL spread strikes: BUY ${buy_str} SELL ${sell_str}")
@@ -363,6 +384,20 @@ def _execute_smart_rec(rec: dict, budget: float, user_id: str | None) -> dict | 
     elif "CREDIT_PUT_SPREAD" in strategy and buy_str > sell_str:
         buy_str, sell_str = sell_str, buy_str
         print(f"[SmartMath] Auto-corrected CREDIT PUT strikes: BUY ${buy_str} SELL ${sell_str}")
+    elif strategy == "IRON_CONDOR" and buy_str > sell_str:
+        # buy_str is the LOWER put boundary, sell_str the UPPER call
+        # boundary (per this function's own prompt: "buy_strike = lower
+        # put, sell_strike = upper call"). Every other 2-leg strategy
+        # above already gets this same order check; IRON_CONDOR never
+        # did, and width = (sell_str - buy_str) * 0.5 going negative on a
+        # swapped pair silently builds an inverted, structurally
+        # impossible condor (wings crossing the body) — confirmed live:
+        # a real run produced a credit ($318) bigger than its own wing
+        # width ($250), i.e. a negative max_loss, which the R/R gate
+        # below never catches since it only rejects LOW risk/reward, not
+        # a nonsensical one.
+        buy_str, sell_str = sell_str, buy_str
+        print(f"[SmartMath] Auto-corrected IRON CONDOR strikes: BUY(put side) ${buy_str} SELL(call side) ${sell_str}")
 
     try:
         from app.options_flow.unusual_whales import get_option_contracts
@@ -393,6 +428,9 @@ def _execute_smart_rec(rec: dict, budget: float, user_id: str | None) -> dict | 
     elif "DEBIT_PUT_SPREAD" in strategy and buy_str < sell_str:
         buy_str, sell_str = sell_str, buy_str
         print(f"[SmartMath] Post-snap correction PUT: BUY ${buy_str} SELL ${sell_str}")
+    elif strategy == "IRON_CONDOR" and buy_str > sell_str:
+        buy_str, sell_str = sell_str, buy_str
+        print(f"[SmartMath] Post-snap correction IRON CONDOR: BUY(put side) ${buy_str} SELL(call side) ${sell_str}")
 
     is_credit = "CREDIT" in strategy or "IRON" in strategy
 

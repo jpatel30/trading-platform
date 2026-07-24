@@ -29,11 +29,37 @@ def confirm_execution(
     entry_price: float,
     qty: int,
     recommendation_id: str | None = None,
+    source: str = "recommendation",
 ) -> dict:
     """
     User confirms they executed a recommended trade.
     Fully idempotent — same symbol + price + date = always 1 row.
     Tomorrow same price = new row. Different price today = new row.
+
+    source: 'recommendation' (default, real manual fills) or
+    'auto_paper' (the automated paper-trade-open job, which
+    deliberately wants MULTIPLE simultaneous positions on the same
+    ticker/day — one per window/budget combo in its grid, not one per
+    day). The dedup guard below is scoped to (symbol, day, source, qty)
+    rather than just (symbol, day) so real fills and paper-trade combos
+    never collide with each other.
+
+    For source='auto_paper' specifically, this guard is skipped
+    entirely — always insert a new row, never dedupe/reuse. The
+    paper-trade-open job deliberately wants MULTIPLE simultaneous
+    positions on the same ticker/day (one per window/budget combo in
+    its grid), and a (symbol, day, qty) key still isn't granular enough
+    to tell them apart: multiple windows can independently pick the
+    identical ticker/strategy (confirmed live — every window converged
+    on the same SPY IRON_CONDOR during a quiet-market test run), and
+    margin-based strategies like iron condors often size to the same
+    contract count across several different budgets, so a qty-based
+    key silently collapsed 20 distinct combos down to 4 real tracked
+    positions the first time this ran. The job's own loop is the sole
+    caller for this source and controls not calling it twice for the
+    same combo within one run — an actual double-run (e.g. a mid-run
+    restart) is the same in-process-scheduler reliability gap already
+    tracked elsewhere, not something this guard can solve anyway.
     """
     try:
         from sqlalchemy import text
@@ -41,14 +67,17 @@ def confirm_execution(
 
         with get_session() as s:
 
-            # Guard: one tracked position per symbol per day
-            existing = s.execute(text("""
-                SELECT id FROM tracked_positions
-                WHERE user_id=:uid AND symbol=:sym
-                AND entry_date=CURRENT_DATE AND is_active=TRUE
-            """), {"uid": user_id, "sym": symbol}).fetchone()
-            if existing:
-                return {"status": "already_tracked", "id": str(existing.id)}
+            # Guard: one tracked position per (symbol, day, source, qty) —
+            # 'recommendation' (real fills) only. See docstring above for
+            # why auto_paper skips this entirely.
+            if source == "recommendation":
+                existing = s.execute(text("""
+                    SELECT id FROM tracked_positions
+                    WHERE user_id=:uid AND symbol=:sym AND source=:source AND qty=:qty
+                    AND entry_date=CURRENT_DATE AND is_active=TRUE
+                """), {"uid": user_id, "sym": symbol, "source": source, "qty": qty}).fetchone()
+                if existing:
+                    return {"status": "already_tracked", "id": str(existing.id)}
 
             # 1. Find today's daily_recommendations row for this ticker —
             #    the table the CURRENT engine actually writes to. Prefer an
@@ -123,54 +152,65 @@ def confirm_execution(
             except Exception as e:
                 print(f"[Tracker] target/stop lookup failed, using defaults: {e}")
 
-            # 3. tracked_positions — update if exists today at this price, else insert
-            existing = s.execute(text("""
-                SELECT id FROM tracked_positions
-                WHERE user_id      = :uid
-                  AND symbol       = :sym
-                  AND entry_date   = CURRENT_DATE
-                  AND entry_price  = :entry
-                  AND is_active    = TRUE
-            """), {"uid": user_id, "sym": symbol,
-                   "entry": entry_price}).fetchone()
+            # 3. tracked_positions — update if exists today at this price
+            #    (+ source, so an auto_paper combo never overwrites a real
+            #    fill or a different combo just because the price matches),
+            #    else insert. auto_paper skips this lookup entirely and
+            #    always inserts fresh — see function docstring.
+            existing = None
+            if source == "recommendation":
+                existing = s.execute(text("""
+                    SELECT id FROM tracked_positions
+                    WHERE user_id      = :uid
+                      AND symbol       = :sym
+                      AND entry_date   = CURRENT_DATE
+                      AND entry_price  = :entry
+                      AND source       = :source
+                      AND is_active    = TRUE
+                """), {"uid": user_id, "sym": symbol,
+                       "entry": entry_price, "source": source}).fetchone()
 
             if existing:
                 s.execute(text("""
                     UPDATE tracked_positions
                     SET qty                = :qty,
-                        source             = 'recommendation',
+                        source             = :source,
                         check_interval_min = 15,
                         is_active          = TRUE
                     WHERE id = :id
-                """), {"id": existing.id, "qty": qty})
+                """), {"id": existing.id, "qty": qty, "source": source})
+                tracked_position_id = str(existing.id)
                 print(f"[Tracker] Updated tracked_position for {symbol}")
             else:
-                s.execute(text("""
+                new_row = s.execute(text("""
                     INSERT INTO tracked_positions (
                         user_id, symbol, source, entry_date,
                         entry_price, qty, target_pct, stop_pct,
                         check_interval_min
                     ) VALUES (
-                        :uid, :sym, 'recommendation', CURRENT_DATE,
+                        :uid, :sym, :source, CURRENT_DATE,
                         :entry, :qty, :tgt, :stp, 15
                     )
+                    RETURNING id
                 """), {
-                    "uid": user_id, "sym": symbol,
+                    "uid": user_id, "sym": symbol, "source": source,
                     "entry": entry_price, "qty": qty,
                     "tgt": real_target_pct, "stp": real_stop_pct,
-                })
+                }).fetchone()
+                tracked_position_id = str(new_row.id) if new_row else None
                 print(f"[Tracker] Created tracked_position for {symbol}")
 
         total_cost = round(entry_price * qty * 100, 2)
         return {
-            "confirmed":         True,
-            "symbol":            symbol,
-            "entry_price":       entry_price,
-            "qty":               qty,
-            "total_cost":        total_cost,
-            "recommendation_id": recommendation_id,
-            "target_pct":        real_target_pct,
-            "stop_pct":          real_stop_pct,
+            "confirmed":           True,
+            "symbol":              symbol,
+            "entry_price":         entry_price,
+            "qty":                 qty,
+            "total_cost":          total_cost,
+            "recommendation_id":   recommendation_id,
+            "tracked_position_id": tracked_position_id,
+            "target_pct":          real_target_pct,
+            "stop_pct":            real_stop_pct,
             "monitoring":        "every 15 min during market hours",
             "message": (
                 f"✅ Logged: {qty} {symbol} contracts at ${entry_price} "

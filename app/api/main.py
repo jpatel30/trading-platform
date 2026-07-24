@@ -287,6 +287,7 @@ async def startup_event():
         import pytz
 
         et = pytz.timezone("America/New_York")
+        pt = pytz.timezone("America/Los_Angeles")
         scheduler = BackgroundScheduler(timezone=et)
 
         def _run_velocity_snapshot():
@@ -301,6 +302,19 @@ async def startup_event():
                     print(f"[Scheduler] Velocity snapshot: {result}")
             except Exception as e:
                 print(f"[Scheduler] Velocity snapshot failed: {e}")
+
+        def _run_after_hours_batch():
+            try:
+                from sqlalchemy import text
+                from app.db.session import get_session
+                from app.signals.after_hours_batch import run_after_hours_batch
+                with get_session() as s:
+                    users = s.execute(text("SELECT id FROM users WHERE is_active=TRUE")).fetchall()
+                for u in users:
+                    result = run_after_hours_batch(str(u.id))
+                    print(f"[Scheduler] After-hours batch: {result}")
+            except Exception as e:
+                print(f"[Scheduler] After-hours batch failed: {e}")
 
         def _run_nightly_learning():
             try:
@@ -342,12 +356,79 @@ async def startup_event():
             id="velocity_snapshot", replace_existing=True,
         )
         scheduler.add_job(
+            _run_after_hours_batch,
+            CronTrigger(day_of_week="mon-fri", hour=16, minute=15, timezone=et),
+            id="after_hours_batch", replace_existing=True,
+        )
+        scheduler.add_job(
             _run_nightly_learning,
             CronTrigger(day_of_week="mon-fri", hour=16, minute=30, timezone=et),
             id="nightly_learning", replace_existing=True,
         )
+
+        def _run_paper_trade_open_options():
+            try:
+                from sqlalchemy import text
+                from app.db.session import get_session
+                from app.recommendations.paper_trading import run_paper_trade_open_options
+                with get_session() as s:
+                    users = s.execute(text("SELECT id FROM users WHERE is_active=TRUE")).fetchall()
+                for u in users:
+                    result = run_paper_trade_open_options(str(u.id))
+                    print(f"[Scheduler] Paper trade open (options): {result.get('confirmed')} confirmed, "
+                          f"{result.get('empty')} empty, {result.get('errored')} errored")
+            except Exception as e:
+                print(f"[Scheduler] Paper trade open (options) failed: {e}")
+
+        def _run_paper_trade_open_stocks():
+            try:
+                from sqlalchemy import text
+                from app.db.session import get_session
+                from app.recommendations.paper_trading import run_paper_trade_open_stocks
+                with get_session() as s:
+                    users = s.execute(text("SELECT id FROM users WHERE is_active=TRUE")).fetchall()
+                for u in users:
+                    result = run_paper_trade_open_stocks(str(u.id))
+                    print(f"[Scheduler] Paper trade open (stocks): {result.get('confirmed')} confirmed, "
+                          f"{result.get('empty')} empty, {result.get('errored')} errored")
+            except Exception as e:
+                print(f"[Scheduler] Paper trade open (stocks) failed: {e}")
+
+        scheduler.add_job(
+            _run_paper_trade_open_options,
+            CronTrigger(day_of_week="mon-fri", hour=6, minute=40, timezone=pt),
+            id="paper_trade_open_options", replace_existing=True,
+        )
+        scheduler.add_job(
+            _run_paper_trade_open_stocks,
+            CronTrigger(day_of_week="mon-fri", hour=6, minute=40, timezone=pt),
+            id="paper_trade_open_stocks", replace_existing=True,
+        )
+
+        def _run_paper_trade_close():
+            try:
+                from sqlalchemy import text
+                from app.db.session import get_session
+                from app.recommendations.paper_trading import run_paper_trade_close
+                with get_session() as s:
+                    users = s.execute(text("SELECT id FROM users WHERE is_active=TRUE")).fetchall()
+                for u in users:
+                    result = run_paper_trade_close(str(u.id))
+                    print(f"[Scheduler] Paper trade close: {result.get('closed')} closed, "
+                          f"{result.get('wins')}W/{result.get('losses')}L, "
+                          f"${result.get('total_pnl_dollars')} pnl, {result.get('errored')} errored")
+            except Exception as e:
+                print(f"[Scheduler] Paper trade close failed: {e}")
+
+        scheduler.add_job(
+            _run_paper_trade_close,
+            CronTrigger(day_of_week="mon-fri", hour=12, minute=55, timezone=pt),
+            id="paper_trade_close", replace_existing=True,
+        )
+
         scheduler.start()
-        print("[Scheduler] ✅ velocity@4:15PM ET | learning@4:30PM ET (weekdays)")
+        print("[Scheduler] ✅ velocity@4:15PM ET | learning@4:30PM ET | "
+              "paper-trade-open@6:40AM PT | paper-trade-close@12:55PM PT (weekdays)")
     except Exception as e:
         print(f"[Startup] Scheduler failed: {e}")
 
@@ -1379,8 +1460,8 @@ async def log_exec_outcome(
     req: LogOutcomeRequest,
     user_id: str = Depends(get_current_user)
 ):
-    from app.learning.prediction_tracker import log_outcome
-    return log_outcome(user_id, req.symbol, req.exit_price, req.exit_reason)
+    from app.learning.prediction_tracker import log_exit
+    return log_exit(user_id, req.symbol, req.exit_price, req.exit_reason)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

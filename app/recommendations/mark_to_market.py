@@ -38,7 +38,12 @@ def get_current_option_value(ticker: str, legs: list[dict]) -> float | None:
         if not expiry:
             return None
 
-        contracts = get_option_contracts(ticker, expiry=expiry, limit=200)
+        # limit=500 — a single expiry's full chain (SPY confirmed 334
+        # contracts one expiry) can exceed the old limit=200, which
+        # silently dropped deep ITM/OTM strikes (found live: a 3-day SPY
+        # iron condor's wings weren't in the first 200 and every leg
+        # match failed, so the whole position could never be marked).
+        contracts = get_option_contracts(ticker, expiry=expiry, limit=500)
         if not contracts:
             return None
 
@@ -47,8 +52,17 @@ def get_current_option_value(ticker: str, legs: list[dict]) -> float | None:
             sym = c.get("option_symbol", "")
             bid = float(c.get("nbbo_bid", 0) or c.get("bid", 0) or 0)
             ask = float(c.get("nbbo_ask", 0) or c.get("ask", 0) or 0)
-            mid = (bid + ask) / 2 if (bid and ask) else float(c.get("mid", 0) or 0)
-            if not sym or not mid:
+            # A deep OTM leg with bid=0/ask=0.01 is real and near-worthless,
+            # not "no data" — the old `bid and ask` check treated that as
+            # unmatchable and skipped it, which breaks ANY spread with a
+            # near-worthless wing (the common case for iron condor wings
+            # once the position is winning). Only fall back to mid/last_price
+            # when there's truly no quote on either side.
+            if bid or ask:
+                mid = (bid + ask) / 2
+            else:
+                mid = float(c.get("mid", 0) or c.get("last_price", 0) or 0)
+            if not sym or (bid == 0 and ask == 0 and mid == 0):
                 continue
             try:
                 for marker in ("C", "P"):

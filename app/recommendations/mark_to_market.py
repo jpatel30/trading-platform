@@ -159,21 +159,62 @@ def mark_recommendation(rec: dict, is_market_open: bool) -> dict:
         if current_value is not None and entry_debit:
             result["current_value"] = current_value
 
+            # pnl_per_share is ALWAYS current_value - entry_debit, for BOTH
+            # debit and credit strategies. get_current_option_value() and
+            # entry_debit are computed with the identical BUY/SELL
+            # convention (see its docstring: "current cost-to-enter this
+            # exact spread", same axis as entry_debit) — so their raw
+            # difference is already the real, signed P&L per share; there
+            # is no separate "credit formula" needed.
+            #
+            # The OLD code special-cased credit trades as
+            # `abs(entry_debit) - current_value`, which silently assumed
+            # current_value was already flipped into a positive
+            # "cost to close". It wasn't — current_value is legitimately
+            # NEGATIVE for a healthy credit spread (e.g. a real SPY iron
+            # condor priced fresh right now costs -$3.56 to enter, i.e.
+            # still nets a credit), exactly mirroring entry_debit's own
+            # sign. Treating that negative number as a positive "cost to
+            # close" effectively ADDED the entry credit and the current
+            # credit together instead of taking their difference —
+            # confirmed live: entry_debit=-3.67, current_value=-3.56 (a
+            # real, tiny, near-breakeven move) produced a fake +543.6%
+            # instead of the correct ~-3% loss.
+            pnl_per_share = current_value - entry_debit
+
             if entry_debit > 0:
-                # Debit spread: paid entry_debit, profit when value rises.
-                # Capital at risk = entry_debit — already correct.
-                pnl_per_share        = current_value - entry_debit
+                # Debit spread: capital at risk = entry_debit (premium paid).
                 risk_basis_per_share = entry_debit
             else:
-                # Credit spread / iron condor: received |entry_debit|,
-                # profit when cost to close falls. Capital at risk is
-                # max_loss (the actual dollar exposure), NOT the credit
-                # received — dividing by credit inflated returns by
-                # roughly (max_loss / credit), ~3x in tested cases.
-                pnl_per_share = abs(entry_debit) - current_value
+                # Credit spread / iron condor: capital at risk is max_loss
+                # (the actual dollar exposure), NOT the credit received —
+                # dividing by credit inflated returns by roughly
+                # (max_loss / credit), ~3x in tested cases.
                 risk_basis_per_share = (max_loss / 100.0) if max_loss > 0 else abs(entry_debit)
 
             pnl_dollars = round(pnl_per_share * 100, 2)
+
+            # Structural sanity bound: a real position can never make more
+            # than its own defined max_profit or lose more than its own
+            # defined max_loss (both per-contract, from the DB) — a 10%
+            # buffer allows for STRADDLE/STRANGLE's max_profit being an
+            # ESTIMATE (1σ expected move, not a hard ceiling) rather than
+            # rejecting a legitimately larger real move. Same category of
+            # backstop as strategy/engine.py's max_l_c<=0 check and
+            # smart_engine.py's spot-sanity check — confirmed this would
+            # have caught today's real bug (pnl_dollars=$723/contract
+            # against a max_profit of only $367).
+            if max_profit > 0 and pnl_dollars > max_profit * 1.1:
+                print(f"[MarkToMarket] Rejected impossible mark for {ticker}: "
+                      f"pnl_dollars={pnl_dollars} exceeds max_profit={max_profit} "
+                      f"(current_value={current_value}, entry_debit={entry_debit}, legs={legs})")
+                return result
+            if max_loss > 0 and pnl_dollars < -max_loss * 1.1:
+                print(f"[MarkToMarket] Rejected impossible mark for {ticker}: "
+                      f"pnl_dollars={pnl_dollars} exceeds -max_loss={-max_loss} "
+                      f"(current_value={current_value}, entry_debit={entry_debit}, legs={legs})")
+                return result
+
             result["pnl_dollars"] = pnl_dollars
             result["pnl_pct"] = (
                 round((pnl_per_share / risk_basis_per_share) * 100, 1)

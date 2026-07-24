@@ -43,6 +43,7 @@ def run_after_hours_batch(user_id: str) -> dict:
     unanswerable.
     """
     from app.scanner.universe import get_scan_universe
+    from app.utils.retry_queue import run_with_retry
 
     started_at = datetime.now(timezone.utc)
     tickers: list[str] = []
@@ -66,21 +67,28 @@ def run_after_hours_batch(user_id: str) -> dict:
         from_date = (datetime.now() - timedelta(days=300)).strftime("%Y-%m-%d")
         to_date   = datetime.now().strftime("%Y-%m-%d")
 
-        for ticker in tickers:
-            try:
-                _snapshot_one_ticker(ticker, from_date, to_date, vix)
-                processed += 1
-            except Exception as e:
-                failed += 1
-                failures.append(f"{ticker}: {e}")
-                print(f"[AfterHoursBatch] {ticker} failed: {e}")
-                continue
+        def _worker(ticker):
+            _snapshot_one_ticker(ticker, from_date, to_date, vix)
+            return {"ok": True, "ticker": ticker}
+
+        retry_result = run_with_retry(tickers, _worker, retry_delay_seconds=45, label="ticker")
+        processed = len(retry_result["succeeded_first_pass"]) + len(retry_result["succeeded_on_retry"])
+        failed    = len(retry_result["failed_both_passes"])
+        failures  = [
+            f"{tickers[i]}: {retry_result['results'][i].get('error', 'unknown')}"
+            for i in retry_result["failed_both_passes"]
+        ]
 
         status = "success" if failed == 0 else ("partial" if processed > 0 else "failed")
         _log_run(
             started_at, datetime.now(timezone.utc), status, processed, failed,
             error_summary="; ".join(failures[:10]) if failures else None,
-            details={"user_id": user_id, "universe_size": len(tickers)},
+            details={
+                "user_id": user_id, "universe_size": len(tickers),
+                "succeeded_first_pass": len(retry_result["succeeded_first_pass"]),
+                "succeeded_on_retry":   len(retry_result["succeeded_on_retry"]),
+                "failed_both_passes":   len(retry_result["failed_both_passes"]),
+            },
         )
         return {
             "job": JOB_NAME, "tickers_total": len(tickers),

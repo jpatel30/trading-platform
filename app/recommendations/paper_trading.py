@@ -321,13 +321,16 @@ def _store_options_recommendation(user_id: str, window: int, budget: float, trad
 def run_paper_trade_open_options(user_id: str) -> dict:
     from app.recommendations.rescan_engine import rescan_with_validation
     from app.learning.prediction_tracker import confirm_execution
+    from app.utils.retry_queue import run_with_retry
 
     started_at    = datetime.now(timezone.utc)
     market_ctx    = _market_context()
     combo_results = []
     confirmed     = 0
     errored       = 0
-    skipped_duplicates = 0
+    skipped_duplicates    = 0
+    succeeded_first_pass  = 0
+    succeeded_on_retry    = 0
 
     for window in OPTIONS_WINDOWS:
         try:
@@ -378,84 +381,95 @@ def run_paper_trade_open_options(user_id: str) -> dict:
             print(f"[PaperTrade] Options window={window} context fetch failed: {e}")
             continue
 
-        for budget in OPTIONS_BUDGETS:
-            try:
-                # Always recompute trade math fresh for THIS budget via
-                # _resize_options_trade, for every budget including the
-                # first — top_pick itself isn't a reliable source of
-                # contracts/entry_debit: if rescan_with_validation reloaded
-                # this window's tickers as an already-existing "morning
-                # pick" (e.g. a second run the same day, or a real user's
-                # own scan earlier that morning), top_pick is shaped like a
-                # _load_todays_recs() row, which has no "contracts" field
-                # at all. Recomputing fresh avoids depending on which shape
-                # top_pick happens to be.
-                trade = _resize_options_trade(top_pick, ticker, budget)
-                if not trade:
-                    combo_results.append({"window": window, "budget": budget, "outcome": "empty",
-                                           "detail": "trade-math gate rejected at this budget"})
-                    continue
+        def _process_options_combo(budget):
+            # Always recompute trade math fresh for THIS budget via
+            # _resize_options_trade, for every budget including the
+            # first — top_pick itself isn't a reliable source of
+            # contracts/entry_debit: if rescan_with_validation reloaded
+            # this window's tickers as an already-existing "morning
+            # pick" (e.g. a second run the same day, or a real user's
+            # own scan earlier that morning), top_pick is shaped like a
+            # _load_todays_recs() row, which has no "contracts" field
+            # at all. Recomputing fresh avoids depending on which shape
+            # top_pick happens to be.
+            trade = _resize_options_trade(top_pick, ticker, budget)
+            if not trade:
+                return {"ok": True, "window": window, "budget": budget, "outcome": "empty",
+                        "detail": "trade-math gate rejected at this budget"}
 
-                entry_price = trade.get("entry_debit", 0)
-                qty         = trade.get("contracts", 0)
-                if not qty:
-                    combo_results.append({"window": window, "budget": budget, "outcome": "empty",
-                                           "detail": "zero contracts sized"})
-                    continue
+            entry_price = trade.get("entry_debit", 0)
+            qty         = trade.get("contracts", 0)
+            if not qty:
+                return {"ok": True, "window": window, "budget": budget, "outcome": "empty",
+                        "detail": "zero contracts sized"}
 
-                # Per-day uniqueness guard - check BEFORE doing any further
-                # work (rec_id lookup/store) for this exact (ticker, window,
-                # budget) combo. Does NOT block the same ticker winning a
-                # DIFFERENT window (that's correct grid behavior) - only the
-                # identical combo repeated today.
-                if _already_opened_today(user_id, ticker, window, budget):
-                    skipped_duplicates += 1
-                    combo_results.append({"window": window, "budget": budget, "outcome": "skipped_duplicate",
-                                           "ticker": ticker,
-                                           "detail": "already opened today for this exact (ticker, window, budget) combo"})
-                    print(f"[PaperTrade] Skipped duplicate: {ticker} window={window} budget={budget} already opened today")
-                    continue
+            # Per-day uniqueness guard - check BEFORE doing any further
+            # work (rec_id lookup/store) for this exact (ticker, window,
+            # budget) combo. Does NOT block the same ticker winning a
+            # DIFFERENT window (that's correct grid behavior) - only the
+            # identical combo repeated today. Also makes a retry of this
+            # exact combo safe/idempotent: if the first attempt actually
+            # got as far as confirm_execution() before failing downstream,
+            # the retry sees it as already-opened and skips instead of
+            # double-inserting.
+            if _already_opened_today(user_id, ticker, window, budget):
+                print(f"[PaperTrade] Skipped duplicate: {ticker} window={window} budget={budget} already opened today")
+                return {"ok": True, "window": window, "budget": budget, "outcome": "skipped_duplicate",
+                        "ticker": ticker,
+                        "detail": "already opened today for this exact (ticker, window, budget) combo"}
 
-                # Reuse the recommendation row rescan_with_validation already
-                # stored for the reference budget (bare "{window}d" horizon,
-                # no budget suffix) if it's really there; otherwise (or for
-                # every other budget) store our own budget-suffixed row so
-                # each combo always has a real recommendation_id.
-                rec_id = None
-                if budget == OPTIONS_BUDGETS[0]:
-                    rec_id = _lookup_recommendation_id(user_id, ticker, f"{window}d")
-                if not rec_id:
-                    rec_id = _store_options_recommendation(user_id, window, budget, trade, scan_result.get("market_view", ""))
+            # Reuse the recommendation row rescan_with_validation already
+            # stored for the reference budget (bare "{window}d" horizon,
+            # no budget suffix) if it's really there; otherwise (or for
+            # every other budget) store our own budget-suffixed row so
+            # each combo always has a real recommendation_id.
+            rec_id = None
+            if budget == OPTIONS_BUDGETS[0]:
+                rec_id = _lookup_recommendation_id(user_id, ticker, f"{window}d")
+            if not rec_id:
+                rec_id = _store_options_recommendation(user_id, window, budget, trade, scan_result.get("market_view", ""))
 
-                confirm_result = confirm_execution(
-                    user_id=user_id, symbol=ticker, entry_price=entry_price, qty=qty,
-                    recommendation_id=rec_id, source="auto_paper",
-                    trading_window_days=window, budget=budget,
-                )
-                if not confirm_result.get("confirmed") and confirm_result.get("status") != "already_tracked":
-                    errored += 1
-                    combo_results.append({"window": window, "budget": budget, "outcome": "error",
-                                           "detail": confirm_result.get("error", "confirm_execution did not confirm")})
-                    continue
-                tracked_position_id = confirm_result.get("tracked_position_id") or confirm_result.get("id")
+            confirm_result = confirm_execution(
+                user_id=user_id, symbol=ticker, entry_price=entry_price, qty=qty,
+                recommendation_id=rec_id, source="auto_paper",
+                trading_window_days=window, budget=budget,
+            )
+            if not confirm_result.get("confirmed") and confirm_result.get("status") != "already_tracked":
+                return {"ok": False, "window": window, "budget": budget,
+                        "detail": confirm_result.get("error", "confirm_execution did not confirm")}
+            tracked_position_id = confirm_result.get("tracked_position_id") or confirm_result.get("id")
 
-                _store_paper_context(
-                    recommendation_id=rec_id, tracked_position_id=tracked_position_id,
-                    ticker=ticker, rec_type="options", window=window, budget=budget,
-                    flow_score=trade.get("flow_score"), dp_score=trade.get("dp_score"),
-                    oi_score=trade.get("oi_score"), oi_max_days=trade.get("oi_max_days"),
-                    iv_level=iv_level, iv_trend=iv_trend, daily_ctx=daily_ctx, intraday=intraday,
-                    market_ctx=market_ctx, conviction_score=trade.get("confidence"),
-                    strategy_selected=trade.get("strategy"), strategy_rule=trade.get("strategy_rule", ""),
-                )
+            _store_paper_context(
+                recommendation_id=rec_id, tracked_position_id=tracked_position_id,
+                ticker=ticker, rec_type="options", window=window, budget=budget,
+                flow_score=trade.get("flow_score"), dp_score=trade.get("dp_score"),
+                oi_score=trade.get("oi_score"), oi_max_days=trade.get("oi_max_days"),
+                iv_level=iv_level, iv_trend=iv_trend, daily_ctx=daily_ctx, intraday=intraday,
+                market_ctx=market_ctx, conviction_score=trade.get("confidence"),
+                strategy_selected=trade.get("strategy"), strategy_rule=trade.get("strategy_rule", ""),
+            )
 
-                confirmed += 1
-                combo_results.append({"window": window, "budget": budget, "outcome": "confirmed",
-                                       "ticker": ticker, "strategy": trade.get("strategy")})
-            except Exception as e:
+            return {"ok": True, "window": window, "budget": budget, "outcome": "confirmed",
+                    "ticker": ticker, "strategy": trade.get("strategy")}
+
+        retry_result = run_with_retry(OPTIONS_BUDGETS, _process_options_combo,
+                                       retry_delay_seconds=45, label="options combo")
+        succeeded_first_pass += len(retry_result["succeeded_first_pass"])
+        succeeded_on_retry   += len(retry_result["succeeded_on_retry"])
+        for i, budget in enumerate(OPTIONS_BUDGETS):
+            r = retry_result["results"][i]
+            if i in retry_result["failed_both_passes"]:
                 errored += 1
-                combo_results.append({"window": window, "budget": budget, "outcome": "error", "detail": str(e)})
-                print(f"[PaperTrade] Options combo window={window} budget={budget} failed: {e}")
+                r.setdefault("outcome", "error")
+                r.setdefault("window", window)
+                r.setdefault("budget", budget)
+                print(f"[PaperTrade] Options combo window={window} budget={budget} failed both passes: "
+                      f"{r.get('detail', r.get('error'))}")
+            elif r.get("outcome") == "confirmed":
+                confirmed += 1
+            elif r.get("outcome") == "skipped_duplicate":
+                skipped_duplicates += 1
+            combo_results.append(r)
 
     empty_count = sum(1 for c in combo_results if c["outcome"] == "empty")
     status = "success" if errored == 0 else ("partial" if confirmed > 0 else "failed")
@@ -463,6 +477,8 @@ def run_paper_trade_open_options(user_id: str) -> dict:
         "paper_trade_open_options", started_at, status, confirmed, errored,
         {"combos": combo_results, "confirmed": confirmed, "empty": empty_count, "errored": errored,
          "skipped_duplicates": skipped_duplicates,
+         "succeeded_first_pass": succeeded_first_pass, "succeeded_on_retry": succeeded_on_retry,
+         "failed_both_passes": errored,
          "error_summary": None if errored == 0 else f"{errored} combo(s) errored"},
     )
     return {"job": "paper_trade_open_options", "confirmed": confirmed, "empty": empty_count,
@@ -519,13 +535,16 @@ def run_paper_trade_open_stocks(user_id: str) -> dict:
     from app.recommendations.smart_stock_scan import run_smart_stock_scan
     from app.recommendations.horizon_engine import get_stock_for_horizon
     from app.learning.prediction_tracker import confirm_execution
+    from app.utils.retry_queue import run_with_retry
 
     started_at    = datetime.now(timezone.utc)
     market_ctx    = _market_context()
     combo_results = []
     confirmed     = 0
     errored       = 0
-    skipped_duplicates = 0
+    skipped_duplicates   = 0
+    succeeded_first_pass = 0
+    succeeded_on_retry    = 0
 
     # Phase 1 (composite fundamentals+velocity+insider ranking) is
     # window-independent — run ONCE for the whole grid, not once per
@@ -598,60 +617,69 @@ def run_paper_trade_open_stocks(user_id: str) -> dict:
             print(f"[PaperTrade] Stock window={window} context fetch failed: {e}")
             continue
 
-        for budget in STOCK_BUDGETS:
-            try:
-                # Per-day uniqueness guard - check BEFORE any further work
-                # (recommendation store) for this exact (ticker, window,
-                # budget) combo. Does NOT block the same ticker winning a
-                # DIFFERENT window (correct grid behavior) - only the
-                # identical combo repeated today.
-                if _already_opened_today(user_id, ticker, window, budget):
-                    skipped_duplicates += 1
-                    combo_results.append({"window": window, "budget": budget, "outcome": "skipped_duplicate",
-                                           "ticker": ticker,
-                                           "detail": "already opened today for this exact (ticker, window, budget) combo"})
-                    print(f"[PaperTrade] Skipped duplicate: {ticker} window={window} budget={budget} already opened today")
-                    continue
+        def _process_stock_combo(budget):
+            # Per-day uniqueness guard - check BEFORE any further work
+            # (recommendation store) for this exact (ticker, window,
+            # budget) combo. Does NOT block the same ticker winning a
+            # DIFFERENT window (correct grid behavior) - only the
+            # identical combo repeated today. Also makes a retry of this
+            # exact combo safe/idempotent (see options function for why).
+            if _already_opened_today(user_id, ticker, window, budget):
+                print(f"[PaperTrade] Skipped duplicate: {ticker} window={window} budget={budget} already opened today")
+                return {"ok": True, "window": window, "budget": budget, "outcome": "skipped_duplicate",
+                        "ticker": ticker,
+                        "detail": "already opened today for this exact (ticker, window, budget) combo"}
 
-                trade = top_pick if budget == STOCK_BUDGETS[0] else _resize_stock_trade(top_pick, budget)
+            trade = top_pick if budget == STOCK_BUDGETS[0] else _resize_stock_trade(top_pick, budget)
 
-                rec_id = _store_stock_recommendation(user_id, window, budget, trade, f"{window} days")
+            rec_id = _store_stock_recommendation(user_id, window, budget, trade, f"{window} days")
 
-                entry_price = trade.get("current_price", 0)
-                qty         = trade.get("shares", 0)
-                if not qty or not entry_price:
-                    combo_results.append({"window": window, "budget": budget, "outcome": "empty",
-                                           "detail": "zero shares sized"})
-                    continue
+            entry_price = trade.get("current_price", 0)
+            qty         = trade.get("shares", 0)
+            if not qty or not entry_price:
+                return {"ok": True, "window": window, "budget": budget, "outcome": "empty",
+                        "detail": "zero shares sized"}
 
-                confirm_result = confirm_execution(
-                    user_id=user_id, symbol=ticker, entry_price=entry_price, qty=qty,
-                    recommendation_id=rec_id, source="auto_paper",
-                    trading_window_days=window, budget=budget,
-                )
-                if not confirm_result.get("confirmed") and confirm_result.get("status") != "already_tracked":
-                    errored += 1
-                    combo_results.append({"window": window, "budget": budget, "outcome": "error",
-                                           "detail": confirm_result.get("error", "confirm_execution did not confirm")})
-                    continue
-                tracked_position_id = confirm_result.get("tracked_position_id") or confirm_result.get("id")
+            confirm_result = confirm_execution(
+                user_id=user_id, symbol=ticker, entry_price=entry_price, qty=qty,
+                recommendation_id=rec_id, source="auto_paper",
+                trading_window_days=window, budget=budget,
+            )
+            if not confirm_result.get("confirmed") and confirm_result.get("status") != "already_tracked":
+                return {"ok": False, "window": window, "budget": budget,
+                        "detail": confirm_result.get("error", "confirm_execution did not confirm")}
+            tracked_position_id = confirm_result.get("tracked_position_id") or confirm_result.get("id")
 
-                _store_paper_context(
-                    recommendation_id=rec_id, tracked_position_id=tracked_position_id,
-                    ticker=ticker, rec_type="stock", window=window, budget=budget,
-                    flow_score=None, dp_score=trade.get("dp_score"),
-                    oi_score=None, oi_max_days=None,
-                    iv_level=iv_level, iv_trend=iv_trend, daily_ctx=daily_ctx, intraday=intraday,
-                    market_ctx=market_ctx, conviction_score=trade.get("fundamental_score"),
-                    strategy_selected="STOCK", strategy_rule="",
-                )
+            _store_paper_context(
+                recommendation_id=rec_id, tracked_position_id=tracked_position_id,
+                ticker=ticker, rec_type="stock", window=window, budget=budget,
+                flow_score=None, dp_score=trade.get("dp_score"),
+                oi_score=None, oi_max_days=None,
+                iv_level=iv_level, iv_trend=iv_trend, daily_ctx=daily_ctx, intraday=intraday,
+                market_ctx=market_ctx, conviction_score=trade.get("fundamental_score"),
+                strategy_selected="STOCK", strategy_rule="",
+            )
 
-                confirmed += 1
-                combo_results.append({"window": window, "budget": budget, "outcome": "confirmed", "ticker": ticker})
-            except Exception as e:
+            return {"ok": True, "window": window, "budget": budget, "outcome": "confirmed", "ticker": ticker}
+
+        retry_result = run_with_retry(STOCK_BUDGETS, _process_stock_combo,
+                                       retry_delay_seconds=45, label="stock combo")
+        succeeded_first_pass += len(retry_result["succeeded_first_pass"])
+        succeeded_on_retry   += len(retry_result["succeeded_on_retry"])
+        for i, budget in enumerate(STOCK_BUDGETS):
+            r = retry_result["results"][i]
+            if i in retry_result["failed_both_passes"]:
                 errored += 1
-                combo_results.append({"window": window, "budget": budget, "outcome": "error", "detail": str(e)})
-                print(f"[PaperTrade] Stock combo window={window} budget={budget} failed: {e}")
+                r.setdefault("outcome", "error")
+                r.setdefault("window", window)
+                r.setdefault("budget", budget)
+                print(f"[PaperTrade] Stock combo window={window} budget={budget} failed both passes: "
+                      f"{r.get('detail', r.get('error'))}")
+            elif r.get("outcome") == "confirmed":
+                confirmed += 1
+            elif r.get("outcome") == "skipped_duplicate":
+                skipped_duplicates += 1
+            combo_results.append(r)
 
     empty_count = sum(1 for c in combo_results if c["outcome"] == "empty")
     status = "success" if errored == 0 else ("partial" if confirmed > 0 else "failed")
@@ -659,6 +687,8 @@ def run_paper_trade_open_stocks(user_id: str) -> dict:
         "paper_trade_open_stocks", started_at, status, confirmed, errored,
         {"combos": combo_results, "confirmed": confirmed, "empty": empty_count, "errored": errored,
          "skipped_duplicates": skipped_duplicates,
+         "succeeded_first_pass": succeeded_first_pass, "succeeded_on_retry": succeeded_on_retry,
+         "failed_both_passes": errored,
          "error_summary": None if errored == 0 else f"{errored} combo(s) errored"},
     )
     return {"job": "paper_trade_open_stocks", "confirmed": confirmed, "empty": empty_count,
@@ -698,6 +728,7 @@ def run_paper_trade_close(user_id: str) -> dict:
     from sqlalchemy import text
     from app.db.session import get_session
     from app.recommendations.mark_to_market import mark_recommendation
+    from app.utils.retry_queue import run_with_retry
 
     started_at        = datetime.now(timezone.utc)
     results            = []
@@ -721,80 +752,88 @@ def run_paper_trade_close(user_id: str) -> dict:
               AND tp.entry_date = CURRENT_DATE
         """)).fetchall()
 
-    for row in rows:
+    def _close_one_position(row):
         ticker = row.symbol
         qty    = int(row.qty or 0)
-        try:
-            if not row.recommendation_id:
-                errored += 1
-                results.append({"tp_id": str(row.tp_id), "ticker": ticker, "outcome": "error",
-                                 "detail": "no paper_trade_context/recommendation link found"})
-                continue
 
-            rec = {
-                "ticker":         ticker,
-                "legs":           row.legs or [],
-                "entry_debit":    float(row.entry_debit or 0),
-                "entry_zone_low": float(row.entry_zone_low or 0),
-                "max_loss":       float(row.max_loss or 0),
-                "max_profit":     float(row.max_profit or 0),
-            }
-            mark = mark_recommendation(rec, is_market_open=True)
+        if not row.recommendation_id:
+            return {"ok": False, "tp_id": str(row.tp_id), "ticker": ticker,
+                     "detail": "no paper_trade_context/recommendation link found"}
 
-            if mark["current_value"] is None or mark["pnl_pct"] is None:
-                errored += 1
-                results.append({"tp_id": str(row.tp_id), "ticker": ticker, "outcome": "error",
-                                 "detail": "could not mark to market (contract/quote unavailable)"})
-                continue
+        rec = {
+            "ticker":         ticker,
+            "legs":           row.legs or [],
+            "entry_debit":    float(row.entry_debit or 0),
+            "entry_zone_low": float(row.entry_zone_low or 0),
+            "max_loss":       float(row.max_loss or 0),
+            "max_profit":     float(row.max_profit or 0),
+        }
+        mark = mark_recommendation(rec, is_market_open=True)
 
-            # mark_recommendation's pnl_dollars is per ONE contract (options)
-            # or per ONE share (stock) — scale by the real position size to
-            # get the actual realized dollar P&L for this combo.
-            realized_pnl_dollars = round(mark["pnl_dollars"] * qty, 2)
-            pnl_pct    = mark["pnl_pct"]
-            exit_price = mark["current_value"]
-            won        = pnl_pct > 0
+        if mark["current_value"] is None or mark["pnl_pct"] is None:
+            return {"ok": False, "tp_id": str(row.tp_id), "ticker": ticker,
+                     "detail": "could not mark to market (contract/quote unavailable)"}
 
-            with get_session() as s2:
-                s2.execute(text("""
-                    UPDATE tracked_positions
-                    SET is_active   = FALSE,
-                        exit_date   = CURRENT_DATE,
-                        exit_price  = :ep,
-                        exit_reason = :reason
-                    WHERE id = :id
-                """), {"ep": exit_price, "reason": "EOD_AUTO_CLOSE", "id": row.tp_id})
+        # mark_recommendation's pnl_dollars is per ONE contract (options)
+        # or per ONE share (stock) — scale by the real position size to
+        # get the actual realized dollar P&L for this combo.
+        realized_pnl_dollars = round(mark["pnl_dollars"] * qty, 2)
+        pnl_pct    = mark["pnl_pct"]
+        exit_price = mark["current_value"]
+        won        = pnl_pct > 0
 
-                s2.execute(text("""
-                    UPDATE daily_recommendations
-                    SET exit_price     = :ep,
-                        exit_reason    = :reason,
-                        closed_at      = now(),
-                        actual_pnl     = :pnl_abs,
-                        actual_pnl_pct = :pnl_pct,
-                        was_correct    = :won
-                    WHERE id = :rid AND closed_at IS NULL
-                """), {
-                    "ep": exit_price, "reason": "EOD_AUTO_CLOSE",
-                    "pnl_abs": realized_pnl_dollars, "pnl_pct": pnl_pct, "won": won,
-                    "rid": row.recommendation_id,
-                })
+        with get_session() as s2:
+            s2.execute(text("""
+                UPDATE tracked_positions
+                SET is_active   = FALSE,
+                    exit_date   = CURRENT_DATE,
+                    exit_price  = :ep,
+                    exit_reason = :reason
+                WHERE id = :id
+            """), {"ep": exit_price, "reason": "EOD_AUTO_CLOSE", "id": row.tp_id})
 
+            s2.execute(text("""
+                UPDATE daily_recommendations
+                SET exit_price     = :ep,
+                    exit_reason    = :reason,
+                    closed_at      = now(),
+                    actual_pnl     = :pnl_abs,
+                    actual_pnl_pct = :pnl_pct,
+                    was_correct    = :won
+                WHERE id = :rid AND closed_at IS NULL
+            """), {
+                "ep": exit_price, "reason": "EOD_AUTO_CLOSE",
+                "pnl_abs": realized_pnl_dollars, "pnl_pct": pnl_pct, "won": won,
+                "rid": row.recommendation_id,
+            })
+
+        return {
+            "ok": True, "tp_id": str(row.tp_id), "ticker": ticker,
+            "exit_price": exit_price, "pnl_dollars": realized_pnl_dollars,
+            "pnl_pct": pnl_pct, "won": won,
+        }
+
+    retry_result = run_with_retry(rows, _close_one_position, retry_delay_seconds=45, label="position")
+
+    for i, row in enumerate(rows):
+        r = dict(retry_result["results"][i])
+        r.setdefault("tp_id", str(row.tp_id))
+        r.setdefault("ticker", row.symbol)
+        if i in retry_result["failed_both_passes"]:
+            errored += 1
+            r["outcome"] = "error"
+            r.setdefault("detail", r.get("error"))
+            print(f"[PaperTrade] Close failed both passes for {row.symbol} ({row.tp_id}): "
+                  f"{r.get('detail', r.get('error'))}")
+        else:
+            r["outcome"] = "closed"
             closed += 1
-            total_pnl_dollars += realized_pnl_dollars
-            if won:
+            total_pnl_dollars += r.get("pnl_dollars", 0)
+            if r.get("won"):
                 wins += 1
             else:
                 losses += 1
-            results.append({
-                "tp_id": str(row.tp_id), "ticker": ticker, "outcome": "closed",
-                "exit_price": exit_price, "pnl_dollars": realized_pnl_dollars,
-                "pnl_pct": pnl_pct, "won": won,
-            })
-        except Exception as e:
-            errored += 1
-            results.append({"tp_id": str(row.tp_id), "ticker": ticker, "outcome": "error", "detail": str(e)})
-            print(f"[PaperTrade] Close failed for {ticker} ({row.tp_id}): {e}")
+        results.append(r)
 
     win_rate = round(wins / closed * 100, 1) if closed else None
     status = "success" if errored == 0 else ("partial" if closed > 0 else "failed")
@@ -802,6 +841,9 @@ def run_paper_trade_close(user_id: str) -> dict:
         "paper_trade_close", started_at, status, closed, errored,
         {"results": results, "closed": closed, "wins": wins, "losses": losses,
          "win_rate": win_rate, "total_pnl_dollars": round(total_pnl_dollars, 2),
+         "succeeded_first_pass": len(retry_result["succeeded_first_pass"]),
+         "succeeded_on_retry": len(retry_result["succeeded_on_retry"]),
+         "failed_both_passes": len(retry_result["failed_both_passes"]),
          "error_summary": None if errored == 0 else f"{errored} position(s) errored"},
     )
     return {

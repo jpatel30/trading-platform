@@ -398,7 +398,8 @@ async def startup_event():
                     return
                 result = run_paper_trade_open_options(uid)
                 print(f"[Scheduler] Paper trade open (options): {result.get('confirmed')} confirmed, "
-                      f"{result.get('empty')} empty, {result.get('errored')} errored")
+                      f"{result.get('empty')} empty, {result.get('errored')} errored, "
+                      f"status={result.get('status')}")
             except Exception as e:
                 print(f"[Scheduler] Paper trade open (options) failed: {e}")
 
@@ -411,20 +412,29 @@ async def startup_event():
                     return
                 result = run_paper_trade_open_stocks(uid)
                 print(f"[Scheduler] Paper trade open (stocks): {result.get('confirmed')} confirmed, "
-                      f"{result.get('empty')} empty, {result.get('errored')} errored")
+                      f"{result.get('empty')} empty, {result.get('errored')} errored, "
+                      f"status={result.get('status')}")
             except Exception as e:
                 print(f"[Scheduler] Paper trade open (stocks) failed: {e}")
 
-        scheduler.add_job(
-            _run_paper_trade_open_options,
-            CronTrigger(day_of_week="mon-fri", hour=6, minute=40, timezone=pt),
-            id="paper_trade_open_options", replace_existing=True,
-        )
-        scheduler.add_job(
-            _run_paper_trade_open_stocks,
-            CronTrigger(day_of_week="mon-fri", hour=6, minute=40, timezone=pt),
-            id="paper_trade_open_stocks", replace_existing=True,
-        )
+        # Fires 4x through the trading day (not just once at open) so
+        # later runs can catch genuinely new intraday opportunities -
+        # each run respects the SAME shared DAILY_PICK_CAP (paper_trading.py),
+        # re-checked live at every call, so the four runs combined never
+        # exceed ~20 total unique picks/day regardless of firing order.
+        # 12:30pm PT is the last call, ~25 min before the 12:55pm PT close.
+        PAPER_TRADE_OPEN_TIMES = [(6, 40), (8, 30), (10, 30), (12, 30)]
+        for _hour, _minute in PAPER_TRADE_OPEN_TIMES:
+            scheduler.add_job(
+                _run_paper_trade_open_options,
+                CronTrigger(day_of_week="mon-fri", hour=_hour, minute=_minute, timezone=pt),
+                id=f"paper_trade_open_options_{_hour:02d}{_minute:02d}", replace_existing=True,
+            )
+            scheduler.add_job(
+                _run_paper_trade_open_stocks,
+                CronTrigger(day_of_week="mon-fri", hour=_hour, minute=_minute, timezone=pt),
+                id=f"paper_trade_open_stocks_{_hour:02d}{_minute:02d}", replace_existing=True,
+            )
 
         def _run_paper_trade_close():
             try:
@@ -468,7 +478,8 @@ async def startup_event():
 
         scheduler.start()
         print("[Scheduler] ✅ velocity@4:15PM ET | learning@4:30PM ET | "
-              "paper-trade-open@6:40AM PT | paper-trade-close@12:55PM PT (weekdays) | "
+              "paper-trade-open@6:40/8:30/10:30AM,12:30PM PT (shared 20/day cap) | "
+              "paper-trade-close@12:55PM PT (weekdays) | "
               "weekly-strategy-review@6:00PM ET (Sun)")
     except Exception as e:
         print(f"[Startup] Scheduler failed: {e}")

@@ -138,6 +138,40 @@ def _already_opened_today(user_id: str, symbol: str, trading_window_days: int, b
         return row is not None
 
 
+# Total unique picks allowed per day, combined across BOTH options and
+# stock — NOT ~20 each (confirmed explicitly, more than once). A "pick"
+# is a distinct (ticker, window, rec_type) — budget variants of the same
+# pick aren't separate opportunities, just position-sizing on the same
+# underlying decision (see this module's own docstring: budget doesn't
+# change which ticker/strategy gets selected).
+DAILY_PICK_CAP = 20
+
+
+def _count_todays_unique_picks(user_id: str) -> int:
+    """
+    How many distinct (ticker, window, rec_type) picks has TODAY already
+    opened, across every run so far (options AND stock combined,
+    regardless of which run or how many budget variants each has).
+    Built directly on the existing per-combo tracking (trading_window_days/
+    budget on tracked_positions, rec_type on paper_trade_context) rather
+    than a separate counter — re-queried live at each check point so both
+    "already at cap before this run starts" and "this run's own opens
+    pushed us over cap partway through" are the same check, not two.
+    """
+    from sqlalchemy import text
+    from app.db.session import get_session
+    with get_session() as s:
+        row = s.execute(text("""
+            SELECT COUNT(*) AS n FROM (
+                SELECT DISTINCT tp.symbol, tp.trading_window_days, ptc.rec_type
+                FROM tracked_positions tp
+                JOIN paper_trade_context ptc ON ptc.tracked_position_id = tp.id
+                WHERE tp.user_id = :uid AND tp.source = 'auto_paper' AND tp.entry_date = CURRENT_DATE
+            ) sub
+        """), {"uid": user_id}).fetchone()
+        return int(row.n or 0)
+
+
 def _lookup_recommendation_id(user_id: str, ticker: str, horizon: str) -> str | None:
     from sqlalchemy import text
     from app.db.session import get_session
@@ -313,7 +347,6 @@ def run_paper_trade_open_options(user_id: str) -> dict:
     from app.utils.retry_queue import run_with_retry
 
     started_at    = datetime.now(timezone.utc)
-    market_ctx    = _market_context()
     combo_results = []
     confirmed     = 0
     errored       = 0
@@ -321,7 +354,38 @@ def run_paper_trade_open_options(user_id: str) -> dict:
     succeeded_first_pass  = 0
     succeeded_on_retry    = 0
 
+    # Daily cap — checked BEFORE any scan work, not after. If an earlier
+    # run today (options or stock) already reached DAILY_PICK_CAP, this
+    # entire run is skipped outright with a real, job_run_log-visible
+    # reason, not a silent no-op.
+    todays_picks = _count_todays_unique_picks(user_id)
+    if todays_picks >= DAILY_PICK_CAP:
+        detail = (f"daily cap of {DAILY_PICK_CAP} unique picks reached "
+                  f"({todays_picks} already open) — skipping this run, no new positions opened")
+        print(f"[PaperTrade] {detail}")
+        _log_job_run("paper_trade_open_options", started_at, "skipped_cap_reached", 0, 0,
+                     {"reason": detail, "todays_unique_picks": todays_picks, "cap": DAILY_PICK_CAP})
+        return {"job": "paper_trade_open_options", "confirmed": 0, "empty": 0, "errored": 0,
+                "skipped_duplicates": 0, "combos": [], "status": "skipped_cap_reached", "detail": detail}
+
+    market_ctx    = _market_context()
+
     for window in OPTIONS_WINDOWS:
+        # Re-checked live at each window boundary, not just once at the
+        # top — this run's OWN earlier windows this same call may have
+        # already used up the remaining budget (e.g. 6:40am opens 12,
+        # leaving 8 for 8:30am — but ALSO within one run, window 4
+        # shouldn't open more once windows 1-3 already used the rest).
+        todays_picks = _count_todays_unique_picks(user_id)
+        if todays_picks >= DAILY_PICK_CAP:
+            detail = (f"daily cap of {DAILY_PICK_CAP} unique picks reached "
+                      f"({todays_picks} already open) mid-run — stopping before window={window}")
+            print(f"[PaperTrade] {detail}")
+            for budget in OPTIONS_BUDGETS:
+                combo_results.append({"window": window, "budget": budget,
+                                       "outcome": "skipped_cap_reached", "detail": detail})
+            break
+
         try:
             scan_result = rescan_with_validation(
                 user_id=user_id, budget=OPTIONS_BUDGETS[0], trading_window_days=window,
@@ -461,17 +525,20 @@ def run_paper_trade_open_options(user_id: str) -> dict:
             combo_results.append(r)
 
     empty_count = sum(1 for c in combo_results if c["outcome"] == "empty")
+    cap_skipped_count = sum(1 for c in combo_results if c["outcome"] == "skipped_cap_reached")
     status = "success" if errored == 0 else ("partial" if confirmed > 0 else "failed")
     _log_job_run(
         "paper_trade_open_options", started_at, status, confirmed, errored,
         {"combos": combo_results, "confirmed": confirmed, "empty": empty_count, "errored": errored,
-         "skipped_duplicates": skipped_duplicates,
+         "skipped_duplicates": skipped_duplicates, "skipped_cap_reached": cap_skipped_count,
+         "todays_unique_picks_after_run": _count_todays_unique_picks(user_id), "cap": DAILY_PICK_CAP,
          "succeeded_first_pass": succeeded_first_pass, "succeeded_on_retry": succeeded_on_retry,
          "failed_both_passes": errored,
          "error_summary": None if errored == 0 else f"{errored} combo(s) errored"},
     )
     return {"job": "paper_trade_open_options", "confirmed": confirmed, "empty": empty_count,
             "errored": errored, "skipped_duplicates": skipped_duplicates,
+            "skipped_cap_reached": cap_skipped_count,
             "combos": combo_results, "status": status}
 
 
@@ -527,13 +594,26 @@ def run_paper_trade_open_stocks(user_id: str) -> dict:
     from app.utils.retry_queue import run_with_retry
 
     started_at    = datetime.now(timezone.utc)
-    market_ctx    = _market_context()
     combo_results = []
     confirmed     = 0
     errored       = 0
     skipped_duplicates   = 0
     succeeded_first_pass = 0
     succeeded_on_retry    = 0
+
+    # Daily cap — checked BEFORE any scan work (see run_paper_trade_open_
+    # options for the full rationale; identical mechanism, shared budget).
+    todays_picks = _count_todays_unique_picks(user_id)
+    if todays_picks >= DAILY_PICK_CAP:
+        detail = (f"daily cap of {DAILY_PICK_CAP} unique picks reached "
+                  f"({todays_picks} already open) — skipping this run, no new positions opened")
+        print(f"[PaperTrade] {detail}")
+        _log_job_run("paper_trade_open_stocks", started_at, "skipped_cap_reached", 0, 0,
+                     {"reason": detail, "todays_unique_picks": todays_picks, "cap": DAILY_PICK_CAP})
+        return {"job": "paper_trade_open_stocks", "confirmed": 0, "empty": 0, "errored": 0,
+                "skipped_duplicates": 0, "combos": [], "status": "skipped_cap_reached", "detail": detail}
+
+    market_ctx    = _market_context()
 
     # Phase 1 (composite fundamentals+velocity+insider ranking) is
     # window-independent — run ONCE for the whole grid, not once per
@@ -571,6 +651,18 @@ def run_paper_trade_open_stocks(user_id: str) -> dict:
     current_price = top_ranked.get("current_price", 0)
 
     for window in STOCK_WINDOWS:
+        # Re-checked live at each window boundary — see run_paper_trade_
+        # open_options for the full rationale (same shared cap).
+        todays_picks = _count_todays_unique_picks(user_id)
+        if todays_picks >= DAILY_PICK_CAP:
+            detail = (f"daily cap of {DAILY_PICK_CAP} unique picks reached "
+                      f"({todays_picks} already open) mid-run — stopping before window={window}")
+            print(f"[PaperTrade] {detail}")
+            for budget in STOCK_BUDGETS:
+                combo_results.append({"window": window, "budget": budget,
+                                       "outcome": "skipped_cap_reached", "detail": detail})
+            break
+
         try:
             top_pick = get_stock_for_horizon(
                 ticker, "6m", STOCK_BUDGETS[0], current_price=current_price,
@@ -671,17 +763,19 @@ def run_paper_trade_open_stocks(user_id: str) -> dict:
             combo_results.append(r)
 
     empty_count = sum(1 for c in combo_results if c["outcome"] == "empty")
+    cap_skipped_count = sum(1 for c in combo_results if c["outcome"] == "skipped_cap_reached")
     status = "success" if errored == 0 else ("partial" if confirmed > 0 else "failed")
     _log_job_run(
         "paper_trade_open_stocks", started_at, status, confirmed, errored,
         {"combos": combo_results, "confirmed": confirmed, "empty": empty_count, "errored": errored,
-         "skipped_duplicates": skipped_duplicates,
+         "skipped_duplicates": skipped_duplicates, "skipped_cap_reached": cap_skipped_count,
+         "todays_unique_picks_after_run": _count_todays_unique_picks(user_id), "cap": DAILY_PICK_CAP,
          "succeeded_first_pass": succeeded_first_pass, "succeeded_on_retry": succeeded_on_retry,
          "failed_both_passes": errored,
          "error_summary": None if errored == 0 else f"{errored} combo(s) errored"},
     )
     return {"job": "paper_trade_open_stocks", "confirmed": confirmed, "empty": empty_count,
-            "errored": errored, "skipped_duplicates": skipped_duplicates,
+            "errored": errored, "skipped_duplicates": skipped_duplicates, "skipped_cap_reached": cap_skipped_count,
             "combos": combo_results, "status": status}
 
 

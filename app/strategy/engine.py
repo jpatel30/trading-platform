@@ -132,7 +132,21 @@ def _get_uw_chain(ticker: str, expiry: str) -> dict[str, dict]:
     try:
         from app.options_flow.unusual_whales import get_option_contracts
         contracts = get_option_contracts(ticker, expiry=expiry, limit=500)
-        return {c.get("option_symbol",""): c for c in contracts if c.get("option_symbol")}
+        chain = {c.get("option_symbol",""): c for c in contracts if c.get("option_symbol")}
+        if not chain:
+            # A real, valid expiry should almost always return SOME
+            # contracts — an empty chain here is exactly what a
+            # non-listed expiry looks like (confirmed live: SMCI given
+            # a made-up date returned 0 contracts every time), and every
+            # leg for it then silently falls back to BSM_estimate
+            # pricing on a contract that was never real. Callers that
+            # don't already validate the expiry against
+            # get_expiry_breakdown() (build_recommendation() does;
+            # _execute_smart_rec() now does too) should treat this as a
+            # real signal to investigate, not just an empty result.
+            print(f"[TradeMath] Empty option chain for {ticker} expiry={expiry} — "
+                  f"either a transient fetch issue or this isn't a real listed expiry")
+        return chain
     except Exception:
         return {}
 

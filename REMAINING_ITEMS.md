@@ -5,7 +5,6 @@ Last updated: July 2026
 Last updated: July 2026. Full technical narrative (root causes, exact fixes, line-by-line verification) for completed work lives in git log commit messages - this doc stays a scannable status/priority list, not a technical diary.
 
 Priority Order (Remaining)
-Fix expiry-selection bug producing non-listed expiries for some tickers (e.g. SMCI got 2026-09-22, not a real listed date - see #1)
 Expand paper-trade scheduling to multiple times/day, capped at ~20 unique picks/day total
 Fix check_fills() - matches bare ticker, not real contract
 Add a real login path for returning users
@@ -20,6 +19,7 @@ Confirm/fix monitor_config table usage
 Decide on ChromaDB (remove container, or wire into real RAG)
 Delete or repurpose orphaned conviction.py
 Populate tracked_positions.daily_rec_id
+Root-cause BSM_estimate legs on positions with a genuinely valid expiry
 Revisit paper-trading calibration assumptions once real data exists
 Build real Robinhood/IBKR/Tastytrade connections
 Turn ad-hoc schema changes into versioned migrations
@@ -32,35 +32,35 @@ Add mobile push notifications
 Build a public invite page
 Descriptions
 
-1. Expiry-selection bug for tickers with sparse/monthly-only chains Found while investigating why 8 SMCI auto_paper positions couldn't be closed ("could not mark to market") even after the retry-queue fix - SMCI's stored entry expiry was 2026-09-22, which is NOT one of SMCI's real listed expiries (confirmed via get_expiry_breakdown: real ones are ...09-04, 09-18, 11-20 - nothing on 09-22). get_option_contracts(expiry=2026-09-22) correctly returns 0 contracts every time, so this isn't transient - the retry (correctly) still fails both attempts. All 8 legs were also stored with price_source=BSM_estimate, meaning even at entry the real chain wasn't fetched successfully - whatever expiry-selection logic picked 09-22 (compute_target_date + nearest-real-expiry matching) didn't validate against this ticker's OWN actual listed expiries for a ticker with a sparser-than-weekly chain. Not yet root-caused in the selection code itself; flagging so it's not mistaken for a retry-queue or mark-to-market bug.
+1. Expand scheduling to multiple times/day, capped at ~20 total Morning/mid-day/afternoon/near-close, simulating "if I checked right now, what would I find." CORRECTED: the ~20 target is TOTAL unique picks across the whole day, combined across every run - not ~20 per run (which would have meant up to ~100/day, mostly repeats of the same tickers). Each later run needs to know what earlier runs already opened today and either skip a ticker/combo already represented, or only add something genuinely new. Per-combo (ticker+window+budget+day) duplication is now solved (see git log - both an app-level pre-check and a DB-level partial unique index), and so is the shared retry-queue mechanism (see git log); what's still missing here is the coarser "total daily volume" cap across separate runs, which needs its own tracking, not just combo-level dedup. Open question, not yet decided: is ~20 split evenly across options/stock (~10 each), or ~20 total combined across both types?
 
-2. Expand scheduling to multiple times/day, capped at ~20 total Morning/mid-day/afternoon/near-close, simulating "if I checked right now, what would I find." CORRECTED: the ~20 target is TOTAL unique picks across the whole day, combined across every run - not ~20 per run (which would have meant up to ~100/day, mostly repeats of the same tickers). Each later run needs to know what earlier runs already opened today and either skip a ticker/combo already represented, or only add something genuinely new. Per-combo (ticker+window+budget+day) duplication is now solved (see git log - both an app-level pre-check and a DB-level partial unique index), and so is the shared retry-queue mechanism (see git log); what's still missing here is the coarser "total daily volume" cap across separate runs, which needs its own tracking, not just combo-level dedup. Open question, not yet decided: is ~20 split evenly across options/stock (~10 each), or ~20 total combined across both types?
+2. Fix check_fills() Auto-detects fills by comparing live Webull positions against today's recommendations - matches on bare ticker only, not strike/expiry/type. Already caused one real mislabeled fill (an existing MSTR position auto-matched to an unrelated recommendation). DB rows cleaned up; root cause not yet fixed.
 
-3. Fix check_fills() Auto-detects fills by comparing live Webull positions against today's recommendations - matches on bare ticker only, not strike/expiry/type. Already caused one real mislabeled fill (an existing MSTR position auto-matched to an unrelated recommendation). DB rows cleaned up; root cause not yet fixed.
+3. Returning-user login path login_with_invite() is the only way in and requires a still-pending invite_code every time. Once accepted, the only way back in is a manual DB reset. Blocks inviting real beta users, who have no database access.
 
-4. Returning-user login path login_with_invite() is the only way in and requires a still-pending invite_code every time. Once accepted, the only way back in is a manual DB reset. Blocks inviting real beta users, who have no database access.
+4. MCP key regeneration Keys mint once at account creation with no way to reissue if lost. create_api_key() already supports multiple active keys per user - just needs a self-serve endpoint.
 
-5. MCP key regeneration Keys mint once at account creation with no way to reissue if lost. create_api_key() already supports multiple active keys per user - just needs a self-serve endpoint.
+5. Cloud deployment Cloudflare tunnel or Railway.app. Directly unblocks #6 - multi-tenant MCP access is fully built and tested but has nowhere to actually run for a real customer yet.
 
-6. Cloud deployment Cloudflare tunnel or Railway.app. Directly unblocks #7 - multi-tenant MCP access is fully built and tested but has nowhere to actually run for a real customer yet.
+6. Hosted MCP server MCP_TRANSPORT=http + ApiKeyTokenVerifier exist and are wired in, purely blocked on #5.
 
-7. Hosted MCP server MCP_TRANSPORT=http + ApiKeyTokenVerifier exist and are wired in, purely blocked on #6.
+7. get_bars() wrapper bug Silently ignores the multiplier argument, only maps minute/hour/day/ week timespans - multiplier=5 would NOT actually fetch 5-minute bars through it. intraday_entry.py already works around this by calling unusual_whales.get_ohlc() directly; the wrapper itself is still a trap for any future caller.
 
-8. get_bars() wrapper bug Silently ignores the multiplier argument, only maps minute/hour/day/ week timespans - multiplier=5 would NOT actually fetch 5-minute bars through it. intraday_entry.py already works around this by calling unusual_whales.get_ohlc() directly; the wrapper itself is still a trap for any future caller.
+8. Wire unused UW data into scoring Economic calendar and net-flow-by-expiry are never called - plausible real signal upgrades. Congress trades and insider-ownership-pct tools exist but don't feed conviction scoring or the LLM prompt at all.
 
-9. Wire unused UW data into scoring Economic calendar and net-flow-by-expiry are never called - plausible real signal upgrades. Congress trades and insider-ownership-pct tools exist but don't feed conviction scoring or the LLM prompt at all.
+9. ETF scoring in stock scans Currently a technicals-only stand-in since ETFs don't have analyst targets/PEG/revenue-growth. Works, but a real fund-appropriate model (expense ratio, index-tracking quality) would be better.
 
-10. ETF scoring in stock scans Currently a technicals-only stand-in since ETFs don't have analyst targets/PEG/revenue-growth. Works, but a real fund-appropriate model (expense ratio, index-tracking quality) would be better.
+10. 3m "both" horizon's stock half Still uses horizon_engine.py's naive per-ticker loop, not smart_stock_scan.py's composite pre-filter (unlike pure 6m/1yr stock scans). Narrow, not urgent.
 
-11. 3m "both" horizon's stock half Still uses horizon_engine.py's naive per-ticker loop, not smart_stock_scan.py's composite pre-filter (unlike pure 6m/1yr stock scans). Narrow, not urgent.
+11. monitor_config table Schema exists with plausible columns (is_active, check_interval, total_alerts_fired) but usage by position_monitor.py not yet confirmed either way.
 
-12. monitor_config table Schema exists with plausible columns (is_active, check_interval, total_alerts_fired) but usage by position_monitor.py not yet confirmed either way.
+12. ChromaDB Running in docker-compose.yml, zero imports anywhere in the codebase. Either remove the container, or wire it into real RAG instead of context_builder.py's current direct-API-call approach.
 
-13. ChromaDB Running in docker-compose.yml, zero imports anywhere in the codebase. Either remove the container, or wire it into real RAG instead of context_builder.py's current direct-API-call approach.
+13. conviction.py cleanup Orphaned - its only caller (the old daily_engine.py path) was retired this session. No remaining importers. Delete it or repurpose it.
 
-14. conviction.py cleanup Orphaned - its only caller (the old daily_engine.py path) was retired this session. No remaining importers. Delete it or repurpose it.
+14. tracked_positions.daily_rec_id Column exists in schema, not yet populated by the current fill- tracking flow (which matches by ticker + fill-price proximity instead). A more direct link; low priority, current approach already works and is tested.
 
-15. tracked_positions.daily_rec_id Column exists in schema, not yet populated by the current fill- tracking flow (which matches by ticker + fill-price proximity instead). A more direct link; low priority, current approach already works and is tested.
+15. BSM_estimate legs on positions with a genuinely VALID expiry Found while auditing all open auto_paper positions for the expiry-selection bug (see git log) - 5 of the 7 affected positions have a real, correctly-listed expiry (confirmed against get_expiry_breakdown), yet some/all legs still priced via BSM_estimate rather than real UW quotes. Not the same bug (expiry validation now catches the invalid-expiry case) - this is a separate, still-open question about why a specific strike at a valid expiry sometimes has no matching UW contract (illiquid/unlisted strike, stale chain fetch, or something else). Not yet root-caused.
 
 16. Revisit paper-trading calibration assumptions All of these resolve the same way - once the reliability fixes above land and a real week or two of trading-hours data accumulates, not before:
 

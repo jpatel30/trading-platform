@@ -369,6 +369,57 @@ def _execute_smart_rec(rec: dict, budget: float, user_id: str | None) -> dict | 
     if not spot or not buy_str:
         return None
 
+    # Expiry validation: the LLM prompt shows real listed expiries (via
+    # _enrich_ticker's get_expiry_breakdown call) and explicitly instructs
+    # picking one of them, but nothing downstream ever checked the LLM's
+    # actual returned "expiry" against that real list — same failure
+    # shape as the strike-hallucination bug below, just a different
+    # field. Confirmed live: SMCI was given expiry=2026-09-22, which
+    # isn't one of SMCI's real listed dates (...09-04, 09-18, 11-20...).
+    # get_option_contracts(ticker, expiry=<invalid date>) then silently
+    # returns 0 contracts every time (not transient), so the "snap to
+    # real strikes" block below finds nothing to snap to AND every leg's
+    # entry price falls back to synthetic BSM estimation — a fake price
+    # on a contract that was never real to begin with, both at entry and
+    # at every later mark-to-market attempt. Snap to the closest REAL
+    # listed expiry if one exists within a reasonable distance (matters
+    # most for tickers like SMCI with a sparser-than-weekly chain, where
+    # the nearest calendar date frequently isn't an actual listed date);
+    # otherwise reject the candidate outright rather than silently
+    # proceeding on a contract that doesn't exist.
+    MAX_EXPIRY_SNAP_DAYS = 15
+    try:
+        from app.options_flow.unusual_whales import get_expiry_breakdown
+        real_expiries = [e.get("expires") or e.get("expiry")
+                         for e in (get_expiry_breakdown(ticker) or [])]
+        real_expiries = [e for e in real_expiries if e]
+    except Exception as e:
+        print(f"[SmartMath] Rejected {ticker} {strategy}: expiry breakdown fetch failed: {e}")
+        return None
+
+    if not real_expiries:
+        print(f"[SmartMath] Rejected {ticker} {strategy}: no real listed expiries found at all")
+        return None
+
+    if expiry not in real_expiries:
+        try:
+            target  = datetime.strptime(expiry, "%Y-%m-%d")
+            closest = min(real_expiries, key=lambda e: abs((datetime.strptime(e, "%Y-%m-%d") - target).days))
+            distance = abs((datetime.strptime(closest, "%Y-%m-%d") - target).days)
+        except Exception as e:
+            print(f"[SmartMath] Rejected {ticker} {strategy}: could not parse expiry '{expiry}': {e}")
+            return None
+
+        if distance > MAX_EXPIRY_SNAP_DAYS:
+            print(f"[SmartMath] Rejected {ticker} {strategy}: expiry {expiry} is not a real listed "
+                  f"date and the closest real one ({closest}) is {distance}d away "
+                  f"(> {MAX_EXPIRY_SNAP_DAYS}d tolerance) — real_expiries={real_expiries}")
+            return None
+
+        print(f"[SmartMath] Snapped {ticker} expiry {expiry} → {closest} "
+              f"(not a real listed date, {distance}d away)")
+        expiry = closest
+
     # Sanity check: strikes should never be wildly divorced from the real
     # spot price. Confirmed live: a 60-day SPY IRON_CONDOR came back with
     # short strikes ~40% below the real $738 spot — not a strike-ordering

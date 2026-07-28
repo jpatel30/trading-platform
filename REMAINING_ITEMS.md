@@ -9,7 +9,6 @@ Add a real login path for returning users
 Add MCP key regeneration
 Deploy somewhere real (Cloudflare tunnel / Railway)
 Point the hosted MCP server at that deployment
-Fix get_bars() wrapper silently ignoring intraday multiplier
 Wire unused UW data into scoring (econ calendar, net-flow-by-expiry, congress trades, insider ownership)
 Improve ETF scoring in stock scans
 Fix 3m "both" horizon's stock half (still on the naive per-ticker loop)
@@ -17,6 +16,7 @@ Confirm/fix monitor_config table usage
 Decide on ChromaDB (remove container, or wire into real RAG)
 Delete or repurpose orphaned conviction.py
 Populate tracked_positions.daily_rec_id
+Fix MCP tool get_price_history(timespan="month") - no real UW equivalent
 Root-cause BSM_estimate legs on positions with a genuinely valid expiry
 Revisit paper-trading calibration assumptions once real data exists
 Build real Robinhood/IBKR/Tastytrade connections
@@ -38,21 +38,21 @@ Descriptions
 
 4. Hosted MCP server MCP_TRANSPORT=http + ApiKeyTokenVerifier exist and are wired in, purely blocked on #3.
 
-5. get_bars() wrapper bug Silently ignores the multiplier argument, only maps minute/hour/day/ week timespans - multiplier=5 would NOT actually fetch 5-minute bars through it. intraday_entry.py already works around this by calling unusual_whales.get_ohlc() directly; the wrapper itself is still a trap for any future caller.
+5. Wire unused UW data into scoring Economic calendar and net-flow-by-expiry are never called - plausible real signal upgrades. Congress trades and insider-ownership-pct tools exist but don't feed conviction scoring or the LLM prompt at all.
 
-6. Wire unused UW data into scoring Economic calendar and net-flow-by-expiry are never called - plausible real signal upgrades. Congress trades and insider-ownership-pct tools exist but don't feed conviction scoring or the LLM prompt at all.
+6. ETF scoring in stock scans Currently a technicals-only stand-in since ETFs don't have analyst targets/PEG/revenue-growth. Works, but a real fund-appropriate model (expense ratio, index-tracking quality) would be better.
 
-7. ETF scoring in stock scans Currently a technicals-only stand-in since ETFs don't have analyst targets/PEG/revenue-growth. Works, but a real fund-appropriate model (expense ratio, index-tracking quality) would be better.
+7. 3m "both" horizon's stock half Still uses horizon_engine.py's naive per-ticker loop, not smart_stock_scan.py's composite pre-filter (unlike pure 6m/1yr stock scans). Narrow, not urgent.
 
-8. 3m "both" horizon's stock half Still uses horizon_engine.py's naive per-ticker loop, not smart_stock_scan.py's composite pre-filter (unlike pure 6m/1yr stock scans). Narrow, not urgent.
+8. monitor_config table Schema exists with plausible columns (is_active, check_interval, total_alerts_fired) but usage by position_monitor.py not yet confirmed either way.
 
-9. monitor_config table Schema exists with plausible columns (is_active, check_interval, total_alerts_fired) but usage by position_monitor.py not yet confirmed either way.
+9. ChromaDB Running in docker-compose.yml, zero imports anywhere in the codebase. Either remove the container, or wire it into real RAG instead of context_builder.py's current direct-API-call approach.
 
-10. ChromaDB Running in docker-compose.yml, zero imports anywhere in the codebase. Either remove the container, or wire it into real RAG instead of context_builder.py's current direct-API-call approach.
+10. conviction.py cleanup Orphaned - its only caller (the old daily_engine.py path) was retired this session. No remaining importers. Delete it or repurpose it.
 
-11. conviction.py cleanup Orphaned - its only caller (the old daily_engine.py path) was retired this session. No remaining importers. Delete it or repurpose it.
+11. tracked_positions.daily_rec_id Column exists in schema, not yet populated by the current fill- tracking flow (which matches by ticker + fill-price proximity instead). A more direct link; low priority, current approach already works and is tested.
 
-12. tracked_positions.daily_rec_id Column exists in schema, not yet populated by the current fill- tracking flow (which matches by ticker + fill-price proximity instead). A more direct link; low priority, current approach already works and is tested.
+12. MCP tool get_price_history(timespan="month") has no real UW equivalent Found while auditing get_bars() callers (see git log) - the MCP tool's own docstring promises 'month' as a valid timespan, but UW's OHLC endpoint has no monthly candle under any tested format (1mo/1M/1month all 422). Falls back to daily bars mislabeled as monthly - same silently-wrong shape as the already-fixed week bug, but no direct UW substitute exists this time (would need real month-aggregation logic built from daily bars, or the docstring corrected to drop the false promise). Not fixed here - out of scope for the get_bars() multiplier fix.
 
 13. BSM_estimate legs on positions with a genuinely VALID expiry Found while auditing all open auto_paper positions for the expiry-selection bug (see git log) - 5 of the 7 affected positions have a real, correctly-listed expiry (confirmed against get_expiry_breakdown), yet some/all legs still priced via BSM_estimate rather than real UW quotes. Not the same bug (expiry validation now catches the invalid-expiry case) - this is a separate, still-open question about why a specific strike at a valid expiry sometimes has no matching UW contract (illiquid/unlisted strike, stale chain fetch, or something else). Not yet root-caused.
 

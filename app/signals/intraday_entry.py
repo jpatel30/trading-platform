@@ -14,10 +14,16 @@ rules say.
 
 Data source note: fetches via unusual_whales.get_ohlc(candle_size="5m"
 or "15m") directly, NOT through market_data/uw_market_data.py's
-get_bars() wrapper — that wrapper's timespan_map only maps "minute"/
-"hour"/"day"/"week" and silently ignores the multiplier argument
-entirely, so multiplier=5 would NOT actually fetch 5-minute bars
-through it today. Flagged as a separate gap, not fixed here.
+get_bars() wrapper. get_bars()'s multiplier handling has since been
+fixed (it used to silently ignore multiplier entirely) — but it still
+isn't used here, deliberately: get_bars() falls back to Polygon on any
+UW failure, and Polygon's bar dict uses a completely different schema
+("timestamp"/"open"/"close" vs UW's "t"/"o"/"c") — confirmed live while
+verifying the get_bars() fix. A silent fallback mid-run would break
+this module's RSI/MACD math (which reads "c" directly) rather than
+just returning slightly different data, so calling get_ohlc() directly
+— guaranteeing one consistent schema — is the right call, not a
+workaround to revisit.
 
 Found and fixed a real, blocking bug while building this: get_ohlc()
 computed every intraday bar's timestamp as 0 (it only ever read a

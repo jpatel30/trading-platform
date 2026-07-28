@@ -7,11 +7,38 @@ from datetime import datetime
 
 
 def get_bars(ticker, multiplier=1, timespan="day", from_date=None, to_date=None, limit=300):
-    """UW OHLC first (0.15s), Polygon fallback."""
+    """UW OHLC first (0.15s), Polygon fallback.
+
+    multiplier is only meaningful for minute/hour granularities — UW's
+    candle_size is a single string like "5m"/"15m"/"1h" (confirmed live:
+    it accepts 1m/5m/15m/30m/1h/4h, but rejects "2d" with a 422, and has
+    no monthly candle under any tested format). Below day/week this now
+    actually builds the requested candle size instead of silently
+    ignoring multiplier and always returning single-unit bars — the
+    previous version's timespan_map mapped EVERY "minute" request to a
+    flat "1m", regardless of what multiplier said, which is exactly the
+    bug intraday_entry.py found and worked around by calling get_ohlc()
+    directly instead of going through this wrapper.
+    """
     try:
         from app.options_flow.unusual_whales import get_ohlc
-        timespan_map = {"minute": "1m", "hour": "1h", "day": "1d", "week": "1d"}
-        bars = get_ohlc(ticker, candle_size=timespan_map.get(timespan, "1d"), limit=limit)
+        if timespan == "minute":
+            candle_size = f"{int(multiplier)}m"
+        elif timespan == "hour":
+            candle_size = f"{int(multiplier)}h"
+        elif timespan == "week":
+            candle_size = "1w"   # was wrongly "1d" — week never actually meant daily
+        else:
+            # day (and month — UW has no real candle for that at all,
+            # see REMAINING_ITEMS.md). Multiplier has no real meaning
+            # here (UW rejects e.g. "2d"), so it's intentionally not
+            # applied — but flag it if a caller ever asks, since that
+            # combination is silently unsupported by the real API.
+            if multiplier != 1:
+                print(f"[UW] get_bars {ticker}: multiplier={multiplier} has no effect "
+                      f"for timespan='{timespan}' — UW only supports single-unit day/week candles")
+            candle_size = "1d"
+        bars = get_ohlc(ticker, candle_size=candle_size, limit=limit)
         if bars:
             if from_date:
                 from_ts = int(datetime.strptime(from_date, "%Y-%m-%d").timestamp() * 1000)

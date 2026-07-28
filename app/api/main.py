@@ -1445,47 +1445,116 @@ async def check_fills(user_id: str = Depends(get_current_user)):
                         "source":    "cache_429",
                     }
             raise
-        pos_symbols = {p.get("symbol","") for p in positions}
-
         with get_session() as s:
             recs = s.execute(text("""
-                SELECT ticker, direction, strategy, expiry, conviction_score
+                SELECT id, ticker, direction, strategy, expiry, conviction_score,
+                       legs, entry_debit, entry_zone_low, entry_zone_high
                 FROM daily_recommendations
                 WHERE user_id=:uid AND date=CURRENT_DATE AND status='ACTIVE'
             """), {"uid": user_id}).fetchall()
 
-        matches = []
+        recs_by_ticker: dict = {}
         for rec in recs:
-            ticker = rec.ticker
-            if ticker in pos_symbols:
-                # Check if already tracked
-                with get_session() as s:
-                    tracked = s.execute(text("""
-                        SELECT id FROM tracked_positions
-                        WHERE user_id=:uid AND ticker=:t
-                        AND created_at > now() - interval '1 day'
-                    """), {"uid": user_id, "t": ticker}).fetchone()
+            recs_by_ticker.setdefault(rec.ticker, []).append(rec)
 
-                if not tracked:
-                    pos = next((p for p in positions if p.get("symbol")==ticker), {})
-                    # Auto-confirm with real price (not 0) to match user entry
-                    entry_price = float(pos.get("unit_cost") or pos.get("last_price") or 0)
-                    qty         = int(pos.get("qty") or 1)
-                    try:
-                        from app.learning.prediction_tracker import confirm_execution
-                        confirm_execution(user_id, ticker, entry_price, qty,
-                                         recommendation_id=None)
-                    except Exception:
-                        pass  # already tracked
-                    matches.append({
-                        "ticker":        ticker,
-                        "direction":     rec.direction,
-                        "strategy":      rec.strategy,
-                        "expiry":        rec.expiry,
-                        "qty":           qty,
-                        "price":         entry_price,
-                        "auto_detected": True,
-                    })
+        # Price-proximity is the strongest real signal available for
+        # picking the CORRECT recommendation among several on the same
+        # ticker/day — Webull's actual position data has no strike/
+        # expiry/OCC-symbol field at all for OPTION holdings (confirmed
+        # live against 7 real option positions: only symbol=<underlying>,
+        # instrument_type, qty, unit_cost, last_price — no contract
+        # detail, and no cheap reverse lookup exists either:
+        # get_trade_instrument_detail(instrument_id) just echoes the id
+        # back, get_trade_security_detail requires strike/expiry as
+        # INPUT, not output). A generous relative band still catches the
+        # real MSTR bug (an old, unrelated position at a wildly
+        # different price) while tolerating normal quote movement
+        # between when a rec was generated and the actual fill.
+        OPTION_PRICE_TOLERANCE_PCT = 0.30
+        STOCK_PRICE_TOLERANCE_PCT  = 0.10
+
+        matches = []
+        for pos in positions:
+            ticker = pos.get("symbol", "")
+            candidates = recs_by_ticker.get(ticker, [])
+            if not candidates:
+                continue
+
+            is_option_pos = pos.get("instrument_type") == "OPTION"
+            unit_cost = float(pos.get("unit_cost") or 0)
+            if not unit_cost:
+                continue
+
+            # Never match an options holding to a stock recommendation
+            # or vice versa — the old code didn't check this at all,
+            # so a stock position and an options position on the same
+            # ticker the same day could get cross-matched.
+            same_type = [r for r in candidates if bool(r.legs) == is_option_pos]
+            if not same_type:
+                continue
+
+            best_rec, best_diff = None, float("inf")
+            for r in same_type:
+                if is_option_pos:
+                    ref_price = abs(float(r.entry_debit or 0))
+                else:
+                    low, high = float(r.entry_zone_low or 0), float(r.entry_zone_high or 0)
+                    if low and high and low <= unit_cost <= high:
+                        ref_price = unit_cost  # inside the recommended zone — exact
+                    else:
+                        ref_price = (low + high) / 2 if (low or high) else 0
+                if not ref_price:
+                    continue
+                diff = abs(unit_cost - ref_price) / ref_price
+                if diff < best_diff:
+                    best_rec, best_diff = r, diff
+
+            if not best_rec:
+                continue
+
+            tolerance = OPTION_PRICE_TOLERANCE_PCT if is_option_pos else STOCK_PRICE_TOLERANCE_PCT
+            if best_diff > tolerance:
+                print(f"[CheckFills] {ticker}: real entry ${unit_cost} is {best_diff:.0%} away "
+                      f"from the closest active recommendation — not auto-confirming, "
+                      f"needs manual Fill")
+                continue
+
+            # Check if already tracked (real column is `symbol`, not
+            # `ticker`). Also requires the tracked entry_price to be
+            # close to THIS specific position's unit_cost — found live
+            # while verifying this fix: without a price check here, a
+            # stock and an options position on the SAME ticker the same
+            # day could still cross-contaminate each other's "already
+            # tracked" state (confirming the stock position first would
+            # make the very next options position on the same ticker
+            # look "already tracked" too, even though it's a completely
+            # different holding never actually confirmed).
+            with get_session() as s:
+                tracked = s.execute(text("""
+                    SELECT id FROM tracked_positions
+                    WHERE user_id=:uid AND symbol=:t
+                      AND created_at > now() - interval '1 day'
+                      AND ABS(entry_price - :price) / GREATEST(ABS(entry_price), 0.01) < :tol
+                """), {"uid": user_id, "t": ticker, "price": unit_cost, "tol": tolerance}).fetchone()
+            if tracked:
+                continue
+
+            qty = int(float(pos.get("qty") or 1))
+            try:
+                from app.learning.prediction_tracker import confirm_execution
+                confirm_execution(user_id, ticker, unit_cost, qty,
+                                 recommendation_id=str(best_rec.id))
+            except Exception:
+                pass  # already tracked
+            matches.append({
+                "ticker":        ticker,
+                "direction":     best_rec.direction,
+                "strategy":      best_rec.strategy,
+                "expiry":        best_rec.expiry,
+                "qty":           qty,
+                "price":         unit_cost,
+                "auto_detected": True,
+            })
 
         return {
             "new_fills": matches,

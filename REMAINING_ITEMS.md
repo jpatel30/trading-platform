@@ -5,7 +5,6 @@ Last updated: July 2026
 Last updated: July 2026. Full technical narrative (root causes, exact fixes, line-by-line verification) for completed work lives in git log commit messages - this doc stays a scannable status/priority list, not a technical diary.
 
 Priority Order (Remaining)
-Fix check_fills() - matches bare ticker, not real contract
 Add a real login path for returning users
 Add MCP key regeneration
 Deploy somewhere real (Cloudflare tunnel / Railway)
@@ -31,35 +30,33 @@ Add mobile push notifications
 Build a public invite page
 Descriptions
 
-1. Fix check_fills() Auto-detects fills by comparing live Webull positions against today's recommendations - matches on bare ticker only, not strike/expiry/type. Already caused one real mislabeled fill (an existing MSTR position auto-matched to an unrelated recommendation). DB rows cleaned up; root cause not yet fixed.
+1. Returning-user login path login_with_invite() is the only way in and requires a still-pending invite_code every time. Once accepted, the only way back in is a manual DB reset. Blocks inviting real beta users, who have no database access.
 
-2. Returning-user login path login_with_invite() is the only way in and requires a still-pending invite_code every time. Once accepted, the only way back in is a manual DB reset. Blocks inviting real beta users, who have no database access.
+2. MCP key regeneration Keys mint once at account creation with no way to reissue if lost. create_api_key() already supports multiple active keys per user - just needs a self-serve endpoint.
 
-3. MCP key regeneration Keys mint once at account creation with no way to reissue if lost. create_api_key() already supports multiple active keys per user - just needs a self-serve endpoint.
+3. Cloud deployment Cloudflare tunnel or Railway.app. Directly unblocks #4 - multi-tenant MCP access is fully built and tested but has nowhere to actually run for a real customer yet.
 
-4. Cloud deployment Cloudflare tunnel or Railway.app. Directly unblocks #5 - multi-tenant MCP access is fully built and tested but has nowhere to actually run for a real customer yet.
+4. Hosted MCP server MCP_TRANSPORT=http + ApiKeyTokenVerifier exist and are wired in, purely blocked on #3.
 
-5. Hosted MCP server MCP_TRANSPORT=http + ApiKeyTokenVerifier exist and are wired in, purely blocked on #4.
+5. get_bars() wrapper bug Silently ignores the multiplier argument, only maps minute/hour/day/ week timespans - multiplier=5 would NOT actually fetch 5-minute bars through it. intraday_entry.py already works around this by calling unusual_whales.get_ohlc() directly; the wrapper itself is still a trap for any future caller.
 
-6. get_bars() wrapper bug Silently ignores the multiplier argument, only maps minute/hour/day/ week timespans - multiplier=5 would NOT actually fetch 5-minute bars through it. intraday_entry.py already works around this by calling unusual_whales.get_ohlc() directly; the wrapper itself is still a trap for any future caller.
+6. Wire unused UW data into scoring Economic calendar and net-flow-by-expiry are never called - plausible real signal upgrades. Congress trades and insider-ownership-pct tools exist but don't feed conviction scoring or the LLM prompt at all.
 
-7. Wire unused UW data into scoring Economic calendar and net-flow-by-expiry are never called - plausible real signal upgrades. Congress trades and insider-ownership-pct tools exist but don't feed conviction scoring or the LLM prompt at all.
+7. ETF scoring in stock scans Currently a technicals-only stand-in since ETFs don't have analyst targets/PEG/revenue-growth. Works, but a real fund-appropriate model (expense ratio, index-tracking quality) would be better.
 
-8. ETF scoring in stock scans Currently a technicals-only stand-in since ETFs don't have analyst targets/PEG/revenue-growth. Works, but a real fund-appropriate model (expense ratio, index-tracking quality) would be better.
+8. 3m "both" horizon's stock half Still uses horizon_engine.py's naive per-ticker loop, not smart_stock_scan.py's composite pre-filter (unlike pure 6m/1yr stock scans). Narrow, not urgent.
 
-9. 3m "both" horizon's stock half Still uses horizon_engine.py's naive per-ticker loop, not smart_stock_scan.py's composite pre-filter (unlike pure 6m/1yr stock scans). Narrow, not urgent.
+9. monitor_config table Schema exists with plausible columns (is_active, check_interval, total_alerts_fired) but usage by position_monitor.py not yet confirmed either way.
 
-10. monitor_config table Schema exists with plausible columns (is_active, check_interval, total_alerts_fired) but usage by position_monitor.py not yet confirmed either way.
+10. ChromaDB Running in docker-compose.yml, zero imports anywhere in the codebase. Either remove the container, or wire it into real RAG instead of context_builder.py's current direct-API-call approach.
 
-11. ChromaDB Running in docker-compose.yml, zero imports anywhere in the codebase. Either remove the container, or wire it into real RAG instead of context_builder.py's current direct-API-call approach.
+11. conviction.py cleanup Orphaned - its only caller (the old daily_engine.py path) was retired this session. No remaining importers. Delete it or repurpose it.
 
-12. conviction.py cleanup Orphaned - its only caller (the old daily_engine.py path) was retired this session. No remaining importers. Delete it or repurpose it.
+12. tracked_positions.daily_rec_id Column exists in schema, not yet populated by the current fill- tracking flow (which matches by ticker + fill-price proximity instead). A more direct link; low priority, current approach already works and is tested.
 
-13. tracked_positions.daily_rec_id Column exists in schema, not yet populated by the current fill- tracking flow (which matches by ticker + fill-price proximity instead). A more direct link; low priority, current approach already works and is tested.
+13. BSM_estimate legs on positions with a genuinely VALID expiry Found while auditing all open auto_paper positions for the expiry-selection bug (see git log) - 5 of the 7 affected positions have a real, correctly-listed expiry (confirmed against get_expiry_breakdown), yet some/all legs still priced via BSM_estimate rather than real UW quotes. Not the same bug (expiry validation now catches the invalid-expiry case) - this is a separate, still-open question about why a specific strike at a valid expiry sometimes has no matching UW contract (illiquid/unlisted strike, stale chain fetch, or something else). Not yet root-caused.
 
-14. BSM_estimate legs on positions with a genuinely VALID expiry Found while auditing all open auto_paper positions for the expiry-selection bug (see git log) - 5 of the 7 affected positions have a real, correctly-listed expiry (confirmed against get_expiry_breakdown), yet some/all legs still priced via BSM_estimate rather than real UW quotes. Not the same bug (expiry validation now catches the invalid-expiry case) - this is a separate, still-open question about why a specific strike at a valid expiry sometimes has no matching UW contract (illiquid/unlisted strike, stale chain fetch, or something else). Not yet root-caused.
-
-15. Revisit paper-trading calibration assumptions All of these resolve the same way - once the reliability fixes above land and a real week or two of trading-hours data accumulates, not before:
+14. Revisit paper-trading calibration assumptions All of these resolve the same way - once the reliability fixes above land and a real week or two of trading-hours data accumulates, not before:
 
 Phase 4 grid sizing (windows/budgets) - untuned, watch job_run_log yield over time
 STOCK_MIN_FUNDAMENTAL=60 - rejected every stock candidate on the one (after-hours) night tested; top priority to revisit ONLY if it recurs on a real trading day
@@ -72,23 +69,23 @@ Whether paper trades actually use the discussed 40%/50% options / 15%/25% stock 
 The -355.6% loss from Phase 5's first real run - very likely a BSM-estimate-vs-live-price artifact (pre-market synthetic entry price vs a real close price), mechanism proven correct, magnitude needs re-checking on a real market-hours run
 job_run_log has no user_id column - fine now that paper-trade jobs run once against the admin account (not looped per user), but any OTHER job that still loops over active users (after_hours_batch, velocity_snapshot, nightly_learning, weekly_strategy_review) produces indistinguishable rows per user if it ever needs the same kind of forensic reconstruction paper-trading's scheduler investigation required
 
-16. Real broker connections Robinhood/IBKR/Tastytrade - factory.py's abstraction and SnapTrade plumbing are ready; the actual OAuth/positions/orders code for each isn't written yet.
+15. Real broker connections Robinhood/IBKR/Tastytrade - factory.py's abstraction and SnapTrade plumbing are ready; the actual OAuth/positions/orders code for each isn't written yet.
 
-17. Versioned migrations Schema changes this session (fill-tracking columns, excluded_from_stats, users.is_admin, the strategy_recommendations rename, all the paper- trading tables) only exist as commands run directly against the live DB, not as files in db/migrations/.
+16. Versioned migrations Schema changes this session (fill-tracking columns, excluded_from_stats, users.is_admin, the strategy_recommendations rename, all the paper- trading tables) only exist as commands run directly against the live DB, not as files in db/migrations/.
 
-18. requirements.txt typo black>=24.0% should be black>=24.0. Flagged previously, never verified fixed.
+17. requirements.txt typo black>=24.0% should be black>=24.0. Flagged previously, never verified fixed.
 
-19. Open-source readiness sweep .env.example, public README setup video, a hardcoded-user-ID check across the codebase.
+18. Open-source readiness sweep .env.example, public README setup video, a hardcoded-user-ID check across the codebase.
 
-20. Architecture diagrams Two diagrams (backend + frontend), suitable for a public write-up. Deliberately deferred until the architecture stops moving quarter to quarter.
+19. Architecture diagrams Two diagrams (backend + frontend), suitable for a public write-up. Deliberately deferred until the architecture stops moving quarter to quarter.
 
-21. Interview talking points No dependencies, can happen anytime.
+20. Interview talking points No dependencies, can happen anytime.
 
-22. WebSocket real-time updates
+21. WebSocket real-time updates
 
-23. Mobile push notifications PWA service worker.
+22. Mobile push notifications PWA service worker.
 
-24. Public invite page
+23. Public invite page
 
 Completed (see git log for full commit-level detail)
 Multi-user MCP access - per-request identity resolution, HTTP transport, auto-minted customer keys, StockBros key-reveal screen

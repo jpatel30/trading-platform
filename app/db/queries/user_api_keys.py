@@ -27,6 +27,28 @@ def get_user_id_for_api_key(api_key_hash: str) -> str | None:
         return str(row[0]) if row else None
 
 
+def deactivate_active_api_keys(user_id: str) -> int:
+    """
+    Mark every currently-active API key for this user is_active=FALSE.
+    Used by key regeneration — chosen over leaving old keys live
+    alongside the new one, since a lost/leaked key that's still valid
+    defeats the point of regenerating at all; there's no current use
+    case here for a user holding multiple simultaneously-valid keys.
+    Returns how many rows were deactivated.
+    """
+    with get_session() as session:
+        result = session.execute(
+            text(
+                """
+                UPDATE user_api_keys SET is_active = FALSE
+                WHERE user_id = :user_id AND is_active = TRUE
+                """
+            ),
+            {"user_id": user_id},
+        )
+        return result.rowcount
+
+
 def create_api_key(user_id: str, api_key_hash: str, label: str = "primary", scopes: str = '["read","write"]') -> str:
     """Insert a new API key hash for a user. Returns the new key's id."""
     with get_session() as session:

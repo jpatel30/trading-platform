@@ -148,6 +148,14 @@ def get_current_admin_user_id(user_id: str = Depends(get_current_user)) -> str:
 class InviteLoginRequest(BaseModel):
     invite_code: str
     display_name: Optional[str] = None
+    password: Optional[str] = None  # set once, at account creation — enables login-existing later
+
+class ExistingLoginRequest(BaseModel):
+    email:    str
+    password: str
+
+class MCPKeyResponse(BaseModel):
+    mcp_api_key: str  # plaintext, only ever present in this one response
 
 class LoginResponse(BaseModel):
     token:        str
@@ -226,14 +234,23 @@ async def login_with_invite(req: InviteLoginRequest):
                 display_name = existing.display_name
                 email        = existing.email
             else:
-                # New user — create account
+                # New user — create account. password_hash is set HERE if
+                # the client sends one (never plaintext, never stored
+                # unhashed) — this is what makes /api/auth/login-existing
+                # usable for this account later. Optional/backward-
+                # compatible: an account created without a password simply
+                # can't use that path yet.
                 display_name = req.display_name or f"Trader_{req.invite_code[:6]}"
+                password_hash = None
+                if req.password:
+                    from app.utils.passwords import hash_password
+                    password_hash = hash_password(req.password)
                 row = s.execute(text("""
-                    INSERT INTO users (display_name, email, invited_by, is_active)
-                    VALUES (:name, :email, :invited_by, TRUE)
+                    INSERT INTO users (display_name, email, invited_by, is_active, password_hash)
+                    VALUES (:name, :email, :invited_by, TRUE, :password_hash)
                     RETURNING id, display_name
                 """), {"name": display_name, "email": invite_email,
-                       "invited_by": invite.invited_by}).fetchone()
+                       "invited_by": invite.invited_by, "password_hash": password_hash}).fetchone()
                 user_id = str(row.id)
                 email   = invite_email
 
@@ -277,6 +294,67 @@ async def login_with_invite(req: InviteLoginRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
+@app.post("/api/auth/login-existing", response_model=LoginResponse, tags=["Auth"])
+async def login_existing_user(req: ExistingLoginRequest):
+    """
+    Login for an existing, already-registered user via email+password —
+    completely independent of invite redemption. Fixes the real gap
+    login_with_invite() has: an invite flips to 'accepted' on first use
+    and can never be reused, so it was the ONLY way back into an
+    account, requiring a manual DB reset for any real user without
+    database access.
+
+    Deliberately returns the SAME generic error for "no such email" and
+    "wrong password" — never confirm/deny whether an email is
+    registered. An account with no password_hash (created before this
+    feature, or without one set) can never authenticate here — verify_
+    password() rejects a missing hash outright, it doesn't fall back to
+    any other check.
+    """
+    from sqlalchemy import text
+    from app.db.session import get_session
+    from app.utils.passwords import verify_password
+
+    with get_session() as s:
+        row = s.execute(text("""
+            SELECT id, display_name, email, password_hash FROM users
+            WHERE email = :email AND is_active = TRUE
+        """), {"email": req.email}).fetchone()
+
+    if not row or not row.password_hash or not verify_password(req.password, row.password_hash):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+
+    token = create_token(str(row.id), row.email or "")
+    return LoginResponse(
+        token        = token,
+        user_id      = str(row.id),
+        display_name = row.display_name,
+        email        = row.email,
+    )
+
+
+@app.post("/api/auth/regenerate-mcp-key", response_model=MCPKeyResponse, tags=["Auth"])
+async def regenerate_mcp_key(user_id: str = Depends(get_current_user)):
+    """
+    Self-serve MCP (Claude Desktop) key regeneration — requires a valid,
+    already-authenticated session. The original key is only ever shown
+    once, at signup; this is the only way to get a new one if it's lost.
+
+    Invalidates every currently-active key for this user before minting
+    the new one (is_active=FALSE, not deleted) — a lost/leaked key that
+    stays valid defeats the point of regenerating, and there's no
+    current use case for a user holding multiple simultaneously-valid
+    keys. Returns the new key in plaintext exactly once, same as signup —
+    only its SHA-256 hash is ever stored.
+    """
+    from app.utils.api_keys import generate_api_key
+    from app.db.queries.user_api_keys import create_api_key, deactivate_active_api_keys
+
+    deactivate_active_api_keys(user_id)
+    plaintext, key_hash = generate_api_key()
+    create_api_key(user_id, key_hash, label="stockbros-regenerated")
+    return MCPKeyResponse(mcp_api_key=plaintext)
 
 
 @app.on_event("startup")

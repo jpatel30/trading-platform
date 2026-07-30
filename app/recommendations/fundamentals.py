@@ -24,6 +24,7 @@ def get_fundamentals(ticker: str) -> dict:
         import yfinance as yf
         info = yf.Ticker(ticker).info
         return {
+            "quote_type":             info.get("quoteType", "EQUITY"),
             "current_price":          info.get("currentPrice"),
             "target_mean_price":      info.get("targetMeanPrice"),
             "target_high_price":      info.get("targetHighPrice"),
@@ -91,6 +92,137 @@ def analyst_target_reliability(price: float, low: float, high: float, mean: floa
         dispersion_factor = 0.6  # unknown spread — moderate discount, not full trust
 
     return round(price_factor * dispersion_factor, 3)
+
+
+def get_fund_data(ticker: str) -> dict:
+    """
+    Fetch ETF/fund-specific data for score_etf_fundamentals(): expense
+    ratio (+ category average), AUM, avg volume, holdings turnover
+    (+ category average). ETFs don't have analyst targets/PEG/revenue
+    growth, so score_fundamentals()'s rubric can't score them for real -
+    this is the fund-appropriate equivalent of get_fundamentals().
+
+    info["netExpenseRatio"] is already a plain percentage (0.0945 means
+    0.0945%). funds_data.fund_operations reports the same figures as
+    fractions (0.000945) - normalized to percentage points here so the
+    two are directly comparable. Total Net Assets' "Category Average"
+    column in funds_data mirrors the fund's own value (a yfinance data
+    quirk, not a real peer average), so AUM uses the absolute info[]
+    figure instead of a category comparison.
+    """
+    try:
+        import yfinance as yf
+        t    = yf.Ticker(ticker)
+        info = t.info
+        result = {
+            "expense_ratio": info.get("netExpenseRatio"),
+            "total_assets":  info.get("totalAssets"),
+            "avg_volume":    info.get("averageVolume"),
+            "category":      info.get("category"),
+        }
+        try:
+            fo = t.funds_data.fund_operations
+            if fo is not None and not fo.empty and ticker in fo.columns:
+                if "Annual Report Expense Ratio" in fo.index:
+                    cat_er = fo.loc["Annual Report Expense Ratio", "Category Average"]
+                    result["expense_ratio_cat_avg"] = float(cat_er) * 100
+                    if result["expense_ratio"] is None:
+                        result["expense_ratio"] = float(fo.loc["Annual Report Expense Ratio", ticker]) * 100
+                if "Annual Holdings Turnover" in fo.index:
+                    result["turnover"]        = float(fo.loc["Annual Holdings Turnover", ticker])
+                    result["turnover_cat_avg"] = float(fo.loc["Annual Holdings Turnover", "Category Average"])
+        except Exception:
+            pass
+        return result
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def score_etf_fundamentals(fund_data: dict, price: float = 0) -> dict:
+    """
+    Score an ETF/fund 0-100 on fund-appropriate metrics, replacing the
+    old technicals-only stand-in (price vs 50d/52w-high, YoY change) that
+    ran because ETFs have no analyst targets/PEG/revenue growth.
+
+    Expense ratio vs category (30pts):    lower fees relative to peers.
+    AUM (25pts):                          larger funds are more stable,
+                                           tighter spreads, less
+                                           delisting/closure risk.
+    Liquidity, avg daily $ volume (20pts): easier to enter/exit near mid.
+    Tracking fidelity proxy (25pts):      holdings turnover relative to
+                                           category. Near-zero turnover is
+                                           what a passive index-replicator
+                                           should show; turnover far above
+                                           category average suggests either
+                                           active-style management or
+                                           difficulty holding the index
+                                           steady. This is a turnover-based
+                                           proxy, not a measured tracking
+                                           error against the fund's actual
+                                           benchmark NAV series - yfinance
+                                           doesn't expose that, so this is
+                                           documented as an approximation
+                                           rather than presented as exact.
+
+    Same return shape as score_fundamentals() (fundamental_score,
+    breakdown) so callers don't need to branch on the result shape.
+    """
+    if fund_data.get("error"):
+        return {"fundamental_score": 50, "breakdown": {}, "error": fund_data["error"]}
+
+    breakdown = {}
+    total     = 0
+
+    er     = fund_data.get("expense_ratio")
+    er_cat = fund_data.get("expense_ratio_cat_avg")
+    if er is not None:
+        if er_cat and er_cat > 0:
+            ratio = er / er_cat
+            pts = 30 if ratio <= 0.3 else 22 if ratio <= 0.7 else 15 if ratio <= 1.0 else 8 if ratio <= 1.5 else 2
+            note = f"{er:.2f}% expense ratio ({ratio:.2f}x category avg {er_cat:.2f}%)"
+        else:
+            pts = 26 if er <= 0.10 else 20 if er <= 0.25 else 12 if er <= 0.50 else 6 if er <= 1.0 else 2
+            note = f"{er:.2f}% expense ratio (no category baseline)"
+        breakdown["expense_ratio"] = {"score": er, "points": pts, "note": note}
+        total += pts
+    else:
+        breakdown["expense_ratio"] = {"score": None, "points": 10, "note": "No expense ratio data (neutral)"}
+        total += 10
+
+    aum = fund_data.get("total_assets")
+    if aum:
+        pts = 25 if aum >= 50e9 else 20 if aum >= 10e9 else 14 if aum >= 1e9 else 7 if aum >= 100e6 else 2
+        breakdown["aum"] = {"score": aum, "points": pts, "note": f"${aum/1e9:.1f}B AUM"}
+        total += pts
+    else:
+        breakdown["aum"] = {"score": None, "points": 8, "note": "No AUM data (neutral)"}
+        total += 8
+
+    dollar_vol = (fund_data.get("avg_volume") or 0) * (price or 0)
+    if dollar_vol:
+        pts = 20 if dollar_vol >= 1e9 else 15 if dollar_vol >= 200e6 else 10 if dollar_vol >= 50e6 else 5 if dollar_vol >= 5e6 else 0
+        breakdown["liquidity"] = {"score": dollar_vol, "points": pts, "note": f"${dollar_vol/1e6:.0f}M avg daily $ volume"}
+        total += pts
+    else:
+        breakdown["liquidity"] = {"score": None, "points": 5, "note": "No volume data (neutral)"}
+        total += 5
+
+    turnover     = fund_data.get("turnover")
+    turnover_cat = fund_data.get("turnover_cat_avg")
+    if turnover is not None and turnover_cat:
+        ratio = turnover / turnover_cat if turnover_cat > 0 else (0 if turnover == 0 else 2.0)
+        pts = 25 if ratio <= 0.3 else 18 if ratio <= 0.7 else 12 if ratio <= 1.0 else 6 if ratio <= 1.5 else 2
+        breakdown["tracking_fidelity"] = {
+            "score": turnover, "points": pts,
+            "note": f"{turnover*100:.1f}% annual turnover ({ratio:.2f}x category avg {turnover_cat*100:.1f}%) - "
+                    f"proxy for index-tracking discipline, not measured tracking error"
+        }
+        total += pts
+    else:
+        breakdown["tracking_fidelity"] = {"score": None, "points": 12, "note": "No turnover data (neutral)"}
+        total += 12
+
+    return {"fundamental_score": min(100, round(total)), "breakdown": breakdown}
 
 
 def get_dp_accumulation_score(ticker: str) -> dict:

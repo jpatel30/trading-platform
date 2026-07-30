@@ -47,7 +47,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from app.signals.flow_scoring import compute_flow_score, compute_dp_score
 from app.utils.scan_status import set_scan_status
-from app.recommendations.fundamentals import analyst_target_reliability
+from app.recommendations.fundamentals import (
+    analyst_target_reliability, get_fund_data, score_etf_fundamentals,
+)
 
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 
@@ -95,6 +97,10 @@ def _fetch_analyst_target(ticker: str) -> dict:
     return {"mean": 0, "low": 0, "high": 0}
 
 
+def _fetch_fund_data(ticker: str) -> dict:
+    return get_fund_data(ticker)
+
+
 def _fetch_insider(ticker: str) -> dict:
     try:
         from app.signals.edgar_insider import get_insider_activity
@@ -124,8 +130,8 @@ def _fetch_velocity_realtime(ticker: str) -> dict:
         return {"score": 50, "velocity": 0, "direction": "NEUTRAL"}
 
 
-def _score_ticker(ticker, fd, target, velocity, insider) -> dict:
-    """Pure math — zero network calls, zero timeouts."""
+def _score_ticker(ticker, fd, target, velocity, insider, fund_data=None) -> dict:
+    """Pure math — zero network calls, zero timeouts (fund_data is pre-fetched, same as fd/target/etc)."""
     price = fd.get("price", 0)
     if not price:
         return {"ticker": ticker, "composite": 0, "filtered": True, "reason": "no price"}
@@ -137,13 +143,13 @@ def _score_ticker(ticker, fd, target, velocity, insider) -> dict:
     reliability     = 1.0
 
     if qt not in ("EQUITY", ""):
-        avg_50   = fd.get("50d_avg", price) or price
-        hi_52w   = fd.get("52w_high", price) or price
-        yr_chg   = fd.get("year_chg", 0)
-        above_50 = 20 if price > avg_50 else 0
-        yr_trend = min(max(yr_chg / 50 * 20, -20), 20)
-        near_hi  = 20 if price >= hi_52w * 0.90 else 0
-        fund_score = 30 + above_50 + yr_trend + near_hi
+        # Real fund-appropriate model (expense ratio, AUM, liquidity, tracking
+        # fidelity) — replaces the old technicals-only stand-in (price vs
+        # 50d/52w-high, YoY change), which gave every ETF a near-identical
+        # score regardless of whether it was a well-run index fund or a thin,
+        # expensive one.
+        etf_score  = score_etf_fundamentals(fund_data or {}, price)
+        fund_score = etf_score["fundamental_score"]
         upside_pct = 0
     else:
         mean = target.get("mean", 0) if isinstance(target, dict) else float(target or 0)
@@ -164,7 +170,7 @@ def _score_ticker(ticker, fd, target, velocity, insider) -> dict:
 
     composite = fund_score*0.50 + velocity.get("score",50)*0.25 + insider.get("score",50)*0.25
 
-    return {
+    result = {
         "ticker": ticker, "price": price, "composite": round(composite,1),
         "fund_score": round(fund_score,1), "velocity_score": velocity.get("score",50),
         "insider_score": insider.get("score",50),
@@ -178,6 +184,9 @@ def _score_ticker(ticker, fd, target, velocity, insider) -> dict:
         "volume": fd.get("volume",0), "change_pct": fd.get("change_pct",0),
         "year_chg": fd.get("year_chg",0), "quote_type": qt, "filtered": False,
     }
+    if qt not in ("EQUITY", ""):
+        result["etf_breakdown"] = etf_score.get("breakdown", {})
+    return result
 
 
 def run_smart_stock_scan(user_id, horizon="6m", budget=5000.0, top_n=5,
@@ -227,6 +236,19 @@ def run_smart_stock_scan(user_id, horizon="6m", budget=5000.0, top_n=5,
             except Exception:
                 pass
     print(f"[StockScan] Analyst targets: {len(analyst_targets)} in {time.time()-t0:.1f}s")
+
+    t0 = time.time()
+    fund_data_cache = {}
+    funds = [t for t in tickers if t not in equities]
+    if funds:
+        with ThreadPoolExecutor(max_workers=10) as ex:
+            futures = {ex.submit(_fetch_fund_data, t): t for t in funds}
+            for fut in as_completed(futures, timeout=30):
+                try:
+                    fund_data_cache[futures[fut]] = fut.result()
+                except Exception:
+                    pass
+        print(f"[StockScan] Fund data (ETF): {len(fund_data_cache)} in {time.time()-t0:.1f}s")
 
     set_scan_status(user_id, "signals")
     t0 = time.time()
@@ -300,6 +322,7 @@ def run_smart_stock_scan(user_id, horizon="6m", budget=5000.0, top_n=5,
             target=analyst_targets.get(ticker, {"mean":0,"low":0,"high":0}),
             velocity=velocity_cache.get(ticker, {"score":50,"velocity":0,"direction":"NEUTRAL"}),
             insider=insider_cache.get(ticker, {"score":50,"signal":"NEUTRAL"}),
+            fund_data=fund_data_cache.get(ticker),
         )
         if not r.get("filtered") and r.get("composite",0) > 0:
             candidates.append(r)

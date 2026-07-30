@@ -143,6 +143,27 @@ def _enrich_ticker(
     except Exception:
         result["insider_signal"], result["insider_text"] = "NEUTRAL", "No insider data"
 
+    # Congress trades (buy/sell cluster) + institutional ownership — real inputs,
+    # not just data sitting unused. Separate from EDGAR insider Form 4 activity above.
+    try:
+        from app.options_flow.unusual_whales import get_congress_trades
+        congress = get_congress_trades(ticker=ticker, limit=10) or []
+        buys  = sum(1 for c in congress if "buy"  in (c.get("txn_type") or "").lower() or "purchase" in (c.get("txn_type") or "").lower())
+        sells = sum(1 for c in congress if "sell" in (c.get("txn_type") or "").lower() or "sale"     in (c.get("txn_type") or "").lower())
+        result["congress_buys"]  = buys
+        result["congress_sells"] = sells
+        result["congress_text"]  = f"{buys}buy/{sells}sell" if congress else "none"
+    except Exception:
+        result["congress_buys"], result["congress_sells"], result["congress_text"] = 0, 0, "none"
+
+    try:
+        from app.options_flow.unusual_whales import get_institutional_ownership
+        io = get_institutional_ownership(ticker) or {}
+        result["inst_own_score"] = io.get("score", 50)
+        result["inst_own_text"]  = io.get("note", "no data")
+    except Exception:
+        result["inst_own_score"], result["inst_own_text"] = 50, "no data"
+
     try:
         from app.signals.oi_flow import get_oi_buildup_signal
         oi = get_oi_buildup_signal(ticker)
@@ -251,11 +272,52 @@ def _compress_ticker(t: dict) -> str:
         f" GEX:{'NEG' if t.get('gex_negative') else 'POS'} Vel:{t.get('velocity',0):+.0f}% Insider:{t.get('insider_signal','N')}"
         f" OI:{t.get('oi_score',0):+.0f}({t.get('oi_signal','NEUTRAL')},{t.get('oi_max_days',0)}d)"
         f" IVexp:{iv_exp_str}"
+        f" Congress:{t.get('congress_text','none')} InstOwn:{t.get('inst_own_score',50):.0f}/100"
         f"{' ⚠️SIGNALS_CONFLICT' if t.get('conflict') else ''}"
     )
 
 
-def _build_llm_prompt(enriched: list[dict], vix: dict, global_news: list[dict], budget: float, today_str: str) -> str:
+def _build_market_tide_summary(net_flow: list) -> str:
+    """Market-wide net call/put premium tide — ticker-agnostic, fetched once per scan."""
+    try:
+        rows = (net_flow or [{}])[0].get("data") or []
+        if not rows:
+            return "no data"
+        last = rows[-1]
+        call_prem = float(last.get("net_call_premium", 0) or 0)
+        put_prem  = float(last.get("net_put_premium", 0) or 0)
+        net = call_prem + put_prem
+        bias = "BULLISH" if net > 0 else "BEARISH" if net < 0 else "NEUTRAL"
+        return f"{bias} (calls ${call_prem/1e6:+.0f}M put ${put_prem/1e6:+.0f}M net ${net/1e6:+.0f}M)"
+    except Exception:
+        return "no data"
+
+
+def _build_econ_calendar_summary(econ_calendar: list, today: datetime) -> str:
+    """Upcoming macro events within 5 days — ticker-agnostic, fetched once per scan."""
+    try:
+        upcoming = []
+        for e in (econ_calendar or []):
+            try:
+                dt = datetime.strptime((e.get("time") or "")[:19], "%Y-%m-%dT%H:%M:%S")
+            except Exception:
+                continue
+            days = (dt - today).days
+            if 0 <= days <= 5:
+                upcoming.append((dt, e))
+        if not upcoming:
+            return "none in next 5 days"
+        upcoming.sort(key=lambda x: x[0])
+        return " | ".join(
+            f"{e.get('event','?')} {dt.strftime('%a %H:%M')}(fcst {e.get('forecast','?')} prev {e.get('prev','?')})"
+            for dt, e in upcoming[:6]
+        )
+    except Exception:
+        return "no data"
+
+
+def _build_llm_prompt(enriched: list[dict], vix: dict, global_news: list[dict], budget: float, today_str: str,
+                       market_tide: str = "no data", econ_events: str = "no data") -> str:
     ticker_blocks = "\n\n".join(_compress_ticker(t) for t in enriched)
     news_block = "\n".join(f"  - [{n.get('source','')}] {n.get('headline','')[:80]}" for n in (global_news or [])[:6])
 
@@ -264,6 +326,8 @@ Budget per trade: ${budget:.0f}. Goal: maximum probability of profit.
 
 === MARKET CONTEXT ===
 VIX: {vix.get('current', 17)} ({vix.get('zone', 'NORMAL')}) trend: {vix.get('trend', 'STABLE')}
+Options tide (market-wide net call/put premium): {market_tide}
+Upcoming economic events (next 5 days): {econ_events}
 Market news:
 {news_block}
 
@@ -277,6 +341,12 @@ Study every candidate above. Consider:
 - Is IV cheap enough to buy? Or should we sell premium?
 - What catalyst will move this stock?
 - Where are the real entry/exit levels?
+- Congress buy/sell activity and institutional ownership (InstOwn) on each candidate —
+  heavy congressional buying or high institutional ownership supports a bullish thesis;
+  congressional selling or low institutional ownership should lower your confidence.
+- The market-wide options tide and upcoming economic events above — a binary macro
+  event (CPI, FOMC, jobs) within a candidate's holding window should lower confidence
+  or push you toward a defined-risk strategy (spread/condor) over a naked position.
 
 Pick up to 4 best option trades.
 STRATEGIES AVAILABLE (pick best for situation):
@@ -577,10 +647,12 @@ def run_smart_recommendations(
     from app.options_flow.unusual_whales import (
         get_earnings_premarket, get_earnings_afterhours,
         get_flow_alerts, get_dark_pool_recent,
+        get_net_flow_by_expiry, get_economic_calendar,
     )
 
     t_total = time.time()
-    today   = datetime.now().strftime("%A %B %d, %Y")
+    now     = datetime.now()
+    today   = now.strftime("%A %B %d, %Y")
 
     print(f"[SmartEngine] Starting run — budget=${budget:.0f}")
     t0 = time.time()
@@ -592,6 +664,15 @@ def run_smart_recommendations(
     earnings_map  = _build_earnings_map(earnings_pre, earnings_post)
     all_flow      = get_flow_alerts(limit=500)       or []
     all_dp        = get_dark_pool_recent(limit=200)  or []
+
+    try:
+        market_tide = _build_market_tide_summary(get_net_flow_by_expiry())
+    except Exception:
+        market_tide = "no data"
+    try:
+        econ_events = _build_econ_calendar_summary(get_economic_calendar(), now)
+    except Exception:
+        econ_events = "no data"
 
     flow_by = {}
     for a in all_flow:
@@ -652,7 +733,7 @@ def run_smart_recommendations(
 
     print(f"[SmartEngine] Calling LLM with {len(enriched)} candidates...")
     t0     = time.time()
-    prompt = _build_llm_prompt(enriched[:10], vix, global_news, budget, today)
+    prompt = _build_llm_prompt(enriched[:10], vix, global_news, budget, today, market_tide, econ_events)
     llm_result = _call_smart_llm(prompt)
     print(f"[SmartEngine] LLM responded in {time.time()-t0:.1f}s")
 

@@ -227,7 +227,7 @@ def get_stock_for_horizon(
     """
     from app.recommendations.fundamentals import (
         get_fundamentals, get_dp_accumulation_score, score_fundamentals,
-        analyst_target_reliability,
+        analyst_target_reliability, get_fund_data, score_etf_fundamentals,
     )
 
     config = HORIZON_CONFIG.get(horizon, HORIZON_CONFIG["6m"])
@@ -244,7 +244,16 @@ def get_stock_for_horizon(
 
     fundamentals = get_fundamentals(ticker)
     dp           = get_dp_accumulation_score(ticker)
-    fund_score   = score_fundamentals(fundamentals, dp, current_price)
+    is_fund      = fundamentals.get("quote_type", "EQUITY") not in ("EQUITY", "")
+
+    # ETFs/funds have no analyst targets/PEG/revenue growth - score_fundamentals()
+    # would score them almost entirely on "neutral" placeholder points (~18-38/100),
+    # permanently failing the STOCK_MIN_FUNDAMENTAL gate below regardless of how
+    # good the fund actually is. Use the fund-appropriate rubric instead.
+    if is_fund:
+        fund_score = score_etf_fundamentals(get_fund_data(ticker), current_price)
+    else:
+        fund_score = score_fundamentals(fundamentals, dp, current_price)
 
     min_fund = STOCK_MIN_FUNDAMENTAL
     if fund_score["fundamental_score"] < min_fund:
@@ -296,23 +305,40 @@ def get_stock_for_horizon(
         shares = 1
     total_cost = round(shares * current_price, 2)
 
-    thesis = _generate_stock_thesis(
-        ticker, horizon, config, fundamentals, dp, fund_score,
-        current_price, target_price, target_pct, momentum, stop_pct
-    )
+    if is_fund:
+        thesis = _generate_fund_thesis(
+            ticker, horizon, config, fund_score,
+            current_price, target_price, target_pct, momentum, stop_pct
+        )
+    else:
+        thesis = _generate_stock_thesis(
+            ticker, horizon, config, fundamentals, dp, fund_score,
+            current_price, target_price, target_pct, momentum, stop_pct
+        )
 
     try:
         from app.llm.service import _call_ollama, is_ollama_available
         if is_ollama_available():
-            prompt = (
-                f"Write a 2-sentence investment thesis for {ticker} {horizon} stock pick. "
-                f"Facts: price ${current_price:.2f}, analyst target ${target_price:.2f} "
-                f"({target_pct:+.1f}%), revenue growth {(fundamentals.get('revenue_growth') or 0)*100:.0f}%, "
-                f"PEG {fundamentals.get('peg_ratio') or 'N/A'}, "
-                f"margins {(fundamentals.get('profit_margins') or 0)*100:.0f}%, "
-                f"analyst rec: {fundamentals.get('analyst_recommendation','N/A')}. "
-                f"Be specific and actionable."
-            )
+            if is_fund:
+                bd = fund_score.get("breakdown", {})
+                prompt = (
+                    f"Write a 2-sentence investment thesis for {ticker} {horizon} fund/ETF pick. "
+                    f"Facts: price ${current_price:.2f}, momentum target ${target_price:.2f} "
+                    f"({target_pct:+.1f}%), {bd.get('expense_ratio',{}).get('note','N/A')}, "
+                    f"{bd.get('aum',{}).get('note','N/A')}, "
+                    f"{bd.get('tracking_fidelity',{}).get('note','N/A')}. "
+                    f"Be specific and actionable."
+                )
+            else:
+                prompt = (
+                    f"Write a 2-sentence investment thesis for {ticker} {horizon} stock pick. "
+                    f"Facts: price ${current_price:.2f}, analyst target ${target_price:.2f} "
+                    f"({target_pct:+.1f}%), revenue growth {(fundamentals.get('revenue_growth') or 0)*100:.0f}%, "
+                    f"PEG {fundamentals.get('peg_ratio') or 'N/A'}, "
+                    f"margins {(fundamentals.get('profit_margins') or 0)*100:.0f}%, "
+                    f"analyst rec: {fundamentals.get('analyst_recommendation','N/A')}. "
+                    f"Be specific and actionable."
+                )
             llm_thesis = _call_ollama(prompt=prompt,
                 system="Expert stock analyst. 2 sentences max. No disclaimers.",
                 max_tokens=100)
@@ -409,6 +435,26 @@ def _get_momentum(ticker: str, horizon: str, trading_window_days: int | None = N
         return {"score": score, "return_pct": round(ret_pct, 1), "note": note}
     except Exception:
         return {"score": 50, "note": "Momentum data unavailable"}
+
+
+def _generate_fund_thesis(
+    ticker: str, horizon: str, config: dict, fund_score: dict,
+    current_price: float, target_price: float, target_pct: float,
+    momentum: dict, stop_pct: float,
+) -> str:
+    bd = fund_score.get("breakdown", {})
+    parts = [
+        f"{ticker} {config['label']} thesis ({config['description']}).",
+        f"Fund quality {fund_score.get('fundamental_score', 50)}/100: "
+        f"{bd.get('expense_ratio', {}).get('note', 'expense ratio N/A')}, "
+        f"{bd.get('aum', {}).get('note', 'AUM N/A')}, "
+        f"{bd.get('liquidity', {}).get('note', 'liquidity N/A')}, "
+        f"{bd.get('tracking_fidelity', {}).get('note', 'tracking N/A')}.",
+        f"Momentum: {momentum.get('note', 'N/A')}. "
+        f"Entry near ${current_price:.2f}, target ${target_price:.2f} ({target_pct:+.1f}%), "
+        f"stop ${current_price * (1 + stop_pct/100):.2f} ({stop_pct}%).",
+    ]
+    return " ".join(parts)
 
 
 def _generate_stock_thesis(
@@ -566,14 +612,16 @@ def scan_for_horizon(
 
     print(f"[HorizonScan] {horizon} — scanning {len(tickers)} tickers...")
 
-    # Pure stock horizons (6m/1yr) delegate to smart_stock_scan.py's
-    # composite fundamentals+velocity+insider pre-filter instead of a naive
-    # per-ticker loop — the same engine the web dashboard's stock scan
-    # already uses (previously only reachable from the web, never MCP), so
+    # Pure stock horizons (6m/1yr) AND the stock half of 3m's combined
+    # "both" horizon delegate to smart_stock_scan.py's composite
+    # fundamentals+velocity+insider pre-filter instead of a naive per-ticker
+    # loop — the same engine the web dashboard's stock scan already uses
+    # (previously only reachable from the web, never MCP), so
     # get_scan_universe-wide stock picks are the same quality regardless of
-    # channel. "options"/"both" horizons are unaffected — options selection
-    # and 3m's combined options+stock loop are unchanged.
-    if rec_type == "stock" and user_id:
+    # channel or horizon. The options half of "both" has no equivalent
+    # composite pre-filter and stays a per-ticker get_options_for_horizon
+    # loop (unchanged) — merged with the composite-ranked stock half below.
+    if rec_type in ("stock", "both") and user_id:
         from app.recommendations.smart_stock_scan import run_smart_stock_scan
 
         market_open   = _is_market_open()
@@ -583,27 +631,101 @@ def scan_for_horizon(
             trading_window_days=trading_window_days,
             stop_loss_pct=stop_loss_pct, profit_target_pct=profit_target_pct,
         )
-        results = [
-            {
-                "ticker":       stock_rec.get("ticker", ""),
-                "horizon":      horizon,
-                "label":        config["label"],
-                "description":  config["description"],
-                "market_open":  market_open,
-                "next_day":     next_day_flag,
-                "stock_rec":    stock_rec,
-                "primary_rec":  "stock",
+
+        if rec_type == "stock":
+            results = [
+                {
+                    "ticker":       stock_rec.get("ticker", ""),
+                    "horizon":      horizon,
+                    "label":        config["label"],
+                    "description":  config["description"],
+                    "market_open":  market_open,
+                    "next_day":     next_day_flag,
+                    "stock_rec":    stock_rec,
+                    "primary_rec":  "stock",
+                }
+                for stock_rec in scan_result.get("stocks", [])
+            ]
+            elapsed = round(time.time()-t0, 1)
+            print(f"[HorizonScan] Done in {elapsed}s — {len(results)} passed "
+                  f"(smart_stock_scan, {scan_result.get('scored',0)} scored)")
+            return {
+                "horizon":         horizon,
+                "label":           config["label"],
+                "recommendations": results[:top_n],
+                "filtered_count":  max(scan_result.get("scored", 0) - len(results), 0),
+                "total_scanned":   len(tickers),
+                "elapsed":         elapsed,
+                "date":            date.today().isoformat(),
             }
-            for stock_rec in scan_result.get("stocks", [])
-        ]
+
+        # rec_type == "both" (3m): stock half comes from the composite
+        # pre-filter above (same as 6m/1yr); options half stays a per-ticker
+        # loop since there's no options-side composite pre-filter to route
+        # through — merge the two by ticker into the existing combined shape.
+        stock_recs_by_ticker = {s.get("ticker",""): s for s in scan_result.get("stocks", [])}
+        min_conf = config["min_conviction"]
+        results, filtered = [], []
+
+        for ticker in tickers:
+            try:
+                options_rec = get_options_for_horizon(
+                    ticker, horizon, budget, user_id,
+                    trading_window_days=trading_window_days,
+                    stop_loss_pct=stop_loss_pct, profit_target_pct=profit_target_pct,
+                )
+                conf      = options_rec.get("confidence", 0) if options_rec else 0
+                stock_rec = stock_recs_by_ticker.get(ticker)
+
+                if conf < min_conf and not stock_rec:
+                    filtered.append({
+                        "ticker": ticker,
+                        "reason": f"Options confidence {conf} < {min_conf}, not in composite stock top-N"
+                    })
+                    continue
+
+                rec = {
+                    "ticker":      ticker,
+                    "horizon":     horizon,
+                    "label":       config["label"],
+                    "description": config["description"],
+                    "market_open": market_open,
+                    "next_day":    next_day_flag,
+                    "options_rec": options_rec,
+                }
+                if stock_rec:
+                    rec["stock_rec"] = stock_rec
+
+                stock_fund = stock_rec.get("fundamental_score", 0) if stock_rec else 0
+                if conf >= 65 and stock_fund >= 60:
+                    rec["primary_rec"]  = "both"
+                    rec["primary_note"] = "Both options and stock look strong — options for short profit, stock for compounding"
+                elif conf >= 65:
+                    rec["primary_rec"] = "options"
+                else:
+                    rec["primary_rec"] = "stock"
+
+                results.append(rec)
+
+            except Exception as e:
+                print(f"[HorizonScan] {ticker} failed: {e}")
+                continue
+
+        def sort_key(r):
+            opt_conf = r.get("options_rec", {}).get("confidence", 0) if r.get("options_rec") else 0
+            stk_fund = r.get("stock_rec", {}).get("fundamental_score", 0) if r.get("stock_rec") else 0
+            return max(opt_conf, stk_fund)
+
+        results.sort(key=sort_key, reverse=True)
+
         elapsed = round(time.time()-t0, 1)
-        print(f"[HorizonScan] Done in {elapsed}s — {len(results)} passed "
-              f"(smart_stock_scan, {scan_result.get('scored',0)} scored)")
+        print(f"[HorizonScan] Done in {elapsed}s — {len(results)} passed, {len(filtered)} filtered "
+              f"(options per-ticker + smart_stock_scan composite)")
         return {
             "horizon":         horizon,
             "label":           config["label"],
             "recommendations": results[:top_n],
-            "filtered_count":  max(scan_result.get("scored", 0) - len(results), 0),
+            "filtered_count":  len(filtered),
             "total_scanned":   len(tickers),
             "elapsed":         elapsed,
             "date":            date.today().isoformat(),
@@ -620,7 +742,7 @@ def scan_for_horizon(
                 stop_loss_pct=stop_loss_pct, profit_target_pct=profit_target_pct,
             )
 
-            if rec_type in ("options", "both"):
+            if rec_type == "options":
                 options_rec = rec.get("options_rec", {})
                 conf = options_rec.get("confidence", 0) if options_rec else 0
                 min_conf = config["min_conviction"]
@@ -631,16 +753,6 @@ def scan_for_horizon(
                     })
                     continue
 
-            if rec_type in ("stock", "both"):
-                stock_rec  = rec.get("stock_rec", {})
-                if stock_rec and stock_rec.get("filtered"):
-                    filtered.append({
-                        "ticker": ticker,
-                        "reason": stock_rec.get("reason", "Below threshold")
-                    })
-                    if rec_type == "stock":
-                        continue
-
             results.append(rec)
 
         except Exception as e:
@@ -648,10 +760,7 @@ def scan_for_horizon(
             continue
 
     def sort_key(r):
-        if rec_type == "stock":
-            return r.get("stock_rec", {}).get("fundamental_score", 0) if r.get("stock_rec") else 0
-        else:
-            return r.get("options_rec", {}).get("confidence", 0) if r.get("options_rec") else 0
+        return r.get("options_rec", {}).get("confidence", 0) if r.get("options_rec") else 0
 
     results.sort(key=sort_key, reverse=True)
 

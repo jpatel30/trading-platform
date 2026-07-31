@@ -1,0 +1,77 @@
+graph TB
+    subgraph Auth["Authentication"]
+        INVITE["Invite redemption<br/>first-time signup"]
+        LOGIN["Password login<br/>returning users<br/>(login-existing)"]
+        KEYREVEAL["MCPKeyReveal<br/>shared component,<br/>shown exactly once"]
+        JWT["JWT (30 days)"]
+    end
+
+    subgraph Layout["Root Dashboard Layout"]
+        ISADMIN["useIsAdmin() context<br/>fetched ONCE, shared down<br/>via React Context"]
+        STRIP["Portfolio strip<br/>admin-only, 5-min poll"]
+    end
+
+    subgraph Picks["Picks Tab"]
+        FORM["5-field form:<br/>trade type / amount /<br/>window (days) / stop % / target %"]
+        OPENPOS["My Open Positions<br/>everyone's non-broker<br/>'portfolio' equivalent"]
+        OPTCARD["OptCard"]
+        STOCKCARD["StockCard"]
+        FILLBTN["FillButton<br/>confirm_execution()"]
+    end
+
+    subgraph Watchlist["Watchlist Tab"]
+        DEFAULT["Default Watchlist<br/>admin-owned, shared"]
+        MINE["My Watchlist<br/>per-user additions"]
+    end
+
+    subgraph History["History Tab"]
+        MINEVIEW["Mine (default view)"]
+        ALLVIEW["All Users<br/>admin-only toggle"]
+        BYUSER["By-customer leaderboard<br/>admin-only mode"]
+    end
+
+    subgraph Portfolio["Portfolio Route"]
+        LIVEPORT["Live Webull view<br/>admin-only, gated<br/>at 3 real call sites"]
+    end
+
+    subgraph Settings["Settings Tab (any authenticated user)"]
+        MCPREGEN["Regenerate Claude Desktop key<br/>confirm-to-invalidate flow —<br/>old key stops working immediately"]
+    end
+
+    INVITE --> KEYREVEAL
+    LOGIN --> JWT
+    KEYREVEAL --> JWT
+    JWT --> ISADMIN
+    JWT --> MCPREGEN
+
+    ISADMIN --> STRIP
+    ISADMIN --> FORM
+    ISADMIN --> ALLVIEW
+    ISADMIN --> LIVEPORT
+
+    FORM --> OPTCARD & STOCKCARD
+    OPTCARD & STOCKCARD --> FILLBTN
+
+    DEFAULT -.admin edits.-> DEFAULT
+    MINE -.per-user edits.-> MINE
+
+    MINEVIEW -.toggle.-> ALLVIEW
+    ALLVIEW --> BYUSER
+
+    MCPREGEN --> KEYREVEAL
+
+    classDef auth fill:#e8f0fe,stroke:#4285f4,color:#1a237e
+    classDef layout fill:#eceff1,stroke:#546e7a,color:#263238
+    classDef picks fill:#e8f5e9,stroke:#43a047,color:#1b5e20
+    classDef watchlist fill:#fff8e1,stroke:#f9a825,color:#5d4037
+    classDef history fill:#f3e5f5,stroke:#8e24aa,color:#4a148c
+    classDef portfolio fill:#ffebee,stroke:#e53935,color:#b71c1c
+    classDef settings fill:#e0f2f1,stroke:#00897b,color:#004d40
+
+    class INVITE,LOGIN,KEYREVEAL,JWT auth
+    class ISADMIN,STRIP layout
+    class FORM,OPENPOS,OPTCARD,STOCKCARD,FILLBTN picks
+    class DEFAULT,MINE watchlist
+    class MINEVIEW,ALLVIEW,BYUSER history
+    class LIVEPORT portfolio
+    class MCPREGEN settings

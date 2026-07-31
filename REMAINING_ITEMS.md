@@ -12,7 +12,6 @@ Revisit paper-trading calibration assumptions once real data exists
 Build real Robinhood/IBKR/Tastytrade connections
 Turn ad-hoc schema changes into versioned migrations
 Open-source readiness sweep
-Build the two architecture diagrams
 Prep interview talking points
 Add WebSocket real-time dashboard updates
 Add mobile push notifications
@@ -45,17 +44,15 @@ job_run_log has no user_id column - fine now that paper-trade jobs run once agai
 
 7. Open-source readiness sweep .env.example, public README setup video, a hardcoded-user-ID check across the codebase.
 
-8. Architecture diagrams Two diagrams (backend + frontend), suitable for a public write-up. Deliberately deferred until the architecture stops moving quarter to quarter.
+8. Interview talking points No dependencies, can happen anytime.
 
-9. Interview talking points No dependencies, can happen anytime.
+9. WebSocket real-time updates
 
-10. WebSocket real-time updates
+10. Mobile push notifications PWA service worker.
 
-11. Mobile push notifications PWA service worker.
+11. Public invite page
 
-12. Public invite page
-
-13. monitor_config has 3 genuinely dead columns and 4 more that are write-only Confirmed by reading every reference in position_monitor.py: alerts_muted/muted_until are real (drive actual mute/unmute behavior). is_active/last_check_at/total_checks/total_alerts_fired are written via _save_config() but nothing ever reads them back from the DB - PositionMonitor.status() reports in-memory instance state instead, so this data becomes invisible on any process restart. check_interval_seconds/alert_cooldown_minutes have zero references anywhere in the codebase. last_error has a column for exactly this purpose but the code tracks it in-memory only and never actually passes it to _save_config(), so it's permanently NULL. Not fixed here - this was a "confirm usage" ask, not a cleanup ask; low priority since the 2 real columns work fine on their own.
+12. monitor_config has 3 genuinely dead columns and 4 more that are write-only Confirmed by reading every reference in position_monitor.py: alerts_muted/muted_until are real (drive actual mute/unmute behavior). is_active/last_check_at/total_checks/total_alerts_fired are written via _save_config() but nothing ever reads them back from the DB - PositionMonitor.status() reports in-memory instance state instead, so this data becomes invisible on any process restart. check_interval_seconds/alert_cooldown_minutes have zero references anywhere in the codebase. last_error has a column for exactly this purpose but the code tracks it in-memory only and never actually passes it to _save_config(), so it's permanently NULL. Not fixed here - this was a "confirm usage" ask, not a cleanup ask; low priority since the 2 real columns work fine on their own.
 
 Completed (see git log for full commit-level detail)
 Multi-user MCP access - per-request identity resolution, HTTP transport, auto-minted customer keys, StockBros key-reveal screen

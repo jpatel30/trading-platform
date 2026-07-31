@@ -1,0 +1,115 @@
+graph TB
+    subgraph DataSources["Data Sources"]
+        UW["Unusual Whales<br/>flow, dark pool, OI, IV, GEX,<br/>earnings, news, congress trades,<br/>institutional ownership"]
+        POLY["Polygon<br/>daily bars + real monthly<br/>aggregates (UW has no month candle)"]
+        YF["yfinance<br/>VIX, fundamentals,<br/>ETF fund data (expense ratio,<br/>AUM, turnover)"]
+        EDGAR["SEC EDGAR<br/>Form 4 insider filings"]
+    end
+
+    subgraph SignalLayer["Signal Layer (predictive, not reactive)"]
+        FLOW["flow_scoring.py<br/>flow + dark-pool score"]
+        OI["oi_flow.py<br/>multi-day OI persistence"]
+        REGIME["market_regime.py<br/>VIX term structure + PCR"]
+        IVEXP["iv_expansion.py<br/>IV velocity, not just level"]
+        INTRA["intraday_entry.py<br/>5m/15m RSI/MACD, observational"]
+        AHB["after_hours_batch.py<br/>daily TA/fundamentals/insider/IV<br/>for the whole watchlist"]
+        INSIDER["edgar_insider.py<br/>Form 4 buy/sell signal"]
+    end
+
+    subgraph Storage["PostgreSQL"]
+        SNAP[("ticker_daily_snapshot")]
+        IVH[("iv_history")]
+        SIGH[("signal_history")]
+        DR[("daily_recommendations<br/>SINGLE source of truth:<br/>thesis + fill + P&L")]
+        TP[("tracked_positions")]
+        PTC[("paper_trade_context<br/>full signal snapshot per pick")]
+        SRP[("strategy_rule_performance<br/>weekly falsifiable stats")]
+        JRL[("job_run_log")]
+    end
+
+    subgraph Scan["Scan"]
+        QS["quick_scan.py<br/>6-signal convergence scorer"]
+        UNIV["scanner/universe.py<br/>watchlist-driven, zero<br/>broker dependency"]
+    end
+
+    subgraph OptionsPath["Options Recommendation Path"]
+        RESCAN["rescan_engine.py::rescan_with_validation<br/>ONE engine, MCP + web both use it"]
+        ENRICH["_enrich_ticker() per candidate<br/>IV/expiries/earnings/news/GEX/insider/<br/>OI/IVexp/velocity/TA/flow/dp +<br/>congress trades (batched once/scan) +<br/>institutional ownership (per ticker)"]
+        COLLECT["_collect_with_timeout()<br/>concurrent.futures.wait() —<br/>never raises on timeout,<br/>always returns whatever finished"]
+        LLM["Ollama Qwen 14B<br/>thesis, strategy, tiered<br/>confidence calibration +<br/>deterministic congress/<br/>institutional adjustment"]
+        ENGINE["strategy/engine.py<br/>strike selection, position sizing"]
+        GATES["Real R/R gate (floor scales w/ DTE,<br/>flat 0.15 for credit strategies) +<br/>EV gate (debit/long-premium only —<br/>credit strategies intentionally exempt,<br/>backtest-informed) +<br/>structural-impossibility backstop +<br/>25% spot-sanity check"]
+    end
+
+    subgraph StockPath["Stock Recommendation Path (3m/6m/1yr)"]
+        SSCAN["smart_stock_scan.py<br/>composite pre-filter:<br/>fundamentals 50% + velocity 25%<br/>+ insider 25%, ranked before<br/>the expensive per-ticker step"]
+        FUND["fundamentals.py<br/>equity: analyst target (reliability-<br/>discounted) + PEG + margins + revenue growth<br/>ETF/fund: expense ratio vs category,<br/>AUM, liquidity, turnover-based<br/>tracking-fidelity proxy"]
+        HORIZON["horizon_engine.py::get_stock_for_horizon<br/>real trading_window_days/stop/target,<br/>not horizon-bucket defaults"]
+    end
+
+    subgraph PaperLoop["Automated Paper-Trading Loop"]
+        OPEN["paper_trade_open<br/>grid sweep, ~20 unique<br/>picks/day cap, idempotent"]
+        CLOSE["paper_trade_close<br/>real mark-to-market pricing"]
+        RETRY["retry_queue.py<br/>shared retry, used by<br/>3 separate call sites"]
+        REVIEW["weekly_review.py<br/>per-bucket win rate,<br/>plain SQL aggregation only"]
+    end
+
+    subgraph Access["Access"]
+        MCP["MCP Server<br/>stdio (admin) / HTTP<br/>(multi-tenant, ApiKeyTokenVerifier)"]
+        API["FastAPI :8001<br/>web dashboard backend"]
+    end
+
+    UW --> FLOW & OI & IVEXP & INTRA
+    POLY --> AHB
+    YF --> AHB & REGIME
+    EDGAR --> AHB & INSIDER
+
+    FLOW & OI & REGIME & IVEXP --> QS
+    UNIV --> QS
+    AHB --> SNAP & IVH
+    QS --> SIGH
+
+    QS --> RESCAN
+    UNIV --> SSCAN
+    RESCAN --> ENRICH
+    ENRICH -.bounded by.-> COLLECT
+    ENRICH --> LLM
+    LLM --> ENGINE
+    ENGINE --> GATES
+    GATES --> DR
+
+    SSCAN --> FUND
+    FUND --> HORIZON
+    HORIZON --> DR
+
+    DR --> OPEN
+    OPEN --> TP
+    OPEN --> PTC
+    OPEN --> INTRA
+    OPEN -.retry.-> RETRY
+    CLOSE -.retry.-> RETRY
+    AHB -.retry.-> RETRY
+    TP --> CLOSE
+    CLOSE --> DR
+    DR --> REVIEW
+    PTC --> REVIEW
+    REVIEW --> SRP
+
+    OPEN & CLOSE & AHB --> JRL
+
+    DR --> API
+    DR --> MCP
+
+    classDef source fill:#e8f0fe,stroke:#4285f4,color:#1a237e
+    classDef signal fill:#fff8e1,stroke:#f9a825,color:#5d4037
+    classDef storage fill:#eceff1,stroke:#546e7a,color:#263238
+    classDef decision fill:#f3e5f5,stroke:#8e24aa,color:#4a148c
+    classDef gate fill:#ffebee,stroke:#e53935,color:#b71c1c
+    classDef access fill:#e0f2f1,stroke:#00897b,color:#004d40
+
+    class UW,POLY,YF,EDGAR source
+    class FLOW,OI,REGIME,IVEXP,INTRA,AHB,INSIDER signal
+    class SNAP,IVH,SIGH,DR,TP,PTC,SRP,JRL storage
+    class RESCAN,ENRICH,COLLECT,LLM,SSCAN,FUND,HORIZON decision
+    class ENGINE,GATES gate
+    class MCP,API access

@@ -481,6 +481,24 @@ def rescan_with_validation(
             try:
                 legs = trade.get("legs", [])
                 entry_basis = abs(trade.get("entry_debit", 0))
+                is_credit   = bool(trade.get("is_credit_strategy"))
+                # For a DEBIT trade (you paid entry_basis), profit means the
+                # premium rises above what you paid — target > entry, stop <
+                # entry. For a CREDIT trade (you received entry_basis, e.g.
+                # an iron condor), profit means the cost to close FALLS below
+                # what you received (buy back cheaper), and loss means it
+                # RISES above it — the direction is inverted. Using the
+                # debit formula for credit trades put target_price ABOVE
+                # entry and stop_price BELOW it, backwards for how a credit
+                # position's economics actually work, and with no
+                # is_credit_strategy flag stored downstream to correct the
+                # framing when format_daily_recommendations() displays it.
+                if is_credit:
+                    target_price = round(entry_basis * (1 - profit_target_pct/100), 2)
+                    stop_price   = round(entry_basis * (1 + stop_loss_pct/100), 2)
+                else:
+                    target_price = round(entry_basis * (1 + profit_target_pct/100), 2)
+                    stop_price   = round(entry_basis * (1 - stop_loss_pct/100), 2)
                 _upsert_recommendation(user_id, {
                     "ticker": ticker, "horizon": window_str,
                     "direction": trade.get("direction",""),
@@ -497,9 +515,9 @@ def rescan_with_validation(
                     # target_price/stop_price computed from entry_basis so
                     # format_daily_recommendations() shows real dollar
                     # figures instead of a hardcoded $0.
-                    "target_price": round(entry_basis * (1 + profit_target_pct/100), 2),
+                    "target_price": target_price,
                     "target_pct": profit_target_pct,
-                    "stop_price": round(entry_basis * (1 - stop_loss_pct/100), 2),
+                    "stop_price": stop_price,
                     "stop_pct": -stop_loss_pct,
                     "timeframe": f"{trading_window_days} days",
                     "invalidation_conditions": rec.get("key_risk",""),

@@ -38,6 +38,130 @@ Broker connection (Webull) is used only for the admin's own live
 portfolio, positions, and orders - the scanner and recommendation
 engine do not depend on it. See "Watchlist Architecture" below.
 
+Full backend data-flow diagram, including the options and stock
+recommendation paths side by side and where each trade-math gate
+applies: `docs/diagrams/backend-architecture.mermaid` (rendered below).
+Frontend component/auth diagram: `docs/diagrams/frontend-architecture.mermaid`,
+rendered in "StockBros Dashboard" below.
+
+```mermaid
+graph TB
+    subgraph DataSources["Data Sources"]
+        UW["Unusual Whales<br/>flow, dark pool, OI, IV, GEX,<br/>earnings, news, congress trades,<br/>institutional ownership"]
+        POLY["Polygon<br/>daily bars + real monthly<br/>aggregates (UW has no month candle)"]
+        YF["yfinance<br/>VIX, fundamentals,<br/>ETF fund data (expense ratio,<br/>AUM, turnover)"]
+        EDGAR["SEC EDGAR<br/>Form 4 insider filings"]
+    end
+
+    subgraph SignalLayer["Signal Layer (predictive, not reactive)"]
+        FLOW["flow_scoring.py<br/>flow + dark-pool score"]
+        OI["oi_flow.py<br/>multi-day OI persistence"]
+        REGIME["market_regime.py<br/>VIX term structure + PCR"]
+        IVEXP["iv_expansion.py<br/>IV velocity, not just level"]
+        INTRA["intraday_entry.py<br/>5m/15m RSI/MACD, observational"]
+        AHB["after_hours_batch.py<br/>daily TA/fundamentals/insider/IV<br/>for the whole watchlist"]
+        INSIDER["edgar_insider.py<br/>Form 4 buy/sell signal"]
+    end
+
+    subgraph Storage["PostgreSQL"]
+        SNAP[("ticker_daily_snapshot")]
+        IVH[("iv_history")]
+        SIGH[("signal_history")]
+        DR[("daily_recommendations<br/>SINGLE source of truth:<br/>thesis + fill + P&L")]
+        TP[("tracked_positions")]
+        PTC[("paper_trade_context<br/>full signal snapshot per pick")]
+        SRP[("strategy_rule_performance<br/>weekly falsifiable stats")]
+        JRL[("job_run_log")]
+    end
+
+    subgraph Scan["Scan"]
+        QS["quick_scan.py<br/>6-signal convergence scorer"]
+        UNIV["scanner/universe.py<br/>watchlist-driven, zero<br/>broker dependency"]
+    end
+
+    subgraph OptionsPath["Options Recommendation Path"]
+        RESCAN["rescan_engine.py::rescan_with_validation<br/>ONE engine, MCP + web both use it"]
+        ENRICH["_enrich_ticker() per candidate<br/>IV/expiries/earnings/news/GEX/insider/<br/>OI/IVexp/velocity/TA/flow/dp +<br/>congress trades (batched once/scan) +<br/>institutional ownership (per ticker)"]
+        COLLECT["_collect_with_timeout()<br/>concurrent.futures.wait() —<br/>never raises on timeout,<br/>always returns whatever finished"]
+        LLM["Ollama Qwen 14B<br/>thesis, strategy, tiered<br/>confidence calibration +<br/>deterministic congress/<br/>institutional adjustment"]
+        ENGINE["strategy/engine.py<br/>strike selection, position sizing"]
+        GATES["Real R/R gate (floor scales w/ DTE,<br/>flat 0.15 for credit strategies) +<br/>EV gate (debit/long-premium only —<br/>credit strategies intentionally exempt,<br/>backtest-informed) +<br/>structural-impossibility backstop +<br/>25% spot-sanity check"]
+    end
+
+    subgraph StockPath["Stock Recommendation Path (3m/6m/1yr)"]
+        SSCAN["smart_stock_scan.py<br/>composite pre-filter:<br/>fundamentals 50% + velocity 25%<br/>+ insider 25%, ranked before<br/>the expensive per-ticker step"]
+        FUND["fundamentals.py<br/>equity: analyst target (reliability-<br/>discounted) + PEG + margins + revenue growth<br/>ETF/fund: expense ratio vs category,<br/>AUM, liquidity, turnover-based<br/>tracking-fidelity proxy"]
+        HORIZON["horizon_engine.py::get_stock_for_horizon<br/>real trading_window_days/stop/target,<br/>not horizon-bucket defaults"]
+    end
+
+    subgraph PaperLoop["Automated Paper-Trading Loop"]
+        OPEN["paper_trade_open<br/>grid sweep, ~20 unique<br/>picks/day cap, idempotent"]
+        CLOSE["paper_trade_close<br/>real mark-to-market pricing"]
+        RETRY["retry_queue.py<br/>shared retry, used by<br/>3 separate call sites"]
+        REVIEW["weekly_review.py<br/>per-bucket win rate,<br/>plain SQL aggregation only"]
+    end
+
+    subgraph Access["Access"]
+        MCP["MCP Server<br/>stdio (admin) / HTTP<br/>(multi-tenant, ApiKeyTokenVerifier)"]
+        API["FastAPI :8001<br/>web dashboard backend"]
+    end
+
+    UW --> FLOW & OI & IVEXP & INTRA
+    POLY --> AHB
+    YF --> AHB & REGIME
+    EDGAR --> AHB & INSIDER
+
+    FLOW & OI & REGIME & IVEXP --> QS
+    UNIV --> QS
+    AHB --> SNAP & IVH
+    QS --> SIGH
+
+    QS --> RESCAN
+    UNIV --> SSCAN
+    RESCAN --> ENRICH
+    ENRICH -.bounded by.-> COLLECT
+    ENRICH --> LLM
+    LLM --> ENGINE
+    ENGINE --> GATES
+    GATES --> DR
+
+    SSCAN --> FUND
+    FUND --> HORIZON
+    HORIZON --> DR
+
+    DR --> OPEN
+    OPEN --> TP
+    OPEN --> PTC
+    OPEN --> INTRA
+    OPEN -.retry.-> RETRY
+    CLOSE -.retry.-> RETRY
+    AHB -.retry.-> RETRY
+    TP --> CLOSE
+    CLOSE --> DR
+    DR --> REVIEW
+    PTC --> REVIEW
+    REVIEW --> SRP
+
+    OPEN & CLOSE & AHB --> JRL
+
+    DR --> API
+    DR --> MCP
+
+    classDef source fill:#e8f0fe,stroke:#4285f4,color:#1a237e
+    classDef signal fill:#fff8e1,stroke:#f9a825,color:#5d4037
+    classDef storage fill:#eceff1,stroke:#546e7a,color:#263238
+    classDef decision fill:#f3e5f5,stroke:#8e24aa,color:#4a148c
+    classDef gate fill:#ffebee,stroke:#e53935,color:#b71c1c
+    classDef access fill:#e0f2f1,stroke:#00897b,color:#004d40
+
+    class UW,POLY,YF,EDGAR source
+    class FLOW,OI,REGIME,IVEXP,INTRA,AHB,INSIDER signal
+    class SNAP,IVH,SIGH,DR,TP,PTC,SRP,JRL storage
+    class RESCAN,ENRICH,COLLECT,LLM,SSCAN,FUND,HORIZON decision
+    class ENGINE,GATES gate
+    class MCP,API access
+```
+
 ---
 
 ## Data Flow - Options Recommendation Run
@@ -248,16 +372,22 @@ app/
                           had been inflating iron condor returns.
                           calculate_backtest_stats() excludes rows
                           flagged excluded_from_stats.
-    conviction.py        12-factor conviction scoring (0-100). Orphaned
-                          this session - its only caller
-                          (run_daily_recommendations) was retired; no
-                          remaining imports anywhere in app/. Left in
-                          place rather than deleted; see REMAINING_ITEMS.md.
-    fundamentals.py      yfinance fundamentals + analyst targets.
-                          analyst_target_reliability() (moved here from
-                          smart_stock_scan.py) is the shared reliability
-                          discount used by both smart_stock_scan.py's
-                          ranking and horizon_engine.py's target_price.
+    fundamentals.py      yfinance fundamentals + analyst targets for
+                          equities. analyst_target_reliability() (moved
+                          here from smart_stock_scan.py) is the shared
+                          reliability discount used by both
+                          smart_stock_scan.py's ranking and
+                          horizon_engine.py's target_price.
+                          get_fund_data()/score_etf_fundamentals() are
+                          the fund-appropriate equivalent for ETFs
+                          (expense ratio vs category, AUM, liquidity,
+                          turnover-based tracking-fidelity proxy) -
+                          replaces an older technicals-only stand-in
+                          that scored every ETF almost identically
+                          regardless of fund quality, and fixed a real
+                          bug where ETFs were being silently filtered
+                          out of stock recommendations entirely by the
+                          equity rubric's near-zero placeholder scoring.
 
   strategy/
     engine.py            Trade math: strike selection, cost, R:R,
@@ -412,38 +542,32 @@ daily_recommendations --< learning_log (aggregate, via nightly loop)
 
 ---
 
-## Conviction Scoring (12 factors, 0-100) - ORPHANED
+## Conviction Scoring
 
-This was recommendations/conviction.py's scoring system, used by the
-old daily_engine.py::run_daily_recommendations() scan path (removed
-this session - see REMAINING_ITEMS.md). It was distinct from and never
-unified with quick_scan.py's 5-signal convergence scanner (price
-momentum, flow, dark pool, TA, OI buildup), which both MCP and web now
-share via rescan_engine.py/smart_engine.py. conviction.py has no
-remaining importers in app/ - kept documented here for now since the
-file itself hasn't been deleted.
+recommendations/conviction.py (a standalone 12-factor deterministic
+scorer, only ever called by the old daily_engine.py::
+run_daily_recommendations() scan path) was deleted this session - zero
+remaining importers confirmed via repo-wide grep before removal. It was
+never unified with quick_scan.py's convergence scanner, which both MCP
+and web share via rescan_engine.py/smart_engine.py.
 
-```
-Factor              Weight  Source
-entry_trigger       20%     TA (AT_SUPPORT/AT_RESISTANCE/BREAKOUT)
-options_flow        20%     UW flow alerts + dark pool (hard block if contradicts)
-iv_rank             15%     UW real 1-year IV rank
-ta_alignment        20%     MA20/50/200 + RSI + MACD trend
-vix_zone            15%     yfinance VIX (LOW/NORMAL/HIGH/EXTREME)
-volume              10%     vs 20-day average
-
-UW bonus signals (+0 to +10 additive):
-  net_premium_ticks  +5     call vs put net premium confirms direction
-  greek_flow         +3     call vs put gamma direction confirms
-  institutional      +2     >70% institutional ownership score
-
-Tiers:
-  80-100: VERY_HIGH  -> strong green, act_now=True
-  70-79:  HIGH       -> green, act_now=True
-  55-69:  MODERATE   -> yellow, watch
-  40-54:  WATCH      -> orange, skip
-  <40:    SKIP       -> red, skip
-```
+conviction_score today IS the LLM's own confidence field from its
+single batched JSON response (see "Data Flow - Options Recommendation
+Run" and the backend diagram above) - there is no separate
+deterministic conviction step anymore. Two things now shape that
+number instead of a 12-factor formula:
+  1. A tiered calibration rubric in the LLM prompt itself (explicit
+     confidence bands tied to how many signals align, replacing an
+     earlier literal `"confidence": 72` example that was silently
+     anchoring every response to the same number regardless of real
+     signal strength).
+  2. A small deterministic +/-15 adjustment applied AFTER the LLM
+     call, based on congress trades + institutional ownership actually
+     agreeing or conflicting with the chosen direction - added because
+     prompt-only calibration reliably moved confidence for broad
+     multi-signal swings but did not reliably move it for this
+     specific signal pair in isolation, confirmed across repeated live
+     tests.
 
 ---
 
@@ -533,6 +657,86 @@ prevented the status-polling endpoint from being served at all during
 the scan.
 ```
 
+```mermaid
+graph TB
+    subgraph Auth["Authentication"]
+        INVITE["Invite redemption<br/>first-time signup"]
+        LOGIN["Password login<br/>returning users<br/>(login-existing)"]
+        KEYREVEAL["MCPKeyReveal<br/>shared component,<br/>shown exactly once"]
+        JWT["JWT (30 days)"]
+    end
+
+    subgraph Layout["Root Dashboard Layout"]
+        ISADMIN["useIsAdmin() context<br/>fetched ONCE, shared down<br/>via React Context"]
+        STRIP["Portfolio strip<br/>admin-only, 5-min poll"]
+    end
+
+    subgraph Picks["Picks Tab"]
+        FORM["5-field form:<br/>trade type / amount /<br/>window (days) / stop % / target %"]
+        OPENPOS["My Open Positions<br/>everyone's non-broker<br/>'portfolio' equivalent"]
+        OPTCARD["OptCard"]
+        STOCKCARD["StockCard"]
+        FILLBTN["FillButton<br/>confirm_execution()"]
+    end
+
+    subgraph Watchlist["Watchlist Tab"]
+        DEFAULT["Default Watchlist<br/>admin-owned, shared"]
+        MINE["My Watchlist<br/>per-user additions"]
+    end
+
+    subgraph History["History Tab"]
+        MINEVIEW["Mine (default view)"]
+        ALLVIEW["All Users<br/>admin-only toggle"]
+        BYUSER["By-customer leaderboard<br/>admin-only mode"]
+    end
+
+    subgraph Portfolio["Portfolio Route"]
+        LIVEPORT["Live Webull view<br/>admin-only, gated<br/>at 3 real call sites"]
+    end
+
+    subgraph Settings["Settings Tab (any authenticated user)"]
+        MCPREGEN["Regenerate Claude Desktop key<br/>confirm-to-invalidate flow —<br/>old key stops working immediately"]
+    end
+
+    INVITE --> KEYREVEAL
+    LOGIN --> JWT
+    KEYREVEAL --> JWT
+    JWT --> ISADMIN
+    JWT --> MCPREGEN
+
+    ISADMIN --> STRIP
+    ISADMIN --> FORM
+    ISADMIN --> ALLVIEW
+    ISADMIN --> LIVEPORT
+
+    FORM --> OPTCARD & STOCKCARD
+    OPTCARD & STOCKCARD --> FILLBTN
+
+    DEFAULT -.admin edits.-> DEFAULT
+    MINE -.per-user edits.-> MINE
+
+    MINEVIEW -.toggle.-> ALLVIEW
+    ALLVIEW --> BYUSER
+
+    MCPREGEN --> KEYREVEAL
+
+    classDef auth fill:#e8f0fe,stroke:#4285f4,color:#1a237e
+    classDef layout fill:#eceff1,stroke:#546e7a,color:#263238
+    classDef picks fill:#e8f5e9,stroke:#43a047,color:#1b5e20
+    classDef watchlist fill:#fff8e1,stroke:#f9a825,color:#5d4037
+    classDef history fill:#f3e5f5,stroke:#8e24aa,color:#4a148c
+    classDef portfolio fill:#ffebee,stroke:#e53935,color:#b71c1c
+    classDef settings fill:#e0f2f1,stroke:#00897b,color:#004d40
+
+    class INVITE,LOGIN,KEYREVEAL,JWT auth
+    class ISADMIN,STRIP layout
+    class FORM,OPENPOS,OPTCARD,STOCKCARD,FILLBTN picks
+    class DEFAULT,MINE watchlist
+    class MINEVIEW,ALLVIEW,BYUSER history
+    class LIVEPORT portfolio
+    class MCPREGEN settings
+```
+
 ---
 
 ## Multi-User / MCP Access Notes
@@ -551,8 +755,12 @@ user by construction.
 Customer MCP keys are minted automatically on account creation (new
 user via invite-code signup in /api/auth/login, app/api/main.py) using
 the same generate_api_key()/create_api_key() the admin's own key uses,
-returned once in plaintext for StockBros to show the customer. There is
-no self-serve "regenerate a lost key" endpoint yet.
+returned once in plaintext for StockBros to show the customer. A
+self-serve regenerate endpoint now exists (StockBros Settings tab ->
+regenerateMcpKey()) - old key invalidated immediately, new one shown
+once via the same MCPKeyReveal component used at signup. Password-based
+login for returning users (login-existing) was added alongside it, so
+signup isn't the only way back in.
 
 Transport is chosen via the mcp_transport setting ("stdio" default,
 "http" for hosted - MCP_TRANSPORT env var). Going from HTTP-capable

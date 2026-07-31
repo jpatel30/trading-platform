@@ -29,7 +29,7 @@ the shared, audited implementation — instead of a local copy.
 import json
 import time
 from datetime import datetime, timedelta
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, wait
 
 from app.signals.flow_scoring import compute_flow_score, compute_dp_score
 
@@ -50,6 +50,38 @@ def _is_optionable(pick: dict) -> bool:
     )
 
 
+def _collect_with_timeout(futures: dict, timeout: float, label: str = "task") -> list:
+    """
+    Collect results from {future: identifier}, bounded by timeout, without
+    ever raising on a batch that doesn't fully finish in time.
+
+    as_completed(futures, timeout=N) — the previous approach — RAISES
+    concurrent.futures.TimeoutError from the loop construct itself when the
+    overall batch doesn't finish in time. That's a different exception from
+    any individual future failing, so a try/except wrapped only around
+    future.result() inside the loop body never catches it — it propagates
+    straight out of the caller uncaught. Confirmed live: a real 14-candidate
+    enrichment batch hit exactly this ("TimeoutError: 14 (of 14) futures
+    unfinished") and the whole function call crashed, returning nothing at
+    all rather than the candidates that *did* finish in time.
+
+    wait() doesn't raise — it returns (done, not_done) sets after `timeout`
+    seconds regardless, so whatever completed is always usable.
+    """
+    done, not_done = wait(list(futures.keys()), timeout=timeout)
+    results = []
+    for fut in done:
+        try:
+            results.append(fut.result())
+        except Exception as e:
+            print(f"[{label}] {futures.get(fut, '?')} failed: {e}")
+    if not_done:
+        names = [futures.get(f, "?") for f in not_done]
+        print(f"[{label}] {len(not_done)}/{len(futures)} still running after {timeout}s "
+              f"timeout — returning {len(results)} that finished: {names}")
+    return results
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Phase 1: Enrich single ticker (runs in parallel for all candidates)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -60,6 +92,7 @@ def _enrich_ticker(
     batch_flow: dict,
     batch_dp: dict,
     user_id: str = "",
+    batch_congress: dict | None = None,
 ) -> dict:
     """Enrich one scanner pick with IV, expiries, news, TA, GEX, insider, OI, velocity."""
     from app.options_flow.unusual_whales import (
@@ -145,9 +178,21 @@ def _enrich_ticker(
 
     # Congress trades (buy/sell cluster) + institutional ownership — real inputs,
     # not just data sitting unused. Separate from EDGAR insider Form 4 activity above.
+    #
+    # get_congress_trades(ticker=X) hits /api/congress/recent-trades WITHOUT a
+    # ticker param even when one is passed — it fetches the same unfiltered
+    # response every time and only filters client-side, so per-ticker calls
+    # were N redundant network round-trips against the shared UW rate limiter
+    # (confirmed live: root cause of a real 30s+ enrichment timeout once this
+    # was added per-candidate). batch_congress (pre-fetched ONCE per scan,
+    # same pattern as batch_flow/batch_dp) avoids that; falls back to a live
+    # per-ticker call only when no batch was supplied.
     try:
-        from app.options_flow.unusual_whales import get_congress_trades
-        congress = get_congress_trades(ticker=ticker, limit=10) or []
+        if batch_congress is not None:
+            congress = batch_congress.get(ticker, [])
+        else:
+            from app.options_flow.unusual_whales import get_congress_trades
+            congress = get_congress_trades(ticker=ticker, limit=10) or []
         buys  = sum(1 for c in congress if "buy"  in (c.get("txn_type") or "").lower() or "purchase" in (c.get("txn_type") or "").lower())
         sells = sum(1 for c in congress if "sell" in (c.get("txn_type") or "").lower() or "sale"     in (c.get("txn_type") or "").lower())
         result["congress_buys"]  = buys
@@ -694,6 +739,7 @@ def run_smart_recommendations(
         get_earnings_premarket, get_earnings_afterhours,
         get_flow_alerts, get_dark_pool_recent,
         get_net_flow_by_expiry, get_economic_calendar,
+        get_congress_trades,
     )
 
     t_total = time.time()
@@ -730,9 +776,21 @@ def run_smart_recommendations(
     batch_flow = {t: compute_flow_score(alerts) for t, alerts in flow_by.items()}
     batch_dp   = {t: compute_dp_score(prints)   for t, prints in dp_by.items()}
 
+    # Fetched ONCE for the whole scan and grouped locally, not per-candidate —
+    # get_congress_trades(ticker=X) hits the same unfiltered UW endpoint
+    # every time regardless of ticker (it filters client-side), so N
+    # per-candidate calls were N redundant round-trips against the shared
+    # UW rate limiter. See _enrich_ticker's batch_congress docstring note.
+    batch_congress = {}
+    try:
+        for c in (get_congress_trades(limit=500) or []):
+            batch_congress.setdefault((c.get("ticker") or "").upper(), []).append(c)
+    except Exception as e:
+        print(f"[SmartEngine] Congress batch fetch failed: {e}")
+
     print(f"[SmartEngine] Shared data in {time.time()-t0:.1f}s | "
           f"VIX={vix.get('current')} | news={len(global_news)} | "
-          f"earnings={len(earnings_pre+earnings_post)}")
+          f"earnings={len(earnings_pre+earnings_post)} | congress_tickers={len(batch_congress)}")
 
     if pre_scanned:
         picks = pre_scanned
@@ -755,20 +813,52 @@ def run_smart_recommendations(
         ]
         print("[SmartEngine] No candidates — using SPY/QQQ fallback")
 
+    # Pre-sort using the SAME key the post-enrichment sort below already
+    # used (flow/dp/change_pct/earnings_days — all available before
+    # enrichment, from the scanner + earnings_map, not from _enrich_ticker
+    # itself) and cap to exactly the LLM prompt's own top-10 cutoff.
+    # Previously every optionable candidate (up to top_picks=15) got the
+    # full ~7-call UW enrichment treatment even though only the top 10 by
+    # this exact key ever reached the prompt — the rest were pure wasted
+    # calls against the shared UW rate limiter (110/min, global across all
+    # threads — confirmed the real bottleneck live: a single _enrich_ticker
+    # call takes ~3s in isolation, but 8 running concurrently took 33s+ for
+    # the FIRST to finish, since throughput is capped by the shared token
+    # bucket, not by parallelism). No backfill buffer beyond exactly 10 —
+    # graceful timeout handling below means losing 1-2 of these 10 to a
+    # slow/failed enrichment is a minor, non-fatal degradation, not worth
+    # the extra rate-limit pressure a bigger buffer would add.
+    ENRICH_BUFFER = 10
+
+    def _pre_sort_key(p):
+        t  = p.get("ticker", "")
+        fs = batch_flow.get(t, {}).get("flow_score", p.get("flow_score", 0))
+        ds = batch_dp.get(t, {}).get("dp_score", p.get("dp_score", 0))
+        ed = earnings_map.get(t, {}).get("days_away", 999)
+        return abs(fs) + abs(ds) + abs(p.get("change_pct", 0)) * 2 + (20 if ed < 14 else 0)
+
+    candidates.sort(key=_pre_sort_key, reverse=True)
+    if len(candidates) > ENRICH_BUFFER:
+        print(f"[SmartEngine] Trimming {len(candidates)} candidates to top {ENRICH_BUFFER} before enrichment")
+        candidates = candidates[:ENRICH_BUFFER]
+
     print(f"[SmartEngine] Enriching {len(candidates)} candidates in parallel...")
     t0       = time.time()
     enriched = []
 
+    # 30s was the original ceiling from before congress-trades/institutional-
+    # ownership were added to _enrich_ticker (this session) — measured live
+    # against real tickers after the batching fix above: 10 candidates x 7
+    # UW-rate-limited calls each (was 6 before this session, +institutional-
+    # ownership, congress now batched once instead of per-candidate) took
+    # 42.5s end to end, all 10 succeeding. 60s leaves ~40% margin over that
+    # real number for day-to-day API variance, not a guessed value.
     with ThreadPoolExecutor(max_workers=min(8, len(candidates))) as ex:
         futures = {
-            ex.submit(_enrich_ticker, c, earnings_map, batch_flow, batch_dp, user_id): c["ticker"]
+            ex.submit(_enrich_ticker, c, earnings_map, batch_flow, batch_dp, user_id, batch_congress): c["ticker"]
             for c in candidates
         }
-        for future in as_completed(futures, timeout=30):
-            try:
-                enriched.append(future.result())
-            except Exception as e:
-                print(f"[SmartEngine] Enrich failed: {e}")
+        enriched = _collect_with_timeout(futures, timeout=60, label="SmartEngine")
 
     print(f"[SmartEngine] Enriched {len(enriched)} tickers in {time.time()-t0:.1f}s")
 

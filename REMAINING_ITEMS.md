@@ -18,7 +18,6 @@ Add WebSocket real-time dashboard updates
 Add mobile push notifications
 Build a public invite page
 monitor_config has 3 genuinely dead columns and 4 more that are write-only
-smart_engine.py enrichment can time out at 30s with a full 14-candidate scan
 Descriptions
 
 1. Cloud deployment Cloudflare tunnel or Railway.app. Directly unblocks #2 - multi-tenant MCP access is fully built and tested but has nowhere to actually run for a real customer yet.
@@ -57,8 +56,6 @@ job_run_log has no user_id column - fine now that paper-trade jobs run once agai
 12. Public invite page
 
 13. monitor_config has 3 genuinely dead columns and 4 more that are write-only Confirmed by reading every reference in position_monitor.py: alerts_muted/muted_until are real (drive actual mute/unmute behavior). is_active/last_check_at/total_checks/total_alerts_fired are written via _save_config() but nothing ever reads them back from the DB - PositionMonitor.status() reports in-memory instance state instead, so this data becomes invisible on any process restart. check_interval_seconds/alert_cooldown_minutes have zero references anywhere in the codebase. last_error has a column for exactly this purpose but the code tracks it in-memory only and never actually passes it to _save_config(), so it's permanently NULL. Not fixed here - this was a "confirm usage" ask, not a cleanup ask; low priority since the 2 real columns work fine on their own.
-
-14. smart_engine.py enrichment can time out at 30s with a full 14-candidate scan Found while verifying the confidence-flatness fix - a live run_smart_recommendations() call with a real 131-ticker watchlist (14 optionable candidates) hit "TimeoutError: 14 (of 14) futures unfinished" at the ThreadPoolExecutor's 30s enrichment timeout. Likely caused by the congress-trades/institutional-ownership live API calls added to _enrich_ticker this session (2 more network calls per candidate on top of IV/expiries/earnings/news/GEX/insider/OI/IVexp/velocity/TA/flow/dp). Not root-caused or fixed here - out of scope for the confidence-calibration task that surfaced it. Worth checking whether 30s is still enough headroom for 14 parallel candidates now, or whether it needs raising / the new calls need to be trimmed to only top-N candidates.
 
 Completed (see git log for full commit-level detail)
 Multi-user MCP access - per-request identity resolution, HTTP transport, auto-minted customer keys, StockBros key-reveal screen

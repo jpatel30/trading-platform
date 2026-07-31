@@ -212,17 +212,17 @@ def rescan_with_validation(
 ) -> dict:
     from app.recommendations.smart_engine import (
         _build_earnings_map, _enrich_ticker, _call_smart_llm,
-        _execute_smart_rec, _is_optionable,
+        _execute_smart_rec, _is_optionable, _collect_with_timeout,
     )
     from app.options_flow.unusual_whales import (
         get_earnings_premarket, get_earnings_afterhours,
-        get_flow_alerts, get_dark_pool_recent,
+        get_flow_alerts, get_dark_pool_recent, get_congress_trades,
     )
     from app.rag.context_builder import _build_vix_context, _build_global_news
     from app.signals.market_regime import get_full_market_regime
     from app.scanner.quick_scan import quick_scan
     from app.utils.scan_status import set_scan_status
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from concurrent.futures import ThreadPoolExecutor
 
     from app.recommendations.daily_engine import _check_api_health, _upsert_recommendation
 
@@ -303,6 +303,15 @@ def rescan_with_validation(
     batch_flow = {t: compute_flow_score(alerts) for t, alerts in flow_by.items()}
     batch_dp   = {t: compute_dp_score(prints)   for t, prints in dp_by.items()}
 
+    # Fetched ONCE for the whole scan, not per-candidate — see
+    # _enrich_ticker's batch_congress docstring note in smart_engine.py.
+    batch_congress = {}
+    try:
+        for c in (get_congress_trades(limit=500) or []):
+            batch_congress.setdefault((c.get("ticker") or "").upper(), []).append(c)
+    except Exception as e:
+        print(f"[Rescan] Congress batch fetch failed: {e}")
+
     from datetime import datetime as _dt
     wl_sorted      = sorted(set(tickers))
     batch_idx      = (_dt.now().minute // 20) % 3
@@ -319,15 +328,13 @@ def rescan_with_validation(
                 return t, [], []
 
         with ThreadPoolExecutor(max_workers=5) as ex:
-            for fut in as_completed({ex.submit(_tf, t): t for t in uncovered}, timeout=30):
-                try:
-                    t, tf, td = fut.result()
-                    if tf:
-                        batch_flow[t] = compute_flow_score(tf)
-                    if td:
-                        batch_dp[t] = compute_dp_score(td)
-                except Exception:
-                    pass
+            uf_futures = {ex.submit(_tf, t): t for t in uncovered}
+            for r in _collect_with_timeout(uf_futures, timeout=30, label="Rescan-uncovered"):
+                t, tf, td = r
+                if tf:
+                    batch_flow[t] = compute_flow_score(tf)
+                if td:
+                    batch_dp[t] = compute_dp_score(td)
         print(f"[Rescan] Total UW coverage: {len(batch_flow)} flow + {len(batch_dp)} dp tickers")
 
     if pre_scanned:
@@ -360,15 +367,18 @@ def rescan_with_validation(
     other_picks = [p for p in picks if p["ticker"] not in ("SPY","QQQ") and _is_optionable(p)]
     candidates = index_candidates + other_picks[:10]
 
-    enriched = []
+    # timeout measured live against this exact 12-candidate shape (2 index +
+    # 10 ranked) after the batch_congress fix above: ~50s end to end for all
+    # 12 to finish (7 UW-rate-limited calls each against the shared 110/min
+    # bucket). 90s already had real margin over that; kept as-is rather than
+    # tightened, since a false-timeout here is worse than a few extra
+    # seconds of headroom on the path real users actually hit.
     with ThreadPoolExecutor(max_workers=6) as ex:
         futures = {
-            ex.submit(_enrich_ticker, c, earnings_map, batch_flow, batch_dp, user_id): c["ticker"]
+            ex.submit(_enrich_ticker, c, earnings_map, batch_flow, batch_dp, user_id, batch_congress): c["ticker"]
             for c in candidates
         }
-        for future in as_completed(futures, timeout=90):
-            try: enriched.append(future.result())
-            except Exception: pass
+        enriched = _collect_with_timeout(futures, timeout=90, label="Rescan")
 
     enriched.sort(
         key=lambda x: abs(x.get("flow_score",0)) + abs(x.get("dp_score",0)) + abs(x.get("change_pct",0))*2,

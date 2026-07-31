@@ -334,6 +334,16 @@ Market news:
 === OPTION CANDIDATES (pick the BEST setups) ===
 {ticker_blocks}
 
+CONFIDENCE CALIBRATION (be honest, do not default to a round number like 70-75):
+- 85-95: 4+ strong aligned signals (flow, OI, IV expansion, dark pool, insider/congress,
+  RSI/trend all pointing the same way), no conflicts.
+- 70-84: several aligned signals, at most one weak/neutral one.
+- 55-69: mixed signals, a plausible but not compelling setup.
+- 40-54: mostly neutral/flat signals, weak or no catalyst, or signals conflict.
+- Below 40: signals actively conflict with the chosen direction.
+Every candidate's confidence MUST be justified by ITS OWN signals shown above — two
+candidates with genuinely different signal strength must NOT get the same confidence.
+
 === YOUR TASK ===
 Study every candidate above. Consider:
 - Which ticker has the STRONGEST signal for options today?
@@ -373,7 +383,7 @@ Respond with valid JSON only:
       "ticker": "NVDA", "direction": "BEARISH", "expiry": "2026-07-17", "dte": 19,
       "strategy": "DEBIT_PUT_SPREAD", "buy_strike": 190.0, "sell_strike": 182.5,
       "reasoning": "2 sentences: why this ticker, why this expiry",
-      "key_risk": "1 sentence on main risk", "confidence": 72, "catalyst": "what will move it"
+      "key_risk": "1 sentence on main risk", "confidence": "<int 0-100, see calibration above>", "catalyst": "what will move it"
     }}
   ],
   "skip": ["NMAX", "CBRS"], "skip_reason": "too illiquid / no catalyst"
@@ -414,6 +424,42 @@ Respond with valid JSON only — no text before or after."""
 # ─────────────────────────────────────────────────────────────────────────────
 # Phase 3: Deterministic math per LLM decision
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _congress_institutional_adjustment(t: dict, direction: str) -> int:
+    """
+    Small deterministic nudge (+/-15 max) applied to the LLM's raw
+    confidence based on congress trades + institutional ownership,
+    layered on top rather than left to prompt instructions alone.
+
+    Found live: prompt-only calibration (a tiered rubric, then an
+    explicit "shift by 12-15 points" instruction) reliably moved
+    confidence for broad multi-signal swings (flow/OI/RSI/IV-expansion)
+    but did NOT reliably move it for congress/institutional data in
+    isolation, even when that data was extreme (9buy/0sell congress,
+    97/100 institutional ownership) and held everything else constant -
+    the local model's reasoning TEXT referenced the data correctly, the
+    confidence NUMBER still didn't budge across repeated tests. This
+    makes the adjustment deterministic and verifiable instead of hoping
+    the model's free-form judgment picks it up.
+    """
+    adj = 0
+
+    buys, sells = t.get("congress_buys", 0), t.get("congress_sells", 0)
+    if buys + sells >= 5:
+        congress_bullish = buys > sells
+        aligned = (congress_bullish and direction == "BULLISH") or \
+                  (not congress_bullish and direction == "BEARISH")
+        adj += 6 if aligned else -6
+
+    inst = t.get("inst_own_score", 50)
+    if inst >= 80 or inst <= 20:
+        inst_bullish = inst >= 80
+        aligned = (inst_bullish and direction == "BULLISH") or \
+                  (not inst_bullish and direction == "BEARISH")
+        adj += 6 if aligned else -6
+
+    return max(-15, min(15, adj))
+
 
 def _execute_smart_rec(rec: dict, budget: float, user_id: str | None) -> dict | None:
     from app.strategy.engine import _execute_trade_math, normalize_strategy
@@ -743,9 +789,19 @@ def run_smart_recommendations(
     print(f"[SmartEngine] Market view: {llm_result.get('market_view','')}")
     print(f"[SmartEngine] Recommendations: {len(llm_result.get('recommendations',[]))}")
 
+    enriched_by_ticker = {e.get("ticker"): e for e in enriched}
+
     t0    = time.time()
     final = []
     for rec in (llm_result.get("recommendations") or []):
+        t_enriched = enriched_by_ticker.get(rec.get("ticker"))
+        if t_enriched:
+            raw_conf = int(rec.get("confidence", 65) or 65)
+            adj      = _congress_institutional_adjustment(t_enriched, rec.get("direction", ""))
+            if adj:
+                rec["confidence"] = max(0, min(100, raw_conf + adj))
+                print(f"[SmartEngine] {rec['ticker']} confidence {raw_conf}->{rec['confidence']} "
+                      f"(congress/institutional adjustment {adj:+d})")
         trade = _execute_smart_rec(rec, budget, user_id)
         if trade:
             final.append(trade)

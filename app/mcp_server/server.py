@@ -183,6 +183,10 @@ def get_price_history(ticker: str, days: int = 200, timespan: str = "day") -> li
         ticker:   e.g. 'NVDA'
         days:     calendar days back (default 200)
         timespan: 'minute' | 'hour' | 'day' | 'week' | 'month'
+                  'month' is served by Polygon (real monthly aggregates,
+                  not a daily-bar substitute) — UW has no monthly candle
+                  at any tested granularity. Everything else is UW-first
+                  with a Polygon fallback.
     """
     from_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
     to_date   = datetime.now().strftime("%Y-%m-%d")

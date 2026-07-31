@@ -20,6 +20,25 @@ def get_bars(ticker, multiplier=1, timespan="day", from_date=None, to_date=None,
     bug intraday_entry.py found and worked around by calling get_ohlc()
     directly instead of going through this wrapper.
     """
+    if timespan == "month":
+        # UW has no monthly candle under any tested format (1mo/1M/1month
+        # all confirmed 422) — go straight to Polygon, which supports real
+        # month aggregates natively via get_aggs(). Previously this fell
+        # into the "day" branch below, which never raises, so the
+        # exception-triggered Polygon fallback never fired either — the
+        # caller silently got daily bars back mislabeled as monthly, with
+        # no signal anything was wrong. Polygon genuinely has this data
+        # (verified live), so this is a real fix, not a fallback.
+        #
+        # Polygon's SDK truncates month-bucketed results when limit is
+        # small (confirmed live: limit=20 over a range with 3 real monthly
+        # bars returned only 1; limit=50 returned all 3, deterministically
+        # reproduced 3/3 runs) — a real quirk of that endpoint, not a
+        # transient flake. Floor the limit so a caller passing a small
+        # value (sized for daily granularity) doesn't silently lose months.
+        from app.market_data.polygon_client import get_bars as _pg
+        return _pg(ticker, multiplier, timespan, from_date, to_date, limit=max(limit, 60))
+
     try:
         from app.options_flow.unusual_whales import get_ohlc
         if timespan == "minute":
@@ -29,11 +48,10 @@ def get_bars(ticker, multiplier=1, timespan="day", from_date=None, to_date=None,
         elif timespan == "week":
             candle_size = "1w"   # was wrongly "1d" — week never actually meant daily
         else:
-            # day (and month — UW has no real candle for that at all,
-            # see REMAINING_ITEMS.md). Multiplier has no real meaning
-            # here (UW rejects e.g. "2d"), so it's intentionally not
-            # applied — but flag it if a caller ever asks, since that
-            # combination is silently unsupported by the real API.
+            # day. Multiplier has no real meaning here (UW rejects e.g.
+            # "2d"), so it's intentionally not applied — but flag it if a
+            # caller ever asks, since that combination is silently
+            # unsupported by the real API.
             if multiplier != 1:
                 print(f"[UW] get_bars {ticker}: multiplier={multiplier} has no effect "
                       f"for timespan='{timespan}' — UW only supports single-unit day/week candles")

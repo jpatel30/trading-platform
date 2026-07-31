@@ -215,6 +215,22 @@ def _uw_price_for_strike(
             return round(bid, 2), round(ask, 2), iv, "UW"
         if ask > 0.05:
             return round(ask * 0.85, 2), round(ask, 2), iv, "UW"
+        # A deep OTM/near-expiry contract quoting bid=0/ask=0.01 (or
+        # similar) is real, live UW data at the minimum tick - not missing
+        # data. Root-caused live: SPY iron condor wings with genuine
+        # bid=0/ask=0.01 quotes, and far-dated/thin-underlying legs
+        # (NFLX/CMG scanned within minutes of market open, HPE/NKE scanned
+        # weeks before expiry) all failed the >0.05 floor above and fell to
+        # a synthetic BSM estimate despite the real contract being right
+        # there in the chain - confirmed by re-querying the exact same
+        # ticker/expiry/strike later, which returns a clean real quote.
+        # Only a genuine bid==0 AND ask==0 means no quote exists at all.
+        # Same insight already applied in mark_to_market.py's
+        # get_current_option_value() for its own separate matching logic
+        # (see its comment) - ported here so entry-time pricing doesn't
+        # discard real market data just because it's cheap.
+        if ask > 0 or bid > 0:
+            return round(max(bid, 0.01), 2), round(max(ask, 0.01), 2), iv, "UW"
 
     try:
         from py_vollib.black_scholes import black_scholes

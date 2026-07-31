@@ -11,8 +11,6 @@ Confirm/fix monitor_config table usage
 Decide on ChromaDB (remove container, or wire into real RAG)
 Delete or repurpose orphaned conviction.py
 Populate tracked_positions.daily_rec_id
-Fix MCP tool get_price_history(timespan="month") - no real UW equivalent
-Root-cause BSM_estimate legs on positions with a genuinely valid expiry
 Revisit paper-trading calibration assumptions once real data exists
 Build real Robinhood/IBKR/Tastytrade connections
 Turn ad-hoc schema changes into versioned migrations
@@ -38,11 +36,7 @@ Descriptions
 
 6. tracked_positions.daily_rec_id Column exists in schema, not yet populated by the current fill- tracking flow (which matches by ticker + fill-price proximity instead). A more direct link; low priority, current approach already works and is tested.
 
-7. MCP tool get_price_history(timespan="month") has no real UW equivalent Found while auditing get_bars() callers (see git log) - the MCP tool's own docstring promises 'month' as a valid timespan, but UW's OHLC endpoint has no monthly candle under any tested format (1mo/1M/1month all 422). Falls back to daily bars mislabeled as monthly - same silently-wrong shape as the already-fixed week bug, but no direct UW substitute exists this time (would need real month-aggregation logic built from daily bars, or the docstring corrected to drop the false promise). Not fixed here - out of scope for the get_bars() multiplier fix.
-
-8. BSM_estimate legs on positions with a genuinely VALID expiry Found while auditing all open auto_paper positions for the expiry-selection bug (see git log) - 5 of the 7 affected positions have a real, correctly-listed expiry (confirmed against get_expiry_breakdown), yet some/all legs still priced via BSM_estimate rather than real UW quotes. Not the same bug (expiry validation now catches the invalid-expiry case) - this is a separate, still-open question about why a specific strike at a valid expiry sometimes has no matching UW contract (illiquid/unlisted strike, stale chain fetch, or something else). Not yet root-caused.
-
-9. Revisit paper-trading calibration assumptions All of these resolve the same way - once the reliability fixes above land and a real week or two of trading-hours data accumulates, not before:
+7. Revisit paper-trading calibration assumptions All of these resolve the same way - once the reliability fixes above land and a real week or two of trading-hours data accumulates, not before:
 
 Phase 4 grid sizing (windows/budgets) - untuned, watch job_run_log yield over time
 STOCK_MIN_FUNDAMENTAL=60 - rejected every stock candidate on the one (after-hours) night tested; top priority to revisit ONLY if it recurs on a real trading day
@@ -55,25 +49,25 @@ Whether paper trades actually use the discussed 40%/50% options / 15%/25% stock 
 The -355.6% loss from Phase 5's first real run - very likely a BSM-estimate-vs-live-price artifact (pre-market synthetic entry price vs a real close price), mechanism proven correct, magnitude needs re-checking on a real market-hours run
 job_run_log has no user_id column - fine now that paper-trade jobs run once against the admin account (not looped per user), but any OTHER job that still loops over active users (after_hours_batch, velocity_snapshot, nightly_learning, weekly_strategy_review) produces indistinguishable rows per user if it ever needs the same kind of forensic reconstruction paper-trading's scheduler investigation required
 
-10. Real broker connections Robinhood/IBKR/Tastytrade - factory.py's abstraction and SnapTrade plumbing are ready; the actual OAuth/positions/orders code for each isn't written yet.
+8. Real broker connections Robinhood/IBKR/Tastytrade - factory.py's abstraction and SnapTrade plumbing are ready; the actual OAuth/positions/orders code for each isn't written yet.
 
-11. Versioned migrations Schema changes this session (fill-tracking columns, excluded_from_stats, users.is_admin, the strategy_recommendations rename, all the paper- trading tables) only exist as commands run directly against the live DB, not as files in db/migrations/.
+9. Versioned migrations Schema changes this session (fill-tracking columns, excluded_from_stats, users.is_admin, the strategy_recommendations rename, all the paper- trading tables) only exist as commands run directly against the live DB, not as files in db/migrations/.
 
-12. requirements.txt typo black>=24.0% should be black>=24.0. Flagged previously, never verified fixed.
+10. requirements.txt typo black>=24.0% should be black>=24.0. Flagged previously, never verified fixed.
 
-13. Open-source readiness sweep .env.example, public README setup video, a hardcoded-user-ID check across the codebase.
+11. Open-source readiness sweep .env.example, public README setup video, a hardcoded-user-ID check across the codebase.
 
-14. Architecture diagrams Two diagrams (backend + frontend), suitable for a public write-up. Deliberately deferred until the architecture stops moving quarter to quarter.
+12. Architecture diagrams Two diagrams (backend + frontend), suitable for a public write-up. Deliberately deferred until the architecture stops moving quarter to quarter.
 
-15. Interview talking points No dependencies, can happen anytime.
+13. Interview talking points No dependencies, can happen anytime.
 
-16. WebSocket real-time updates
+14. WebSocket real-time updates
 
-17. Mobile push notifications PWA service worker.
+15. Mobile push notifications PWA service worker.
 
-18. Public invite page
+16. Public invite page
 
-19. smart_engine.py's LLM confidence output barely varies with input signal strength Found while verifying the new congress-trades/institutional-ownership/market-tide/econ-calendar wiring into _enrich_ticker/_compress_ticker/_build_llm_prompt (now live and confirmed present in real prompts - see git log). Ran the local Qwen model (temperature=0.05) on the same NVDA candidate with the new fields absent vs. present with extreme synthetic values (0buy/8sell vs 9buy/0sell congress, 5/100 vs 99/100 institutional ownership) - confidence stayed pinned at 72 in every run. Broadened the test to swap flow_score/dp_score/sweeps/RSI/trend/OI/IV-expansion between extreme-bullish and neutral/conflicted values (unrelated to this task's new fields) - confidence stayed at 72 there too, so this is a pre-existing characteristic of the model/prompt config, not something introduced by or specific to the new wiring. The reasoning text does visibly change to reference the new fields (e.g. "despite bullish market sentiment"), so the data isn't silently ignored - it just doesn't move the numeric confidence that becomes conviction_score. Worth a real fix (higher temperature, explicit confidence-calibration instructions, or a deterministic adjustment layered on top of the LLM number) but out of scope for the data-wiring task that surfaced it.
+17. smart_engine.py's LLM confidence output barely varies with input signal strength Found while verifying the new congress-trades/institutional-ownership/market-tide/econ-calendar wiring into _enrich_ticker/_compress_ticker/_build_llm_prompt (now live and confirmed present in real prompts - see git log). Ran the local Qwen model (temperature=0.05) on the same NVDA candidate with the new fields absent vs. present with extreme synthetic values (0buy/8sell vs 9buy/0sell congress, 5/100 vs 99/100 institutional ownership) - confidence stayed pinned at 72 in every run. Broadened the test to swap flow_score/dp_score/sweeps/RSI/trend/OI/IV-expansion between extreme-bullish and neutral/conflicted values (unrelated to this task's new fields) - confidence stayed at 72 there too, so this is a pre-existing characteristic of the model/prompt config, not something introduced by or specific to the new wiring. The reasoning text does visibly change to reference the new fields (e.g. "despite bullish market sentiment"), so the data isn't silently ignored - it just doesn't move the numeric confidence that becomes conviction_score. Worth a real fix (higher temperature, explicit confidence-calibration instructions, or a deterministic adjustment layered on top of the LLM number) but out of scope for the data-wiring task that surfaced it.
 
 Completed (see git log for full commit-level detail)
 Multi-user MCP access - per-request identity resolution, HTTP transport, auto-minted customer keys, StockBros key-reveal screen

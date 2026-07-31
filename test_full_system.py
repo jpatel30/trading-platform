@@ -94,44 +94,8 @@ for horizon in ['3m', '6m', '1yr']:
     except Exception as e:
         print(f"  {horizon:4} {stock_ticker} → ERROR: {e}")
 
-# ── Step 6: Conviction scoring test ──────────────────────────────────────────
-print(f"\n[{elapsed()}s] STEP 5: Conviction scoring with new UW signals")
-try:
-    from app.recommendations.conviction import calculate_conviction
-    from app.rag.context_builder import _build_price_context, _build_vix_context, _build_iv_context
-
-    price_ctx = _build_price_context(test_ticker)
-    vix_ctx   = _build_vix_context()
-    iv_ctx    = _build_iv_context(test_ticker, vix=vix_ctx.get('current', 17))
-
-    signal_data = {
-        "ticker":     test_ticker,
-        "flow_score": picks[0].get('flow_score', 50) if picks else 50,
-        "dp_score":   picks[0].get('dp_score', 50) if picks else 50,
-    }
-
-    direction = picks[0].get('direction', 'BEARISH') if picks else 'BEARISH'
-
-    conv = calculate_conviction(
-        price_ctx   = price_ctx,
-        vix_ctx     = vix_ctx,
-        iv_ctx      = iv_ctx,
-        ta_data     = {"signal": "NEUTRAL", "trend": "DOWNTREND", "rsi_14": 47, "macd_signal": "BEARISH"},
-        signal_data = signal_data,
-        direction   = direction,
-        llm_confidence = 65,
-    )
-    print(f"  {test_ticker} {direction}: conviction={conv['conviction_score']}/100 tier={conv['conviction_tier']}")
-    print(f"  Passes threshold (70): {conv['passes_threshold']}")
-    if signal_data.get('net_premium_direction'):
-        print(f"  Net premium: {signal_data['net_premium_direction']} | "
-              f"Greek flow: {signal_data.get('greek_flow_direction','N/A')} | "
-              f"Institutional: {signal_data.get('institutional_score','N/A')}/100")
-except Exception as e:
-    print(f"  ❌ Conviction scoring: {e}")
-
-# ── Step 7: DB store test ─────────────────────────────────────────────────────
-print(f"\n[{elapsed()}s] STEP 6: DB store test (P1 fix verification)")
+# ── Step 6: DB store test ─────────────────────────────────────────────────────
+print(f"\n[{elapsed()}s] STEP 5: DB store test (P1 fix verification)")
 try:
     from app.recommendations.daily_engine import _upsert_recommendation
     rec_id = _upsert_recommendation(user_id, {

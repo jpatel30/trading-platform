@@ -188,10 +188,12 @@ def confirm_execution(
                         check_interval_min  = 15,
                         is_active           = TRUE,
                         trading_window_days = :window,
-                        budget              = :budget
+                        budget              = :budget,
+                        daily_rec_id        = COALESCE(daily_rec_id, :rec_id)
                     WHERE id = :id
                 """), {"id": existing.id, "qty": qty, "source": source,
-                       "window": trading_window_days, "budget": budget})
+                       "window": trading_window_days, "budget": budget,
+                       "rec_id": recommendation_id})
                 tracked_position_id = str(existing.id)
                 print(f"[Tracker] Updated tracked_position for {symbol}")
             else:
@@ -199,10 +201,12 @@ def confirm_execution(
                     INSERT INTO tracked_positions (
                         user_id, symbol, source, entry_date,
                         entry_price, qty, target_pct, stop_pct,
-                        check_interval_min, trading_window_days, budget
+                        check_interval_min, trading_window_days, budget,
+                        daily_rec_id
                     ) VALUES (
                         :uid, :sym, :source, CURRENT_DATE,
-                        :entry, :qty, :tgt, :stp, 15, :window, :budget
+                        :entry, :qty, :tgt, :stp, 15, :window, :budget,
+                        :rec_id
                     )
                     RETURNING id
                 """), {
@@ -210,6 +214,7 @@ def confirm_execution(
                     "entry": entry_price, "qty": qty,
                     "tgt": real_target_pct, "stp": real_stop_pct,
                     "window": trading_window_days, "budget": budget,
+                    "rec_id": recommendation_id,
                 }).fetchone()
                 tracked_position_id = str(new_row.id) if new_row else None
                 print(f"[Tracker] Created tracked_position for {symbol}")

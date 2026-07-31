@@ -7,14 +7,10 @@ Last updated: July 2026. Full technical narrative (root causes, exact fixes, lin
 Priority Order (Remaining)
 Deploy somewhere real (Cloudflare tunnel / Railway)
 Point the hosted MCP server at that deployment
-Confirm/fix monitor_config table usage
 Decide on ChromaDB (remove container, or wire into real RAG)
-Delete or repurpose orphaned conviction.py
-Populate tracked_positions.daily_rec_id
 Revisit paper-trading calibration assumptions once real data exists
 Build real Robinhood/IBKR/Tastytrade connections
 Turn ad-hoc schema changes into versioned migrations
-Fix the requirements.txt typo
 Open-source readiness sweep
 Build the two architecture diagrams
 Prep interview talking points
@@ -22,21 +18,16 @@ Add WebSocket real-time dashboard updates
 Add mobile push notifications
 Build a public invite page
 smart_engine.py's LLM confidence output barely varies with input signal strength
+monitor_config has 3 genuinely dead columns and 4 more that are write-only
 Descriptions
 
 1. Cloud deployment Cloudflare tunnel or Railway.app. Directly unblocks #2 - multi-tenant MCP access is fully built and tested but has nowhere to actually run for a real customer yet.
 
 2. Hosted MCP server MCP_TRANSPORT=http + ApiKeyTokenVerifier exist and are wired in, purely blocked on #1.
 
-3. monitor_config table Schema exists with plausible columns (is_active, check_interval, total_alerts_fired) but usage by position_monitor.py not yet confirmed either way.
+3. ChromaDB Running in docker-compose.yml, zero imports anywhere in the codebase. Either remove the container, or wire it into real RAG instead of context_builder.py's current direct-API-call approach.
 
-4. ChromaDB Running in docker-compose.yml, zero imports anywhere in the codebase. Either remove the container, or wire it into real RAG instead of context_builder.py's current direct-API-call approach.
-
-5. conviction.py cleanup Orphaned - its only caller (the old daily_engine.py path) was retired this session. No remaining importers. Delete it or repurpose it.
-
-6. tracked_positions.daily_rec_id Column exists in schema, not yet populated by the current fill- tracking flow (which matches by ticker + fill-price proximity instead). A more direct link; low priority, current approach already works and is tested.
-
-7. Revisit paper-trading calibration assumptions All of these resolve the same way - once the reliability fixes above land and a real week or two of trading-hours data accumulates, not before:
+4. Revisit paper-trading calibration assumptions All of these resolve the same way - once the reliability fixes above land and a real week or two of trading-hours data accumulates, not before:
 
 Phase 4 grid sizing (windows/budgets) - untuned, watch job_run_log yield over time
 STOCK_MIN_FUNDAMENTAL=60 - rejected every stock candidate on the one (after-hours) night tested; top priority to revisit ONLY if it recurs on a real trading day
@@ -49,25 +40,25 @@ Whether paper trades actually use the discussed 40%/50% options / 15%/25% stock 
 The -355.6% loss from Phase 5's first real run - very likely a BSM-estimate-vs-live-price artifact (pre-market synthetic entry price vs a real close price), mechanism proven correct, magnitude needs re-checking on a real market-hours run
 job_run_log has no user_id column - fine now that paper-trade jobs run once against the admin account (not looped per user), but any OTHER job that still loops over active users (after_hours_batch, velocity_snapshot, nightly_learning, weekly_strategy_review) produces indistinguishable rows per user if it ever needs the same kind of forensic reconstruction paper-trading's scheduler investigation required
 
-8. Real broker connections Robinhood/IBKR/Tastytrade - factory.py's abstraction and SnapTrade plumbing are ready; the actual OAuth/positions/orders code for each isn't written yet.
+5. Real broker connections Robinhood/IBKR/Tastytrade - factory.py's abstraction and SnapTrade plumbing are ready; the actual OAuth/positions/orders code for each isn't written yet.
 
-9. Versioned migrations Schema changes this session (fill-tracking columns, excluded_from_stats, users.is_admin, the strategy_recommendations rename, all the paper- trading tables) only exist as commands run directly against the live DB, not as files in db/migrations/.
+6. Versioned migrations Schema changes this session (fill-tracking columns, excluded_from_stats, users.is_admin, the strategy_recommendations rename, all the paper- trading tables) only exist as commands run directly against the live DB, not as files in db/migrations/.
 
-10. requirements.txt typo black>=24.0% should be black>=24.0. Flagged previously, never verified fixed.
+7. Open-source readiness sweep .env.example, public README setup video, a hardcoded-user-ID check across the codebase.
 
-11. Open-source readiness sweep .env.example, public README setup video, a hardcoded-user-ID check across the codebase.
+8. Architecture diagrams Two diagrams (backend + frontend), suitable for a public write-up. Deliberately deferred until the architecture stops moving quarter to quarter.
 
-12. Architecture diagrams Two diagrams (backend + frontend), suitable for a public write-up. Deliberately deferred until the architecture stops moving quarter to quarter.
+9. Interview talking points No dependencies, can happen anytime.
 
-13. Interview talking points No dependencies, can happen anytime.
+10. WebSocket real-time updates
 
-14. WebSocket real-time updates
+11. Mobile push notifications PWA service worker.
 
-15. Mobile push notifications PWA service worker.
+12. Public invite page
 
-16. Public invite page
+13. smart_engine.py's LLM confidence output barely varies with input signal strength Found while verifying the new congress-trades/institutional-ownership/market-tide/econ-calendar wiring into _enrich_ticker/_compress_ticker/_build_llm_prompt (now live and confirmed present in real prompts - see git log). Ran the local Qwen model (temperature=0.05) on the same NVDA candidate with the new fields absent vs. present with extreme synthetic values (0buy/8sell vs 9buy/0sell congress, 5/100 vs 99/100 institutional ownership) - confidence stayed pinned at 72 in every run. Broadened the test to swap flow_score/dp_score/sweeps/RSI/trend/OI/IV-expansion between extreme-bullish and neutral/conflicted values (unrelated to this task's new fields) - confidence stayed at 72 there too, so this is a pre-existing characteristic of the model/prompt config, not something introduced by or specific to the new wiring. The reasoning text does visibly change to reference the new fields (e.g. "despite bullish market sentiment"), so the data isn't silently ignored - it just doesn't move the numeric confidence that becomes conviction_score. Worth a real fix (higher temperature, explicit confidence-calibration instructions, or a deterministic adjustment layered on top of the LLM number) but out of scope for the data-wiring task that surfaced it.
 
-17. smart_engine.py's LLM confidence output barely varies with input signal strength Found while verifying the new congress-trades/institutional-ownership/market-tide/econ-calendar wiring into _enrich_ticker/_compress_ticker/_build_llm_prompt (now live and confirmed present in real prompts - see git log). Ran the local Qwen model (temperature=0.05) on the same NVDA candidate with the new fields absent vs. present with extreme synthetic values (0buy/8sell vs 9buy/0sell congress, 5/100 vs 99/100 institutional ownership) - confidence stayed pinned at 72 in every run. Broadened the test to swap flow_score/dp_score/sweeps/RSI/trend/OI/IV-expansion between extreme-bullish and neutral/conflicted values (unrelated to this task's new fields) - confidence stayed at 72 there too, so this is a pre-existing characteristic of the model/prompt config, not something introduced by or specific to the new wiring. The reasoning text does visibly change to reference the new fields (e.g. "despite bullish market sentiment"), so the data isn't silently ignored - it just doesn't move the numeric confidence that becomes conviction_score. Worth a real fix (higher temperature, explicit confidence-calibration instructions, or a deterministic adjustment layered on top of the LLM number) but out of scope for the data-wiring task that surfaced it.
+14. monitor_config has 3 genuinely dead columns and 4 more that are write-only Confirmed by reading every reference in position_monitor.py: alerts_muted/muted_until are real (drive actual mute/unmute behavior). is_active/last_check_at/total_checks/total_alerts_fired are written via _save_config() but nothing ever reads them back from the DB - PositionMonitor.status() reports in-memory instance state instead, so this data becomes invisible on any process restart. check_interval_seconds/alert_cooldown_minutes have zero references anywhere in the codebase. last_error has a column for exactly this purpose but the code tracks it in-memory only and never actually passes it to _save_config(), so it's permanently NULL. Not fixed here - this was a "confirm usage" ask, not a cleanup ask; low priority since the 2 real columns work fine on their own.
 
 Completed (see git log for full commit-level detail)
 Multi-user MCP access - per-request identity resolution, HTTP transport, auto-minted customer keys, StockBros key-reveal screen

@@ -381,18 +381,29 @@ async def startup_event():
             except Exception as e:
                 print(f"[Scheduler] Velocity snapshot failed: {e}")
 
-        def _run_after_hours_batch():
+        def _run_search_agent(trigger: str):
+            """
+            MULTIAGENT_MIGRATION.md Phase A, item 2 — the same full
+            computation (universe resolution + after-hours-style daily
+            snapshot + quick_scan convergence scoring) fires at two
+            daily slots: post-close (was the only run before this) and
+            pre-open (new — catches overnight movement before the
+            trading day's first paper-trade-open window at 6:40am PT).
+            """
             try:
                 from sqlalchemy import text
                 from app.db.session import get_session
-                from app.signals.after_hours_batch import run_after_hours_batch
+                from app.agents.search_agent import run_search_agent
                 with get_session() as s:
                     users = s.execute(text("SELECT id FROM users WHERE is_active=TRUE")).fetchall()
                 for u in users:
-                    result = run_after_hours_batch(str(u.id))
-                    print(f"[Scheduler] After-hours batch: {result}")
+                    result = run_search_agent(str(u.id), trigger=trigger)
+                    print(f"[Scheduler] Search agent ({trigger}): "
+                          f"{result['universe_size']} tickers, "
+                          f"batch={result['batch'].get('status')}, "
+                          f"{len(result['candidates'])} candidates")
             except Exception as e:
-                print(f"[Scheduler] After-hours batch failed: {e}")
+                print(f"[Scheduler] Search agent ({trigger}) failed: {e}")
 
         def _run_nightly_learning():
             try:
@@ -434,9 +445,17 @@ async def startup_event():
             id="velocity_snapshot", replace_existing=True,
         )
         scheduler.add_job(
-            _run_after_hours_batch,
+            lambda: _run_search_agent("post_close"),
             CronTrigger(day_of_week="mon-fri", hour=16, minute=15, timezone=et),
-            id="after_hours_batch", replace_existing=True,
+            id="search_agent_post_close", replace_existing=True,
+        )
+        scheduler.add_job(
+            lambda: _run_search_agent("pre_open"),
+            # 6am PT, ~40 min before the first paper-trade-open window
+            # (6:40am PT) - catches overnight movement before the
+            # trading day's first pick gets made.
+            CronTrigger(day_of_week="mon-fri", hour=6, minute=0, timezone=pt),
+            id="search_agent_pre_open", replace_existing=True,
         )
         scheduler.add_job(
             _run_nightly_learning,

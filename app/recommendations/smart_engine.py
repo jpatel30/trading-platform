@@ -734,7 +734,8 @@ def run_smart_recommendations(
 ) -> dict:
     from app.scanner.quick_scan import quick_scan
     from app.scanner.universe import get_scan_universe
-    from app.rag.context_builder import _build_vix_context, _build_global_news
+    from app.rag.context_builder import _build_vix_context
+    from app.agents.news_agent import build_global_news as _build_global_news
     from app.options_flow.unusual_whales import (
         get_earnings_premarket, get_earnings_afterhours,
         get_flow_alerts, get_dark_pool_recent,

@@ -495,16 +495,28 @@ def get_congress_trades(ticker: str | None = None, limit: int = 20) -> list[dict
     """
     Recent congressional stock trades (senators + representatives).
     Fields: name, ticker, transaction_date, txn_type (buy/sell),
-            amounts, member_type, notes
+            amounts, member_type, notes, security_type
 
     Congressional buy signals have historically preceded major moves.
+
+    MULTIAGENT_MIGRATION.md item 3: verified live against UW directly
+    (not assumed) that /api/politician-portfolios/recent-trades
+    (hyphenated) IS a real, distinct enterprise-only endpoint on this
+    account — confirmed via a live 422 with an explicit "Missing access
+    ... enterprise only endpoint" message, not a guess. The endpoint
+    below is a DIFFERENT one (underscored path), already accessible on
+    this plan, that happens to return the same underlying data as the
+    old /api/congress/recent-trades this function used to call - same
+    first record content, one extra field (security_type), and 500
+    records per call instead of 100 (confirmed live). No enterprise
+    upgrade needed for this improvement.
     """
     key = f"congress:{ticker or 'all'}"
     cached = _cache_get(key)
     if cached:
         return cached
 
-    data = _get("/api/congress/recent-trades")
+    data = _get("/api/politician-portfolios/recent_trades")
     if isinstance(data, list):
         if ticker:
             data = [d for d in data if (d.get("ticker") or "").upper() == ticker.upper()]

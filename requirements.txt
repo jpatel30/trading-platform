@@ -33,6 +33,11 @@ ta>=0.11.0
 polygon-api-client>=1.13
 yfinance>=0.2.40        # Free fallback for basic quotes
 
+# Multi-agent migration (MULTIAGENT_MIGRATION.md)
+chromadb>=1.5             # Retrieval Library corpus (filing_embed.py)
+beautifulsoup4>=4.11.1     # SEC EDGAR filing HTML parsing (already a
+                           # transitive dep via yfinance, now used directly)
+
 # Dev tools
 pytest>=8.0
 pytest-asyncio>=0.23

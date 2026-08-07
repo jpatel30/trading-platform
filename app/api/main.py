@@ -405,6 +405,26 @@ async def startup_event():
             except Exception as e:
                 print(f"[Scheduler] Search agent ({trigger}) failed: {e}")
 
+        def _run_news_agent(trigger: str):
+            """
+            MULTIAGENT_MIGRATION.md item 6 — same two-slot cadence as
+            the Search Agent above. Unlike Search Agent, News Agent has
+            no per-user watchlist dependency (global market news +
+            macro calendar are the same for everyone), so this runs
+            once per fire, not looped over active users - same
+            single-run principle already established for paper-trading
+            jobs elsewhere in this scheduler, for the same reason
+            (nothing here is user-specific).
+            """
+            try:
+                from app.agents.news_agent import run_news_agent
+                result = run_news_agent(trigger=trigger)
+                print(f"[Scheduler] News agent ({trigger}): "
+                      f"{len(result['news'])} headlines, "
+                      f"{result['macro'].get('high_impact_count', 0)} high-impact events")
+            except Exception as e:
+                print(f"[Scheduler] News agent ({trigger}) failed: {e}")
+
         def _run_nightly_learning():
             try:
                 from sqlalchemy import text
@@ -456,6 +476,16 @@ async def startup_event():
             # trading day's first pick gets made.
             CronTrigger(day_of_week="mon-fri", hour=6, minute=0, timezone=pt),
             id="search_agent_pre_open", replace_existing=True,
+        )
+        scheduler.add_job(
+            lambda: _run_news_agent("post_close"),
+            CronTrigger(day_of_week="mon-fri", hour=16, minute=15, timezone=et),
+            id="news_agent_post_close", replace_existing=True,
+        )
+        scheduler.add_job(
+            lambda: _run_news_agent("pre_open"),
+            CronTrigger(day_of_week="mon-fri", hour=6, minute=0, timezone=pt),
+            id="news_agent_pre_open", replace_existing=True,
         )
         scheduler.add_job(
             _run_nightly_learning,

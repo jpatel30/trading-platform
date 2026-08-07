@@ -218,7 +218,8 @@ def rescan_with_validation(
         get_earnings_premarket, get_earnings_afterhours,
         get_flow_alerts, get_dark_pool_recent, get_congress_trades,
     )
-    from app.rag.context_builder import _build_vix_context, _build_global_news
+    from app.rag.context_builder import _build_vix_context
+    from app.agents.news_agent import build_global_news as _build_global_news
     from app.signals.market_regime import get_full_market_regime
     from app.scanner.quick_scan import quick_scan
     from app.utils.scan_status import set_scan_status

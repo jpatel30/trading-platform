@@ -105,18 +105,15 @@ def get_scan_universe(
         except Exception as e:
             print(f"[Scanner] Watchlist unavailable: {e}")
 
-    # ── Priority 2: Current Webull positions ──────────────────────────────────
+    # ── Priority 2: Currently-held tracked positions ──────────────────────────
+    # No broker left to poll (MULTIAGENT_MIGRATION.md items 27-31) -
+    # tracked_positions (confirm_execution) is the only source of "what
+    # do I currently hold" now.
     if include_positions and user_id:
         try:
-            from app.broker.webull_connector import WebullConnector
-            from app.broker.base import BrokerNotConnectedError
-            wb  = WebullConnector(user_id)
-            pos = wb.get_positions()
-            pos_tickers = [
-                p["symbol"].split()[0]   # handle "NVDA 230120C..." options
-                for p in pos
-                if p.get("instrument_type") == "STOCK"
-            ]
+            from app.learning.prediction_tracker import get_positions_from_tracked
+            pos = get_positions_from_tracked(user_id)
+            pos_tickers = [p["symbol"] for p in pos if p.get("instrument_type") == "STOCK"]
             new = [t for t in pos_tickers if t not in tickers]
             tickers.extend(new)
             print(f"[Scanner] Positions: {len(pos_tickers)} tickers ({len(new)} new)")

@@ -40,13 +40,12 @@ def get_portfolio_additions(
         candidates: list of positions worth adding to with score + reasoning
         not_ready:  positions with good P&L but failing other criteria
     """
-    from app.broker.webull_connector import WebullConnector
+    from app.learning.prediction_tracker import get_positions_from_tracked
     from app.market_data.uw_market_data import get_bars
     from app.technical_analysis.engine import get_technical_profile
     from app.recommendations.fundamentals import get_dp_accumulation_score
 
-    wb        = WebullConnector(user_id)
-    positions = wb.get_positions()
+    positions = get_positions_from_tracked(user_id)
 
     if not positions:
         return {"candidates": [], "not_ready": [], "message": "No positions found"}

@@ -20,6 +20,75 @@ from datetime import datetime, timedelta
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Broker removal (MULTIAGENT_MIGRATION.md items 27-31) — positions adapter
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# get_positions_from_tracked() reshapes open tracked_positions rows into
+# the exact same dict shape WebullConnector.get_positions() used to
+# return (symbol, instrument_type, qty, unit_cost, last_price, total_cost,
+# market_value, unrealized_profit_loss, unrealized_profit_loss_rate) - so
+# every consumer built against that shape (app/broker/sell_signals.py,
+# active_bets.py, portfolio_additions.py, position_monitor.py) keeps
+# working with no changes to ITS OWN logic, just backed by real confirmed
+# fills (tracked_positions) instead of a live broker feed. Current price
+# comes from the existing non-broker price sources
+# (market_price.get_market_price - yfinance/Polygon, no broker, no extra
+# paid API usage), not a broker quote.
+#
+# instrument_type isn't stored directly on tracked_positions (confirm_
+# execution() never set it) - inferred from whether the linked
+# daily_recommendations row has non-empty legs (options) or not (stock),
+# same signal check_fills() used to use for the same distinction before
+# item 29 removed it. The 100x options-contract multiplier applied below
+# matches confirm_execution()'s own total_cost convention exactly (see
+# its `total_cost = entry_price * qty * 100` line) - not a new number.
+
+def get_positions_from_tracked(user_id: str) -> list[dict]:
+    from sqlalchemy import text
+    from app.db.session import get_session
+    from app.market_data.market_price import get_market_price
+
+    with get_session() as s:
+        rows = s.execute(text("""
+            SELECT tp.symbol, tp.entry_price, tp.qty, tp.entry_date, tp.source,
+                   tp.target_pct, tp.stop_pct, dr.legs
+            FROM tracked_positions tp
+            LEFT JOIN daily_recommendations dr ON dr.id = tp.daily_rec_id
+            WHERE tp.user_id = :uid AND tp.is_active = TRUE
+        """), {"uid": user_id}).fetchall()
+
+    positions = []
+    for r in rows:
+        is_option  = bool(r.legs)
+        multiplier = 100 if is_option else 1
+        qty        = float(r.qty)
+        unit_cost  = float(r.entry_price)
+
+        try:
+            quote      = get_market_price(r.symbol)
+            last_price = float(quote.get("price") or unit_cost)
+        except Exception:
+            last_price = unit_cost
+
+        total_cost   = unit_cost  * qty * multiplier
+        market_value = last_price * qty * multiplier
+        pnl          = market_value - total_cost
+        pnl_pct      = (pnl / total_cost) if total_cost else 0.0
+
+        positions.append({
+            "symbol": r.symbol, "instrument_type": "OPTION" if is_option else "STOCK",
+            "qty": qty, "unit_cost": unit_cost, "last_price": last_price,
+            "total_cost": round(total_cost, 2), "market_value": round(market_value, 2),
+            "unrealized_profit_loss": round(pnl, 2),
+            "unrealized_profit_loss_rate": round(pnl_pct, 4),
+            "source": r.source, "entry_date": str(r.entry_date),
+            "target_pct": float(r.target_pct) if r.target_pct is not None else None,
+            "stop_pct": float(r.stop_pct) if r.stop_pct is not None else None,
+        })
+    return positions
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Confirm Execution (user bought the recommended trade)
 # ─────────────────────────────────────────────────────────────────────────────
 

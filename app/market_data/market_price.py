@@ -40,36 +40,14 @@ def get_market_price(ticker: str, user_id: str | None = None) -> dict:
 
     Args:
         ticker:  stock ticker e.g. 'NVDA'
-        user_id: optional — if provided, checks Webull positions first
+        user_id: unused — kept for call-site compatibility (MULTIAGENT_
+                 MIGRATION.md items 27-31 removed the broker-position
+                 price source this used to enable)
     """
     ticker  = ticker.upper()
     session = _is_market_hours()
 
-    # ── Source 1: Webull positions (if user owns this ticker) ────────────────
-    if user_id:
-        try:
-            from app.broker.webull_connector import WebullConnector
-            from app.broker.base import BrokerNotConnectedError
-            wb = WebullConnector(user_id)
-            positions = wb.get_positions()
-            for p in positions:
-                if p.get("symbol", "").upper() == ticker and p.get("instrument_type") == "STOCK":
-                    price = float(p["last_price"])
-                    cost  = float(p["unit_cost"])
-                    return {
-                        "ticker": ticker,
-                        "price":  price,
-                        "session": session,
-                        "source": "webull_position",
-                        "change": round(price - cost, 2),
-                        "change_pct": round((price - cost) / cost * 100, 2) if cost else None,
-                        "timestamp": datetime.now().isoformat(),
-                        "note": "From your Webull position (live price)"
-                    }
-        except Exception:
-            pass
-
-    # ── Source 2: yfinance — includes pre/post market ─────────────────────────
+    # ── Source 1: yfinance — includes pre/post market ─────────────────────────
     try:
         import yfinance as yf
         t = yf.Ticker(ticker)
@@ -112,7 +90,7 @@ def get_market_price(ticker: str, user_id: str | None = None) -> dict:
     except Exception as e:
         pass
 
-    # ── Source 3: Polygon.io previous close ──────────────────────────────────
+    # ── Source 2: Polygon.io previous close ──────────────────────────────────
     try:
         from app.market_data.polygon_client import get_previous_close
         q = get_previous_close(ticker)

@@ -2,15 +2,16 @@
 C13 Position Monitor v2 (W13).
 
 Two-tier monitoring:
-    Recommended positions  → every 15 min + LLM enrichment on first detection
+    Recommended positions  → every 15 min
     Manual/unknown         → every 30 min + rule-based only
-    New position detected  → immediate LLM: "not from our engine, here's analysis"
 
 Flow:
     Every 15 min (recommended) / 30 min (manual):
-        Fetch live positions from Webull
-        Cache in portfolio_cache (SWR pattern for other tools)
-        Detect NEW positions not previously seen → LLM analysis + alert
+        Load open positions from tracked_positions (MULTIAGENT_MIGRATION.md
+        items 27-31 — no broker left to poll; tracked_positions/
+        confirm_execution is the only way a position gets tracked at all
+        now, so there's no "surprise" broker position to reconcile
+        against it the way there used to be)
         Evaluate each position:
             - Recommended: compare vs target/stop from recommendation engine
             - Manual: compare vs rule-based thresholds
@@ -33,52 +34,6 @@ def get_monitor(user_id: str) -> "PositionMonitor":
     if user_id not in _monitors:
         _monitors[user_id] = PositionMonitor(user_id)
     return _monitors[user_id]
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Portfolio Cache
-# ─────────────────────────────────────────────────────────────────────────────
-
-def cache_portfolio(user_id: str, positions: list, balances: dict | None = None) -> None:
-    """Cache positions in DB for instant reads by other tools."""
-    try:
-        from sqlalchemy import text
-        from app.db.session import get_session
-        with get_session() as s:
-            s.execute(text("""
-                INSERT INTO portfolio_cache (user_id, positions, balances, updated_at)
-                VALUES (:uid, :pos, :bal, now())
-                ON CONFLICT (user_id)
-                DO UPDATE SET positions=EXCLUDED.positions,
-                              balances=EXCLUDED.balances,
-                              updated_at=now()
-            """), {"uid": user_id, "pos": json.dumps(positions),
-                   "bal": json.dumps(balances) if balances else None})
-    except Exception as e:
-        print(f"[Monitor] Cache write failed: {e}")
-
-
-def get_cached_portfolio(user_id: str) -> dict | None:
-    """Get cached positions. Returns None if not found."""
-    try:
-        from sqlalchemy import text
-        from app.db.session import get_session
-        with get_session() as s:
-            row = s.execute(text(
-                "SELECT positions, balances, updated_at FROM portfolio_cache WHERE user_id=:uid"
-            ), {"uid": user_id}).fetchone()
-            if not row:
-                return None
-            age = (datetime.now(row.updated_at.tzinfo) - row.updated_at).seconds // 60
-            return {
-                "positions":   json.loads(row.positions),
-                "balances":    json.loads(row.balances) if row.balances else None,
-                "cached_at":   row.updated_at.isoformat(),
-                "age_minutes": age,
-                "is_stale":    age > 35,
-            }
-    except Exception:
-        return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -409,27 +364,6 @@ def dismiss_all_alerts(user_id: str) -> int:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# LLM Enrichment (new positions only)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _llm_analyze_new_position(symbol: str, pnl_pct: float, source: str) -> str:
-    """Quick LLM sentence for newly detected position."""
-    try:
-        from app.llm.service import _call_ollama
-        origin = "from our recommendation engine" if source == "recommendation" \
-                 else "NOT from our recommendation engine — manually opened"
-        r = _call_ollama(
-            prompt=f"{symbol} new position detected, {pnl_pct:+.1f}% P&L, {origin}. "
-                   f"One sentence: what should the trader know right now?",
-            system="Expert trader. One sentence only. Actionable.",
-            max_tokens=50,
-        )
-        return r.strip()
-    except Exception:
-        return ""
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Position Monitor
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -452,7 +386,6 @@ class PositionMonitor:
         self.last_error     = None
         self.total_checks   = 0
         self.alerts_fired   = 0
-        self._known_symbols: set[str] = set()   # tracks what we've seen before
 
     # ── Start / Stop ──────────────────────────────────────────────────────────
 
@@ -534,38 +467,19 @@ class PositionMonitor:
 
     def _check_positions(self, check_manual: bool = True) -> int:
         """
-        Fetch positions, detect new ones, evaluate against targets.
+        Load open positions from tracked_positions, evaluate against targets.
         check_manual=False → only evaluate recommended positions (15 min cycle).
         check_manual=True  → evaluate all (30 min cycle).
         """
-        from app.broker.webull_connector import WebullConnector
+        from app.learning.prediction_tracker import get_positions_from_tracked
         from app.broker.sell_signals import evaluate_sell_signals
 
-        wb        = WebullConnector(self.user_id)
-        positions = wb.get_positions()
+        positions = get_positions_from_tracked(self.user_id)
         if not positions:
             return 0
 
-        # Cache for other tools
-        try: bal = wb.get_balance()
-        except: bal = None
-        cache_portfolio(self.user_id, positions, bal)
-
         # Load tracked position metadata
         tracked = get_tracked_symbols(self.user_id)
-
-        # Detect NEW positions not seen before
-        current_symbols    = {p["symbol"] for p in positions}
-        new_symbols        = current_symbols - self._known_symbols
-        disappeared_symbols = self._known_symbols - current_symbols
-
-        if self._known_symbols:   # skip on very first run
-            for sym in new_symbols:
-                self._handle_new_position(sym, positions, tracked)
-            for sym in disappeared_symbols:
-                self._handle_disappeared_position(sym)
-
-        self._known_symbols = current_symbols
 
         # Evaluate signals
         signals     = evaluate_sell_signals(positions)
@@ -645,80 +559,7 @@ class PositionMonitor:
 
         return ("WATCH", "LOW", f"{base} — {rule}", 240)
 
-    def _handle_new_position(self, symbol: str, positions: list, tracked: dict) -> None:
-        """
-        Called when a position appears that wasn't there before.
-        Runs LLM analysis and fires NEW_POSITION alert.
-        """
-        pos    = next((p for p in positions if p["symbol"] == symbol), {})
-        pnl    = float(pos.get("unrealized_profit_loss_rate", 0)) * 100
-        source = tracked.get(symbol, {}).get("source", "manual")
-
-        print(f"[Monitor] 🆕 New position detected: {symbol} ({source})")
-
-        # Quick LLM sentence
-        llm_note = _llm_analyze_new_position(symbol, pnl, source)
-
-        # Auto-add to tracked if not already there
-        if symbol not in tracked:
-            add_tracked_position(
-                self.user_id, symbol, source="manual",
-                entry_price=float(pos.get("unit_cost", 0)),
-                llm_entry_note=llm_note,
-            )
-
-        origin_label = "from our recommendation engine" if source == "recommendation" \
-                       else "NOT from our recommendation engine"
-        msg = f"New position: {symbol} ({pnl:+.1f}%) — {origin_label}. {llm_note}"
-
-        fire_alert(self.user_id, symbol, "NEW_POSITION", "MEDIUM",
-                   msg, pnl, cooldown_min=9999)  # only fire once
-
     # ── Config helpers ────────────────────────────────────────────────────────
-
-    def _handle_disappeared_position(self, symbol: str) -> None:
-        """
-        Called when a position disappears from Webull.
-        Asks user what happened instead of guessing.
-        Fires POSITION_CLOSED alert with clear action instructions.
-        """
-        print(f"[Monitor] 📭 Position disappeared: {symbol}")
-
-        msg = (
-            f"{symbol} is no longer in your Webull positions. "
-            f"Did you close it? Please tell me: "
-            f"'I sold {symbol} at $X' so I can log the outcome, "
-            f"or 'it expired' if it was an option."
-        )
-
-        fired = fire_alert(
-            user_id    = self.user_id,
-            symbol     = symbol,
-            alert_type = "POSITION_CLOSED",
-            urgency    = "HIGH",
-            message    = msg,
-            cooldown_min = 9999,  # only fire once per position
-        )
-
-        if fired:
-            print(f"[Monitor] 🔔 POSITION_CLOSED alert fired for {symbol}")
-
-        # Also close tracked_position so monitor stops watching it
-        try:
-            from sqlalchemy import text
-            from app.db.session import get_session
-            with get_session() as s:
-                s.execute(text("""
-                    UPDATE tracked_positions
-                    SET is_active  = FALSE,
-                        exit_date  = CURRENT_DATE,
-                        exit_reason = 'DETECTED_CLOSED'
-                    WHERE user_id = :uid
-                      AND symbol  = :sym
-                      AND is_active = TRUE
-                """), {"uid": self.user_id, "sym": symbol})
-        except Exception as e:
-            print(f"[Monitor] Could not update tracked_position: {e}")
 
     def _save_config(self, **kwargs) -> None:
         try:

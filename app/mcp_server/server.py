@@ -1,7 +1,9 @@
 """
 MCP Server — Trading Intelligence Platform.
 
-Phase 1:  Webull broker + market data + sell signals + portfolio P&L
+Phase 1:  Market data + sell signals + portfolio P&L (positions sourced
+          from tracked_positions/confirm_execution — no broker connection
+          exists for anyone, MULTIAGENT_MIGRATION.md items 27-31)
 Phase 2:  Options flow + technical analysis + strategy engine + scanner + watchlist
 Phase 3+: RAG pipeline, position monitor, notifications, prediction tracker
 """
@@ -16,8 +18,6 @@ if str(PROJECT_ROOT) not in sys.path:
 from fastmcp import FastMCP
 from sqlalchemy import text
 
-from app.broker.base import BrokerNotConnectedError
-from app.broker.webull_connector import WebullConnector
 from app.db.session import get_session
 from app.market_data.polygon_client import (
     get_bars, get_bulk_previous_close,
@@ -50,47 +50,25 @@ def ping() -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# WEBULL BROKER TOOLS (W2)
+# POSITION TOOLS (W2)
 # ─────────────────────────────────────────────────────────────────────────────
+#
+# No broker connection exists for anyone (MULTIAGENT_MIGRATION.md items
+# 27-31) - positions are sourced from tracked_positions, populated only
+# via confirm_execution()/the Fill flow. get_balances/get_orders had no
+# tracked_positions equivalent (no account balance or pending-order
+# concept without a live broker) and are gone, not repurposed.
 
 @mcp.tool()
 def get_positions() -> list[dict]:
     """
-    Fetch current live positions from Webull (stocks and options).
+    Fetch current open positions (stocks and options) from confirmed fills.
     Returns list of {symbol, instrument_type, qty, unit_cost, last_price,
     market_value, total_cost, unrealized_profit_loss, unrealized_profit_loss_rate}.
     """
-    user_id = get_current_user_id()
-    try:
-        return WebullConnector(user_id).get_positions()
-    except BrokerNotConnectedError:
-        return [{"error": "Webull not connected."}]
+    from app.learning.prediction_tracker import get_positions_from_tracked
+    return get_positions_from_tracked(get_current_user_id())
 
-
-@mcp.tool()
-def get_balances() -> dict:
-    """
-    Fetch current account balance, cash, and buying power from Webull.
-    Returns {total_asset_currency, total_market_value, total_cash_balance, ...}.
-    """
-    user_id = get_current_user_id()
-    try:
-        return WebullConnector(user_id).get_balance()
-    except BrokerNotConnectedError:
-        return {"error": "Webull not connected."}
-
-
-@mcp.tool()
-def get_orders() -> list[dict]:
-    """
-    Fetch today's orders from Webull.
-    Returns list of orders with {symbol, side, order_status, filled_price, qty}.
-    """
-    user_id = get_current_user_id()
-    try:
-        return WebullConnector(user_id).get_orders()
-    except BrokerNotConnectedError:
-        return [{"error": "Webull not connected."}]
 
 @mcp.tool()
 def get_active_bets() -> dict:
@@ -110,8 +88,9 @@ def get_active_bets() -> dict:
     Sorted by urgency: stop hits first, then near-stop, then target hits.
     """
     from app.broker.active_bets import get_active_bets as _get, format_bets_report
+    from app.learning.prediction_tracker import get_positions_from_tracked
     user_id  = get_current_user_id()
-    pos      = WebullConnector(user_id).get_positions()
+    pos      = get_positions_from_tracked(user_id)
     bets     = _get(pos, user_id=user_id)
     return {
         "report": format_bets_report(bets),
@@ -887,12 +866,9 @@ def get_portfolio_pnl() -> dict:
     win rate, per-position breakdown sorted by P&L, best/worst performers.
     """
     from app.broker.sell_signals import get_portfolio_pnl_summary
-    user_id = get_current_user_id()
-    wb      = WebullConnector(user_id)
-    pos     = wb.get_positions()
-    try:    bal = wb.get_balance()
-    except: bal = None
-    return get_portfolio_pnl_summary(pos, bal)
+    from app.learning.prediction_tracker import get_positions_from_tracked
+    pos = get_positions_from_tracked(get_current_user_id())
+    return get_portfolio_pnl_summary(pos, None)
 
 
 @mcp.tool()
@@ -917,8 +893,9 @@ def get_sell_signals(use_llm: bool = True) -> dict:
         format_sell_report,
         get_portfolio_pnl_summary,
     )
+    from app.learning.prediction_tracker import get_positions_from_tracked
     user_id = get_current_user_id()
-    pos     = WebullConnector(user_id).get_positions()
+    pos     = get_positions_from_tracked(user_id)
     pnl     = get_portfolio_pnl_summary(pos, None)
 
     if use_llm:

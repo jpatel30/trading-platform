@@ -21,8 +21,6 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from app.broker.base import BrokerNotConnectedError
-
 try:
     from jose import JWTError, jwt
 except ImportError:
@@ -50,41 +48,6 @@ app.add_middleware(
     allow_headers     = ["*"],
 )
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Broker-not-connected — centralized, not per-endpoint
-# ─────────────────────────────────────────────────────────────────────────────
-#
-# Broker connection (Webull) is admin-only by design (see ARCHITECTURE.md's
-# "Broker Connection Is Optional") - every non-admin user hits
-# BrokerNotConnectedError on every broker-touching endpoint, always, not as
-# an edge case. A single handler here means a new call site added later
-# can't reintroduce an uncaught 500 the way four separate per-endpoint
-# try/excepts already did - the same class of "same fix needed in N places"
-# duplication (flow_scoring, excluded_from_stats) already cleaned up
-# elsewhere this session. 200, not 500: this is an expected, normal state
-# for most users, not a server error - shaped per endpoint with a
-# `no_broker` flag so the frontend can distinguish it from "connected but
-# genuinely zero positions/signals" unambiguously.
-#
-# Each broker-touching endpoint must let BrokerNotConnectedError propagate
-# past its own try/except (via `except BrokerNotConnectedError: raise`
-# before any blanket `except Exception`) for this handler to ever see it.
-@app.exception_handler(BrokerNotConnectedError)
-async def broker_not_connected_handler(request: Request, exc: BrokerNotConnectedError):
-    path = request.url.path
-    if path == "/api/sell-signals":
-        body = {"no_broker": True, "signals": [], "pnl": {}}
-    elif path == "/api/portfolio/check-fills":
-        body = {"no_broker": True, "new_fills": [], "positions_count": 0, "recs_count": 0}
-    else:
-        # /api/portfolio, /api/portfolio/active-bets, and any future
-        # broker-touching endpoint default to the full portfolio shape.
-        body = {
-            "no_broker": True, "positions": [], "balances": {}, "pnl": {},
-            "bets": [], "source": "no_broker",
-        }
-    return JSONResponse(status_code=200, content=body)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -171,6 +134,7 @@ class ConfirmExecutionRequest(BaseModel):
     symbol:      str
     entry_price: float
     qty:         int
+    recommendation_id: str | None = None
 
 class LogOutcomeRequest(BaseModel):
     symbol:      str
@@ -431,7 +395,7 @@ async def startup_event():
                 from app.db.session import get_session
                 from app.learning.nightly_loop import run_nightly_loop
                 from app.recommendations.mark_to_market import mark_all_active_recommendations
-                from app.broker.factory import get_broker
+                from app.learning.prediction_tracker import get_positions_from_tracked
                 with get_session() as s:
                     users = s.execute(text("SELECT id FROM users WHERE is_active=TRUE")).fetchall()
                 for u in users:
@@ -451,7 +415,7 @@ async def startup_event():
                         print(f"[Scheduler] Mark-to-market failed for {uid[:8]}: {e}")
 
                     try:
-                        positions = get_broker(uid).get_positions() or []
+                        positions = get_positions_from_tracked(uid) or []
                     except Exception:
                         positions = []
                     result = run_nightly_loop(uid, positions)
@@ -806,71 +770,29 @@ async def get_portfolio(
     live: bool = False,
     user_id: str = Depends(get_current_user)
 ):
+    """
+    MULTIAGENT_MIGRATION.md items 27-31: no broker left to poll - built
+    from tracked_positions (confirm_execution, real fills only) via the
+    same adapter position_monitor.py uses. `live` is accepted for
+    backwards call-site compatibility but is a no-op now: there's no
+    broker cache/rate-limit distinction left to make, tracked_positions
+    is always current.
+    """
     try:
         from app.broker.sell_signals import get_portfolio_pnl_summary
         from app.broker.active_bets import get_active_bets
-        from app.monitor.position_monitor import get_cached_portfolio
+        from app.learning.prediction_tracker import get_positions_from_tracked
 
-        # Use cache for instant response (updated every 15-30 min by monitor)
-        # Get positions + balances (cache or live)
-        positions, balances, source = [], {}, "empty"
-
-        if not live:
-            cache = get_cached_portfolio(user_id)
-            if cache and not cache.get("is_stale"):
-                positions = cache["positions"]
-                balances  = cache.get("balances") or {}
-                source    = "cache"
-
-        if not positions:
-            from app.broker.factory import get_broker
-            broker = get_broker(user_id)
-
-            # Webull rate limit protection — min 30s between live fetches per user
-            import time
-            from sqlalchemy import text
-            from app.db.session import get_session
-            now = time.time()
-            _last_fetch = getattr(get_portfolio, f"_last_{user_id}", 0)
-            if now - _last_fetch < 30 and not live:
-                # Too soon — use cache
-                _cache = get_cached_portfolio(user_id)
-                if _cache:
-                    positions = _cache.get("positions") or []
-                    balances  = _cache.get("balances")  or {}
-                    source    = "cache_cooldown"
-            if not positions:
-                try:
-                    positions = broker.get_positions() or []
-                    balances  = broker.get_balances()   or {}
-                    source    = "live"
-                    setattr(get_portfolio, f"_last_{user_id}", now)
-                except Exception as _we:
-                    if "429" in str(_we) or "TOO_MANY" in str(_we):
-                        print(f"[Portfolio] Webull 429 — using cache")
-                        _cache = get_cached_portfolio(user_id)
-                        if _cache:
-                            positions = _cache.get("positions") or []
-                            balances  = _cache.get("balances")  or {}
-                            source    = "cache_429"
-                        else:
-                            raise
-                    else:
-                        raise
-
-        # Extract correct values from Webull nested structure
-        acct      = (balances.get("account_currency_assets") or [{}])[0]
-        net_liq   = float(acct.get("net_liquidation_value") or balances.get("total_market_value") or 0)
-        cash      = float(balances.get("total_cash_balance") or acct.get("cash_balance") or 0)
-        pos_value = float(balances.get("total_market_value") or acct.get("positions_market_value") or 0)
+        positions = get_positions_from_tracked(user_id)
+        balances  = {}   # no broker account balance/buying-power source anymore
 
         pnl  = get_portfolio_pnl_summary(positions, balances) if positions else {}
         bets = get_active_bets(positions, user_id=user_id) if positions else []
 
-        pnl["net_liq"]         = round(net_liq, 2)
-        pnl["cash"]            = round(cash, 2)
-        pnl["positions_value"] = round(pos_value, 2)
-        pnl["buying_power"]    = round(cash, 2)
+        pnl["net_liq"]         = round(sum(p.get("market_value", 0) for p in positions), 2)
+        pnl["cash"]            = 0.0
+        pnl["positions_value"] = pnl["net_liq"]
+        pnl["buying_power"]    = 0.0
 
         # Merge type + option fields from pnl.positions into bets
         pnl_pos = pnl.get("positions", [])
@@ -898,10 +820,8 @@ async def get_portfolio(
             "balances":      balances,
             "pnl":           pnl,
             "bets":          bets,
-            "source":        source,
+            "source":        "tracked_positions",
         }
-    except BrokerNotConnectedError:
-        raise  # handled globally - see broker_not_connected_handler
     except Exception as e:
         import traceback
         print(f"[Portfolio API Error] {traceback.format_exc()}")
@@ -911,13 +831,10 @@ async def get_portfolio(
 @app.get("/api/portfolio/active-bets", tags=["Portfolio"])
 async def get_active_bets_api(user_id: str = Depends(get_current_user)):
     try:
-        from app.broker.factory import get_broker
         from app.broker.active_bets import get_active_bets
-        broker    = get_broker(user_id)
-        positions = broker.get_positions()
+        from app.learning.prediction_tracker import get_positions_from_tracked
+        positions = get_positions_from_tracked(user_id)
         return get_active_bets(positions, user_id=user_id)
-    except BrokerNotConnectedError:
-        raise  # handled globally - see broker_not_connected_handler
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -1307,10 +1224,10 @@ async def get_history_grouped(
 async def get_open_positions(user_id: str = Depends(get_current_user)):
     """
     Confirmed-filled positions, sourced from daily_recommendations - this
-    is every user's equivalent of "portfolio" (broker connection is
-    admin-only; see ARCHITECTURE.md's "Broker Connection Is Optional").
-    Applies to the admin too - confirming a fill here is separate from
-    their real Webull account.
+    is every user's equivalent of "portfolio". No broker connection
+    exists for anyone anymore, including the former admin (MULTIAGENT_
+    MIGRATION.md items 27-31) - confirm_execution()/the Fill flow is the
+    only way a position ever gets recorded, for every user alike.
 
     Note: tracked_positions also records a fill (used by
     position_monitor.py for alerting) but has no thesis/legs/mark-to-
@@ -1544,13 +1461,10 @@ async def remove_ticker(
 @app.get("/api/sell-signals", tags=["Signals"])
 async def get_sell_signals(user_id: str = Depends(get_current_user)):
     try:
-        from app.broker.factory import get_broker
         from app.broker.sell_signals import evaluate_sell_signals
-        broker    = get_broker(user_id)
-        positions = broker.get_positions()
+        from app.learning.prediction_tracker import get_positions_from_tracked
+        positions = get_positions_from_tracked(user_id)
         return evaluate_sell_signals(positions)
-    except BrokerNotConnectedError:
-        raise  # handled globally - see broker_not_connected_handler
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -1575,170 +1489,22 @@ async def backtest(user_id: str = Depends(get_current_user)):
 # Execution Tracking
 # ─────────────────────────────────────────────────────────────────────────────
 
-@app.get("/api/portfolio/check-fills", tags=["Portfolio"])
-async def check_fills(user_id: str = Depends(get_current_user)):
-    """
-    Auto-detect if user filled a recommendation.
-    Compare current positions vs today's active recommendations.
-    Called every 30s after scan for 30 min.
-    """
-    try:
-        from sqlalchemy import text
-        from app.db.session import get_session
-        from app.broker.factory import get_broker
-        from datetime import date
-
-        broker    = get_broker(user_id)
-        try:
-            positions = broker.get_positions() or []
-        except Exception as pos_err:
-            if "429" in str(pos_err) or "TOO_MANY" in str(pos_err):
-                # Rate limited — fall back to cached portfolio
-                print(f"[Portfolio] Webull 429 — using cached portfolio")
-                from sqlalchemy import text
-                from app.db.session import get_session
-                with get_session() as s:
-                    cached = s.execute(text(
-                        "SELECT positions, balances FROM portfolio_cache WHERE user_id=:uid"
-                    ), {"uid": user_id}).fetchone()
-                if cached:
-                    return {
-                        "positions": cached.positions or [],
-                        "balances":  cached.balances or {},
-                        "pnl":       {},
-                        "bets":      [],
-                        "source":    "cache_429",
-                    }
-            raise
-        with get_session() as s:
-            recs = s.execute(text("""
-                SELECT id, ticker, direction, strategy, expiry, conviction_score,
-                       legs, entry_debit, entry_zone_low, entry_zone_high
-                FROM daily_recommendations
-                WHERE user_id=:uid AND date=CURRENT_DATE AND status='ACTIVE'
-            """), {"uid": user_id}).fetchall()
-
-        recs_by_ticker: dict = {}
-        for rec in recs:
-            recs_by_ticker.setdefault(rec.ticker, []).append(rec)
-
-        # Price-proximity is the strongest real signal available for
-        # picking the CORRECT recommendation among several on the same
-        # ticker/day — Webull's actual position data has no strike/
-        # expiry/OCC-symbol field at all for OPTION holdings (confirmed
-        # live against 7 real option positions: only symbol=<underlying>,
-        # instrument_type, qty, unit_cost, last_price — no contract
-        # detail, and no cheap reverse lookup exists either:
-        # get_trade_instrument_detail(instrument_id) just echoes the id
-        # back, get_trade_security_detail requires strike/expiry as
-        # INPUT, not output). A generous relative band still catches the
-        # real MSTR bug (an old, unrelated position at a wildly
-        # different price) while tolerating normal quote movement
-        # between when a rec was generated and the actual fill.
-        OPTION_PRICE_TOLERANCE_PCT = 0.30
-        STOCK_PRICE_TOLERANCE_PCT  = 0.10
-
-        matches = []
-        for pos in positions:
-            ticker = pos.get("symbol", "")
-            candidates = recs_by_ticker.get(ticker, [])
-            if not candidates:
-                continue
-
-            is_option_pos = pos.get("instrument_type") == "OPTION"
-            unit_cost = float(pos.get("unit_cost") or 0)
-            if not unit_cost:
-                continue
-
-            # Never match an options holding to a stock recommendation
-            # or vice versa — the old code didn't check this at all,
-            # so a stock position and an options position on the same
-            # ticker the same day could get cross-matched.
-            same_type = [r for r in candidates if bool(r.legs) == is_option_pos]
-            if not same_type:
-                continue
-
-            best_rec, best_diff = None, float("inf")
-            for r in same_type:
-                if is_option_pos:
-                    ref_price = abs(float(r.entry_debit or 0))
-                else:
-                    low, high = float(r.entry_zone_low or 0), float(r.entry_zone_high or 0)
-                    if low and high and low <= unit_cost <= high:
-                        ref_price = unit_cost  # inside the recommended zone — exact
-                    else:
-                        ref_price = (low + high) / 2 if (low or high) else 0
-                if not ref_price:
-                    continue
-                diff = abs(unit_cost - ref_price) / ref_price
-                if diff < best_diff:
-                    best_rec, best_diff = r, diff
-
-            if not best_rec:
-                continue
-
-            tolerance = OPTION_PRICE_TOLERANCE_PCT if is_option_pos else STOCK_PRICE_TOLERANCE_PCT
-            if best_diff > tolerance:
-                print(f"[CheckFills] {ticker}: real entry ${unit_cost} is {best_diff:.0%} away "
-                      f"from the closest active recommendation — not auto-confirming, "
-                      f"needs manual Fill")
-                continue
-
-            # Check if already tracked (real column is `symbol`, not
-            # `ticker`). Also requires the tracked entry_price to be
-            # close to THIS specific position's unit_cost — found live
-            # while verifying this fix: without a price check here, a
-            # stock and an options position on the SAME ticker the same
-            # day could still cross-contaminate each other's "already
-            # tracked" state (confirming the stock position first would
-            # make the very next options position on the same ticker
-            # look "already tracked" too, even though it's a completely
-            # different holding never actually confirmed).
-            with get_session() as s:
-                tracked = s.execute(text("""
-                    SELECT id FROM tracked_positions
-                    WHERE user_id=:uid AND symbol=:t
-                      AND created_at > now() - interval '1 day'
-                      AND ABS(entry_price - :price) / GREATEST(ABS(entry_price), 0.01) < :tol
-                """), {"uid": user_id, "t": ticker, "price": unit_cost, "tol": tolerance}).fetchone()
-            if tracked:
-                continue
-
-            qty = int(float(pos.get("qty") or 1))
-            try:
-                from app.learning.prediction_tracker import confirm_execution
-                confirm_execution(user_id, ticker, unit_cost, qty,
-                                 recommendation_id=str(best_rec.id))
-            except Exception:
-                pass  # already tracked
-            matches.append({
-                "ticker":        ticker,
-                "direction":     best_rec.direction,
-                "strategy":      best_rec.strategy,
-                "expiry":        best_rec.expiry,
-                "qty":           qty,
-                "price":         unit_cost,
-                "auto_detected": True,
-            })
-
-        return {
-            "new_fills": matches,
-            "positions_count": len(positions),
-            "recs_count": len(recs),
-        }
-    except BrokerNotConnectedError:
-        raise  # handled globally - see broker_not_connected_handler
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
 @app.post("/api/execution/confirm", tags=["Execution"])
 async def confirm_exec(
     req: ConfirmExecutionRequest,
     user_id: str = Depends(get_current_user)
 ):
+    """
+    The ONLY way any user reports a real fill (MULTIAGENT_MIGRATION.md
+    item 31) - check_fills()'s broker-position auto-detection is gone
+    (item 29, no broker left to check against). recommendation_id is
+    optional: if the frontend already knows which recommendation this
+    fill was for, pass it directly for an exact link instead of
+    confirm_execution()'s own best-price-match fallback.
+    """
     from app.learning.prediction_tracker import confirm_execution
-    return confirm_execution(user_id, req.symbol, req.entry_price, req.qty)
+    return confirm_execution(user_id, req.symbol, req.entry_price, req.qty,
+                              recommendation_id=req.recommendation_id)
 
 
 @app.post("/api/execution/outcome", tags=["Execution"])
@@ -1770,19 +1536,3 @@ async def configure_discord(
     if not saved:
         raise HTTPException(status_code=500, detail="Failed to save webhook")
     return send_test_notification(user_id)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Brokers
-# ─────────────────────────────────────────────────────────────────────────────
-
-@app.get("/api/brokers", tags=["Brokers"])
-async def list_brokers():
-    from app.broker.factory import list_supported_brokers
-    return list_supported_brokers()
-
-
-@app.get("/api/brokers/active", tags=["Brokers"])
-async def active_broker(user_id: str = Depends(get_current_user)):
-    from app.broker.factory import get_active_broker_name
-    return {"broker": get_active_broker_name(user_id)}

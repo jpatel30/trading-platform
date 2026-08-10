@@ -96,18 +96,9 @@ def _safe(v, default=0.0):
 
 
 def _get_live_spot(ticker: str, fallback: float = 0, user_id: str | None = None) -> float:
-    """Webull (if owned) → yfinance → Polygon fallback."""
-    if user_id:
-        try:
-            from app.broker.webull_connector import WebullConnector
-            wb = WebullConnector(user_id)
-            for p in wb.get_positions():
-                if (p.get("symbol","").upper() == ticker.upper()
-                        and p.get("instrument_type") == "STOCK"):
-                    price = float(p["last_price"])
-                    if price > 0: return price
-        except Exception:
-            pass
+    """yfinance → Polygon fallback. user_id unused — kept for call-site
+    compatibility (MULTIAGENT_MIGRATION.md items 27-31 removed the
+    broker-position price source this used to enable)."""
     try:
         import yfinance as yf
         fi = yf.Ticker(ticker).fast_info

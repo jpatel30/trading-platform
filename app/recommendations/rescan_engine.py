@@ -271,11 +271,13 @@ def rescan_with_validation(
         tickers = get_scan_universe(user_id=user_id)
 
         # Don't recommend buying more of what's already held as a new
-        # entry. Best-effort — a broker-fetch failure should never block
-        # the scan itself.
+        # entry. Best-effort — a lookup failure should never block the
+        # scan itself. Sourced from tracked_positions (MULTIAGENT_
+        # MIGRATION.md items 27-31 — no broker left to check against),
+        # not a live broker feed.
         try:
-            from app.broker.webull_connector import WebullConnector
-            portfolio_syms = {p["symbol"] for p in WebullConnector(user_id).get_positions()}
+            from app.learning.prediction_tracker import get_positions_from_tracked
+            portfolio_syms = {p["symbol"] for p in get_positions_from_tracked(user_id)}
             tickers_filtered = [t for t in tickers if t not in portfolio_syms]
             removed = len(tickers) - len(tickers_filtered)
             if removed > 0:

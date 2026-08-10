@@ -5,3 +5,4 @@ __pycache__/
 *.log
 .DS_Store
 .idea/
+app/learning/task_list.md

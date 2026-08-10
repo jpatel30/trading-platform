@@ -190,6 +190,7 @@ def _store_paper_context(
     flow_score, dp_score, oi_score, oi_max_days,
     iv_level, iv_trend, daily_ctx: dict, intraday: dict,
     market_ctx: dict, conviction_score, strategy_selected: str, strategy_rule: str,
+    which_rule_conflict_triggered: str | None = None,
 ) -> None:
     try:
         from sqlalchemy import text
@@ -204,7 +205,8 @@ def _store_paper_context(
                     daily_rsi, daily_macd_signal, daily_trend,
                     intraday_5min_signal, intraday_15min_signal,
                     vix_zone, vix_regime_bias,
-                    conviction_score, strategy_selected, which_strategy_rule_fired
+                    conviction_score, strategy_selected, which_strategy_rule_fired,
+                    which_rule_conflict_triggered
                 ) VALUES (
                     :rec_id, :tp_id, :ticker, :rec_type,
                     :window, :budget,
@@ -213,7 +215,8 @@ def _store_paper_context(
                     :d_rsi, :d_macd, :d_trend,
                     CAST(:intra5 AS jsonb), CAST(:intra15 AS jsonb),
                     :vix_zone, :vix_bias,
-                    :conv, :strat, :rule
+                    :conv, :strat, :rule,
+                    :conflict
                 )
             """), {
                 "rec_id": recommendation_id, "tp_id": tracked_position_id,
@@ -226,6 +229,7 @@ def _store_paper_context(
                 "intra5": json.dumps(intraday.get("5min")), "intra15": json.dumps(intraday.get("15min")),
                 "vix_zone": market_ctx.get("vix_zone"), "vix_bias": market_ctx.get("regime_bias"),
                 "conv": conviction_score, "strat": strategy_selected, "rule": strategy_rule,
+                "conflict": which_rule_conflict_triggered,
             })
     except Exception as e:
         print(f"[PaperTrade] paper_trade_context write failed for {ticker}: {e}")

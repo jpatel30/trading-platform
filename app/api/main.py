@@ -563,6 +563,39 @@ async def startup_event():
                 id=f"paper_trade_open_stocks_{_hour:02d}{_minute:02d}", replace_existing=True,
             )
 
+        def _run_tie_break_batch():
+            """
+            MULTIAGENT_MIGRATION.md items 20-22. Runs once, admin-only -
+            same single-fire principle as the paper-trade-open jobs above,
+            for the same reason (this opens real picks through the same
+            confirm_execution()/DAILY_PICK_CAP path, not a per-customer
+            scan). Scheduled at the (8, 30) PT slot deliberately: the
+            first of the 3 windows the doc names as eligible for tie-break
+            opens (6:40 excluded — not enough buffer after
+            search_agent_pre_open @ 6:00 PT, which is what fills
+            tie_break_queue in the first place) and always AFTER that
+            search/routing pass has fully completed, never concurrently
+            with it (item 21).
+            """
+            try:
+                from app.agents.prediction_agent import run_tie_break_batch
+                uid = _get_paper_trade_admin_user_id()
+                if not uid:
+                    print("[Scheduler] Tie-break batch skipped: no admin user found")
+                    return
+                result = run_tie_break_batch(uid)
+                print(f"[Scheduler] Tie-break batch: {result.get('pending_seen')} pending, "
+                      f"{result.get('opened')} opened, {result.get('rejected')} rejected, "
+                      f"{result.get('errored')} errored")
+            except Exception as e:
+                print(f"[Scheduler] Tie-break batch failed: {e}")
+
+        scheduler.add_job(
+            _run_tie_break_batch,
+            CronTrigger(day_of_week="mon-fri", hour=8, minute=30, timezone=pt),
+            id="tie_break_batch_0830", replace_existing=True,
+        )
+
         def _run_paper_trade_close():
             try:
                 from app.recommendations.paper_trading import run_paper_trade_close
@@ -599,15 +632,20 @@ async def startup_event():
 
         scheduler.add_job(
             _run_weekly_strategy_review,
-            CronTrigger(day_of_week="sun", hour=18, minute=0, timezone=et),
+            # MULTIAGENT_MIGRATION.md item 23 — daily now, not Sunday-only
+            # (every day of the week, not restricted via day_of_week).
+            # Pairs with item 24's rolling-7-day window: a Tuesday run
+            # reviews Wed-Tue, not last week's already-reviewed Mon-Fri.
+            CronTrigger(hour=18, minute=0, timezone=et),
             id="weekly_strategy_review", replace_existing=True,
         )
 
         scheduler.start()
         print("[Scheduler] ✅ velocity@4:15PM ET | learning@4:30PM ET | "
               "paper-trade-open@6:40/8:30/10:30AM,12:30PM PT (shared 20/day cap) | "
+              "tie-break-batch@8:30AM PT | "
               "paper-trade-close@12:55PM PT (weekdays) | "
-              "weekly-strategy-review@6:00PM ET (Sun)")
+              "learning-agent-review@6:00PM ET (daily, rolling 7-day window)")
     except Exception as e:
         print(f"[Startup] Scheduler failed: {e}")
 

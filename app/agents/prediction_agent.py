@@ -308,16 +308,228 @@ def classify_and_store(user_id: str, enriched: dict, market_regime: dict | None 
             db.execute(text("""
                 INSERT INTO tie_break_queue (
                     candidate_direction_id, user_id, ticker,
-                    which_rule_conflict_triggered, bullish_signals, bearish_signals
+                    which_rule_conflict_triggered, bullish_signals, bearish_signals,
+                    enriched_snapshot
                 ) VALUES (
                     :cdid, :uid, :ticker, :conflict,
-                    CAST(:bulls AS jsonb), CAST(:bears AS jsonb)
+                    CAST(:bulls AS jsonb), CAST(:bears AS jsonb), CAST(:snapshot AS jsonb)
                 )
             """), {
                 "cdid": candidate_direction_id, "uid": user_id, "ticker": route["ticker"],
                 "conflict": _conflict_description(route["signal_votes"]),
                 "bulls": json.dumps(bullish), "bears": json.dumps(bearish),
+                # item 21's batch runs later, as a genuinely separate process
+                # (no in-memory `enriched` to hand it) - stored here once, at
+                # routing time, so that later run never re-fetches live paid
+                # UW data for a candidate this process already scanned today.
+                "snapshot": json.dumps(enriched, default=str),
             })
 
     route["candidate_direction_id"] = candidate_direction_id
     return route
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Finalize Phase (items 18-19)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Item 18 says "extract the R/R gate, EV gate, and structural-
+# impossibility backstop into a module that explicitly takes Bull+Bear
+# output" - those three gates plus expiry validation, strike-sanity
+# checks, and strike-order auto-correction all already live together in
+# smart_engine.py::_execute_smart_rec(), proven this session across a
+# long chain of real bugs found and fixed there. Bull/Bear's output
+# JSON (bull_bear_agents.py) was deliberately built to match its exact
+# input contract for this reason. Re-extracting that logic a second
+# time here would mean two copies drifting apart; calling the existing
+# function against Bull's and Bear's proposals instead is the actual
+# "re-verifies before storing" item 18 asks for - real UW quotes, real
+# gates, not the rough BSM-only check the Routing Phase used.
+
+def finalize_debate(debate: dict, routing: dict, budget: float, user_id: str) -> dict | None:
+    """
+    Item 18: re-verify run_bull_bear_debate()'s output against the real
+    gates. Item 19: handles both routed (one proposal) and tie_break
+    (both proposals) modes, tagging which_rule_conflict_triggered on
+    tie-break results.
+
+    routed mode: verify whichever single proposal exists.
+    tie_break mode: verify BOTH real proposals, resolve -
+      - only one clears the real gates -> it wins (the market's own
+        math broke the tie, not just LLM confidence)
+      - both clear -> higher confidence wins
+      - neither clears -> reject entirely, same "reject rather than
+        degrade" philosophy the gates themselves already use
+    """
+    from app.recommendations.smart_engine import _execute_smart_rec
+
+    mode = debate.get("mode")
+    bull, bear = debate.get("bull"), debate.get("bear")
+
+    if mode == "routed":
+        proposal = bull or bear
+        side = "bull" if bull else "bear"
+        if not proposal:
+            return None
+        trade = _execute_smart_rec(proposal, budget, user_id)
+        if trade:
+            trade["finalized_from"] = side
+            trade["finalize_mode"]  = "routed"
+        return trade
+
+    if mode == "tie_break":
+        bull_trade = _execute_smart_rec(bull, budget, user_id) if bull else None
+        bear_trade = _execute_smart_rec(bear, budget, user_id) if bear else None
+
+        if bull_trade and not bear_trade:
+            winner, side = bull_trade, "bull"
+        elif bear_trade and not bull_trade:
+            winner, side = bear_trade, "bear"
+        elif bull_trade and bear_trade:
+            bull_conf = bull.get("confidence", 0) if bull else 0
+            bear_conf = bear.get("confidence", 0) if bear else 0
+            winner, side = (bull_trade, "bull") if bull_conf >= bear_conf else (bear_trade, "bear")
+        else:
+            print(f"[Finalize] {debate.get('ticker')}: neither bull nor bear cleared "
+                  f"the real gates — no viable trade either direction")
+            return None
+
+        winner["finalized_from"] = side
+        winner["finalize_mode"]  = "tie_break"
+        winner["which_rule_conflict_triggered"] = _conflict_description(routing.get("signal_votes", []))
+        return winner
+
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tie-break sequencing (items 20-22)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Item 20: classify_and_store() (above) already only ever WRITES a
+# tie_break_queue row (status='pending') - it never calls
+# run_bull_bear_debate/finalize_debate inline. A main pass that loops
+# candidates through classify_and_store already runs start-to-finish with
+# the queue purely accumulating, untouched, by construction - nothing
+# further needed here to satisfy item 20 itself.
+#
+# Item 21: run_tie_break_batch() below is that separate, later process.
+# app/api/main.py only ever schedules it after the main routing pass's own
+# job (search_agent_pre_open) has fully finished - never concurrently -
+# same reasoning bull_bear_agents.py's docstring already documents for
+# tie_break mode itself (the enrichment-timeout/rate-limiter bug: threads
+# competing for the same rate-limited UW resources).
+#
+# Item 22: resolved winners open through the EXACT SAME
+# confirm_execution()/DAILY_PICK_CAP path paper_trading.py's grid already
+# uses for every other pick - not a new opening mechanism - and
+# app/api/main.py schedules this batch at the (8, 30) PT slot, the first
+# of the 3 windows the doc names as eligible (6:40 excluded: not enough
+# buffer after the pre-open pass this batch depends on). No new time slot
+# value is introduced; the same shared ~20/day cap applies automatically
+# because DAILY_PICK_CAP/_count_todays_unique_picks are the same functions.
+
+def run_tie_break_batch(user_id: str, budget: float = 2500.0) -> dict:
+    """
+    Resolves every pending tie_break_queue row for this user: re-runs the
+    debate (both agents, from the enriched_snapshot stored at routing
+    time - no re-fetch of live paid data), finalizes against the real
+    gates, and - if a real trade survives - opens it exactly like any
+    other paper-trading pick, so the Learning Agent's stats can't tell a
+    tie-break open apart from a routed one except by the
+    which_rule_conflict_triggered tag on it.
+    """
+    from sqlalchemy import text
+    from app.db.session import get_session
+    from app.agents.bull_bear_agents import run_bull_bear_debate
+    from app.agents.retrieval_library import build_retrieval_context
+    from app.recommendations.paper_trading import (
+        DAILY_PICK_CAP, _count_todays_unique_picks, _already_opened_today,
+        _store_paper_context, _store_options_recommendation,
+    )
+    from app.learning.prediction_tracker import confirm_execution
+
+    window = 21   # matches this module's own fixed rough routing horizon (route_candidate)
+    resolved = opened = rejected = errored = 0
+
+    with get_session() as db:
+        pending = db.execute(text("""
+            SELECT q.id, q.ticker,
+                   q.which_rule_conflict_triggered, q.enriched_snapshot,
+                   cd.direction_lean, cd.confidence_of_routing, cd.strategy_shape,
+                   cd.rough_strikes, cd.expiry, cd.clears_rough_rr_gate, cd.rough_rr,
+                   cd.signal_votes, cd.routing_classification
+            FROM tie_break_queue q
+            JOIN candidate_directions cd ON cd.id = q.candidate_direction_id
+            WHERE q.status = 'pending' AND q.user_id = :uid
+            ORDER BY q.created_at ASC
+        """), {"uid": user_id}).fetchall()
+
+    for row in pending:
+        if _count_todays_unique_picks(user_id) >= DAILY_PICK_CAP:
+            print(f"[TieBreakBatch] daily cap ({DAILY_PICK_CAP}) reached — "
+                  f"stopping, {len(pending) - resolved} row(s) left pending for tomorrow's batch")
+            break
+
+        enriched = row.enriched_snapshot or {}
+        if not enriched:
+            errored += 1
+            print(f"[TieBreakBatch] {row.ticker}: no enriched_snapshot stored — skipping")
+            continue
+
+        routing = {
+            "ticker": row.ticker, "direction_lean": row.direction_lean,
+            "strategy_shape": row.strategy_shape, "rough_strikes": row.rough_strikes or [],
+            "expiry": str(row.expiry) if row.expiry else None,
+            "confidence_of_routing": row.confidence_of_routing,
+            "clears_rough_rr_gate": row.clears_rough_rr_gate, "rough_rr": float(row.rough_rr or 0),
+            "signal_votes": row.signal_votes or [], "routing_classification": row.routing_classification,
+        }
+
+        status = "resolved_rejected"
+        try:
+            retrieval_context = build_retrieval_context(enriched, routing, user_id)
+            debate = run_bull_bear_debate(enriched, routing, retrieval_context=retrieval_context)
+            trade  = finalize_debate(debate, routing, budget, user_id)
+
+            if trade:
+                ticker = trade["ticker"]
+                if _already_opened_today(user_id, ticker, window, budget):
+                    status = "resolved_duplicate"
+                else:
+                    rec_id = _store_options_recommendation(user_id, window, budget, trade, market_view="tie_break")
+                    confirm_result = confirm_execution(
+                        user_id=user_id, symbol=ticker, entry_price=trade.get("entry_debit", 0),
+                        qty=trade.get("contracts", 0), recommendation_id=rec_id, source="auto_paper",
+                        trading_window_days=window, budget=budget,
+                    )
+                    if confirm_result.get("confirmed") or confirm_result.get("status") == "already_tracked":
+                        tracked_position_id = confirm_result.get("tracked_position_id") or confirm_result.get("id")
+                        _store_paper_context(
+                            recommendation_id=rec_id, tracked_position_id=tracked_position_id,
+                            ticker=ticker, rec_type="options", window=window, budget=budget,
+                            flow_score=enriched.get("flow_score"), dp_score=enriched.get("dp_score"),
+                            oi_score=enriched.get("oi_score"), oi_max_days=enriched.get("oi_max_days"),
+                            iv_level=enriched.get("iv_current"), iv_trend=enriched.get("iv_exp_signal"),
+                            daily_ctx={}, intraday={}, market_ctx={},
+                            conviction_score=trade.get("confidence"), strategy_selected=trade.get("strategy"),
+                            strategy_rule=trade.get("strategy_rule", ""),
+                            which_rule_conflict_triggered=row.which_rule_conflict_triggered,
+                        )
+                        status, opened = "resolved_opened", opened + 1
+                    else:
+                        status = "resolved_confirm_failed"
+            else:
+                rejected += 1
+        except Exception as e:
+            errored += 1
+            status = "resolved_error"
+            print(f"[TieBreakBatch] {row.ticker}: {e}")
+
+        with get_session() as db:
+            db.execute(text("UPDATE tie_break_queue SET status = :status, resolved_at = now() WHERE id = :id"),
+                       {"status": status, "id": row.id})
+        resolved += 1
+
+    return {"pending_seen": len(pending), "resolved": resolved, "opened": opened,
+            "rejected": rejected, "errored": errored}

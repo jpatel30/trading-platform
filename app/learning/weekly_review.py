@@ -88,6 +88,14 @@ def _bucket_conviction_x_5min(r):
     return f"{tier}_{'confirmed' if fired else 'not_confirmed'}"
 
 
+def _bucket_rule_conflict(r):
+    """Item 25: only tie-break opens (run_tie_break_batch,
+    prediction_agent.py) ever populate which_rule_conflict_triggered -
+    every routed (non-tie-break) open leaves it NULL and is excluded from
+    this particular split, same as any other bucket's missing-data case."""
+    return r.which_rule_conflict_triggered or None
+
+
 BUCKET_GROUPS = [
     ("strategy_rule",              _bucket_strategy_rule),
     ("oi_persistence",             _bucket_oi_persistence),
@@ -96,6 +104,7 @@ BUCKET_GROUPS = [
     ("intraday_15min_confirmed",   _bucket_intraday_15min),
     ("window_length",              _bucket_window_length),
     ("conviction_x_5min_confirmed", _bucket_conviction_x_5min),
+    ("rule_conflict_triggered",    _bucket_rule_conflict),
 ]
 
 
@@ -129,15 +138,20 @@ def _relevant_entry_confirmed(r) -> bool | None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Week range default — the just-completed Mon-Fri.
+# Week range default (item 24) — a genuine rolling 7-day window, computed
+# fresh every run from date.today(), not the just-completed Mon-Fri. Now
+# that this runs daily (item 23) rather than only Sunday night, "the
+# week" needs to mean "the last 7 days as of right now" or every weekday
+# run between Mondays would keep reporting the same stale, already-
+# reviewed Mon-Fri window. week_start shifts by one day on every daily
+# run, so weekly_review_log/strategy_rule_performance's existing
+# (user_id, week_start) uniqueness naturally gives each day its own row
+# rather than overwriting yesterday's - no schema change needed for that.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _default_week_range() -> tuple:
     today = date.today()
-    days_since_friday = (today.weekday() - 4) % 7   # Mon=0 ... Sun=6, Fri=4
-    week_end   = today - timedelta(days=days_since_friday)
-    week_start = week_end - timedelta(days=4)
-    return week_start, week_end
+    return today - timedelta(days=6), today
 
 
 def _fetch_joined_rows(user_id: str, week_start: date, week_end: date) -> list:
@@ -149,7 +163,8 @@ def _fetch_joined_rows(user_id: str, week_start: date, week_end: date) -> list:
             SELECT dr.id AS recommendation_id, dr.ticker, dr.date, dr.was_correct,
                    dr.actual_pnl_pct, dr.conviction_tier,
                    ptc.which_strategy_rule_fired, ptc.oi_max_days, ptc.iv_5day_trend,
-                   ptc.trading_window_days, ptc.intraday_5min_signal, ptc.intraday_15min_signal
+                   ptc.trading_window_days, ptc.intraday_5min_signal, ptc.intraday_15min_signal,
+                   ptc.which_rule_conflict_triggered
             FROM daily_recommendations dr
             JOIN paper_trade_context ptc ON ptc.recommendation_id = dr.id
             WHERE dr.user_id = :uid
@@ -192,6 +207,7 @@ def _upsert_bucket_row(user_id: str, bucket_name: str, week_start: date, week_en
 def _upsert_weekly_review_log(
     user_id: str, week_start: date, week_end: date, overall: dict,
     wrong_trade_count: int, wrong_entry_count: int, llm_summary: str | None,
+    task_list_md: str | None = None,
 ) -> None:
     from sqlalchemy import text
     from app.db.session import get_session
@@ -201,11 +217,11 @@ def _upsert_weekly_review_log(
             INSERT INTO weekly_review_log (
                 user_id, week_start, week_end, total_paper_trades,
                 overall_win_rate, overall_avg_pnl_pct,
-                wrong_trade_count, wrong_entry_count, llm_summary
+                wrong_trade_count, wrong_entry_count, llm_summary, task_list_md
             ) VALUES (
                 :uid, :ws, :we, :total,
                 :win_rate, :avg_pnl_pct,
-                :wrong_trade, :wrong_entry, :summary
+                :wrong_trade, :wrong_entry, :summary, :task_list
             )
             ON CONFLICT (user_id, week_start) DO UPDATE SET
                 week_end             = EXCLUDED.week_end,
@@ -215,13 +231,14 @@ def _upsert_weekly_review_log(
                 wrong_trade_count    = EXCLUDED.wrong_trade_count,
                 wrong_entry_count    = EXCLUDED.wrong_entry_count,
                 llm_summary          = EXCLUDED.llm_summary,
+                task_list_md         = EXCLUDED.task_list_md,
                 created_at           = now()
         """), {
             "uid": user_id, "ws": week_start, "we": week_end,
             "total": overall["sample_size"], "win_rate": overall["win_rate"],
             "avg_pnl_pct": overall["avg_pnl_pct"],
             "wrong_trade": wrong_trade_count, "wrong_entry": wrong_entry_count,
-            "summary": llm_summary,
+            "summary": llm_summary, "task_list": task_list_md,
         })
 
 
@@ -315,6 +332,147 @@ numbers say. Rules:
         return None
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Task list (item 26). Deterministic - same "plain aggregation only" rule
+# this whole file already follows (see module docstring's CRITICAL
+# CONSTRAINT): every suggestion below is a threshold check against
+# numbers _bucket_stats() already computed, never an LLM guess. Each
+# bucket dimension is attributed to whichever of the 5 target agents
+# (MULTIAGENT_MIGRATION.md's Search/News/Prediction/Bull/Bear) actually
+# owns the decision that dimension measures - so a reader can act on this
+# without re-deriving that mapping themselves.
+# ─────────────────────────────────────────────────────────────────────────────
+
+GOOD_WIN_RATE_PCT = 60.0
+BAD_WIN_RATE_PCT  = 40.0
+
+# dimension -> (owning agent(s), what decision that agent should revisit)
+_BUCKET_AGENT_MAP = {
+    "strategy_rule":               ("Prediction Agent / Bull & Bear Agents",
+                                     "which deterministic strategy shape this rule routes to, and how Bull/Bear refine it"),
+    "oi_persistence":               ("Search Agent",
+                                     "the OI-buildup materiality threshold used when surfacing candidates"),
+    "iv_trend":                     ("Search Agent / Prediction Agent",
+                                     "how much weight IV-expansion state gets in candidate surfacing and routing"),
+    "window_length":                ("Search Agent",
+                                     "which trading-window lengths this agent should favor surfacing candidates for"),
+    "conviction_x_5min_confirmed":  ("Bull Agent / Bear Agent",
+                                     "confidence calibration — is stated confidence actually predictive here"),
+    "rule_conflict_triggered":      ("Prediction Agent / Bull & Bear Agents",
+                                     "whether THIS specific signal conflict should keep routing to tie-break, "
+                                     "and whether Bull/Bear's tie-break debate resolves it well"),
+}
+
+
+def _task_list_section(bucket_results: dict) -> dict[str, list[str]]:
+    """Groups every notably-good/notably-bad bucket finding under its
+    owning agent. Buckets not in _BUCKET_AGENT_MAP (the two intraday-
+    timing dimensions) fall under 'General / Entry Timing' - they're not
+    owned by one of the 5 named agents, they're a property of WHEN a
+    resolved pick opens, independent of which agent picked it."""
+    sections: dict[str, list[str]] = {}
+
+    def add(agent: str, line: str) -> None:
+        sections.setdefault(agent, []).append(line)
+
+    for dim, labels in bucket_results.items():
+        agent, decision = _BUCKET_AGENT_MAP.get(dim, ("General / Entry Timing", None))
+        for label, stats in labels.items():
+            if not stats["sufficient_sample"]:
+                continue
+            wr = stats["win_rate"]
+            if wr is None:
+                continue
+            if wr >= GOOD_WIN_RATE_PCT:
+                verdict = f"**working well** ({wr}% win rate, n={stats['sample_size']}) — lean into this"
+            elif wr <= BAD_WIN_RATE_PCT:
+                verdict = f"**underperforming** ({wr}% win rate, n={stats['sample_size']}) — reconsider this"
+            else:
+                continue
+            tail = f" — revisit {decision}" if decision else ""
+            add(agent, f"- `{dim}={label}`: {verdict}{tail}")
+
+    return sections
+
+
+def _generate_task_list(
+    week_start: date, week_end: date, overall: dict, bucket_results: dict,
+    timeframe_comparison: dict, wrong_trade_count: int, wrong_entry_count: int,
+) -> str:
+    lines = [
+        f"# Learning Agent task list — {week_start} to {week_end}",
+        "",
+        f"Rolling 7-day window: {overall['sample_size']} closed trades, "
+        f"{overall['win_rate']}% win rate, {overall['avg_pnl_pct']}% avg P&L.",
+        "",
+    ]
+
+    sections = _task_list_section(bucket_results)
+
+    verdict = timeframe_comparison.get("verdict")
+    if verdict and "insufficient" not in verdict:
+        sections.setdefault("General / Entry Timing", []).append(f"- {verdict}")
+
+    for agent in ["Search Agent", "News Agent", "Prediction Agent / Bull & Bear Agents",
+                  "Search Agent / Prediction Agent", "Bull Agent / Bear Agent",
+                  "General / Entry Timing"]:
+        findings = sections.pop(agent, None)
+        if not findings:
+            continue
+        lines.append(f"## {agent}")
+        lines.extend(findings)
+        lines.append("")
+
+    for agent, findings in sections.items():   # anything left over (defensive, shouldn't normally hit)
+        lines.append(f"## {agent}")
+        lines.extend(findings)
+        lines.append("")
+
+    # Wrong-trade vs wrong-entry — directly actionable for candidate
+    # selection (Search/Prediction) vs strategy/strike selection (Bull/
+    # Bear), the same split the rest of this module already computes.
+    if wrong_trade_count or wrong_entry_count:
+        lines.append("## Wrong-trade vs wrong-entry (losing trades)")
+        if wrong_trade_count >= wrong_entry_count and wrong_trade_count >= MIN_SAMPLE_SIZE:
+            lines.append(
+                f"- {wrong_trade_count} losses had NO entry-timing confirmation at all "
+                f"(vs {wrong_entry_count} that did and still lost) — the candidate itself was "
+                f"likely the problem, not the entry timing. **Search Agent / Prediction Agent**: "
+                f"tighten candidate surfacing/routing thresholds before this pattern repeats."
+            )
+        elif wrong_entry_count > wrong_trade_count and wrong_entry_count >= MIN_SAMPLE_SIZE:
+            lines.append(
+                f"- {wrong_entry_count} losses had entry-timing CONFIRMED and still lost "
+                f"(vs {wrong_trade_count} unconfirmed) — timing wasn't the issue. "
+                f"**Bull Agent / Bear Agent**: the strategy/strike selection itself needs review."
+            )
+        else:
+            lines.append(f"- {wrong_trade_count} unconfirmed-entry losses, {wrong_entry_count} "
+                          f"confirmed-entry losses — sample too small yet to attribute a pattern.")
+        lines.append("")
+
+    if len(lines) <= 4:   # nothing but the header/summary lines got added
+        lines.append("No bucket cleared both the minimum sample size and the "
+                      f"{GOOD_WIN_RATE_PCT}%/{BAD_WIN_RATE_PCT}% notability thresholds this run — "
+                      "nothing actionable yet, re-check tomorrow's rolling window.")
+
+    return "\n".join(lines)
+
+
+def _write_task_list_file(content: str) -> None:
+    """Item 26's literal 'task_list.md-writing output' - a real file on
+    disk, not just a DB column, so it's directly readable without a query.
+    Always overwritten with the latest run (this fires daily now, item
+    23) - gitignored, generated output, not source."""
+    import os
+    try:
+        path = os.path.join(os.path.dirname(__file__), "task_list.md")
+        with open(path, "w") as f:
+            f.write(content)
+    except Exception as e:
+        print(f"[WeeklyReview] task_list.md write failed (non-fatal): {e}")
+
+
 def run_weekly_strategy_review(user_id: str, week_start: date | None = None, week_end: date | None = None) -> dict:
     started_at = datetime.now(timezone.utc)
 
@@ -371,7 +529,14 @@ def run_weekly_strategy_review(user_id: str, week_start: date | None = None, wee
         overall, bucket_results, timeframe_comparison, wrong_trade_count, wrong_entry_count,
     )
 
-    _upsert_weekly_review_log(user_id, week_start, week_end, overall, wrong_trade_count, wrong_entry_count, llm_summary)
+    task_list_md = _generate_task_list(
+        week_start, week_end, overall, bucket_results,
+        timeframe_comparison, wrong_trade_count, wrong_entry_count,
+    )
+    _write_task_list_file(task_list_md)
+
+    _upsert_weekly_review_log(user_id, week_start, week_end, overall, wrong_trade_count,
+                               wrong_entry_count, llm_summary, task_list_md)
 
     status = "success"
     _log_job_run(
@@ -394,5 +559,6 @@ def run_weekly_strategy_review(user_id: str, week_start: date | None = None, wee
         "wrong_trade_count": wrong_trade_count, "wrong_entry_count": wrong_entry_count,
         "total_losses": len(losing_rows),
         "llm_summary": llm_summary,
+        "task_list_md": task_list_md,
         "status": status,
     }

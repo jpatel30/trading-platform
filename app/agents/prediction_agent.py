@@ -498,8 +498,13 @@ def run_tie_break_batch(user_id: str, budget: float = 2500.0) -> dict:
                     status = "resolved_duplicate"
                 else:
                     rec_id = _store_options_recommendation(user_id, window, budget, trade, market_view="tie_break")
+                    # abs() — entry_debit is signed (negative for credit
+                    # strategies); tracked_positions.entry_price must be
+                    # an unsigned magnitude. See paper_trading.py's
+                    # matching fix (run_paper_trade_open_options) for the
+                    # full rationale — same bug, same call pattern.
                     confirm_result = confirm_execution(
-                        user_id=user_id, symbol=ticker, entry_price=trade.get("entry_debit", 0),
+                        user_id=user_id, symbol=ticker, entry_price=abs(trade.get("entry_debit", 0)),
                         qty=trade.get("contracts", 0), recommendation_id=rec_id, source="auto_paper",
                         trading_window_days=window, budget=budget,
                     )

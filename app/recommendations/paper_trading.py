@@ -454,7 +454,20 @@ def run_paper_trade_open_options(user_id: str) -> dict:
                 return {"ok": True, "window": window, "budget": budget, "outcome": "empty",
                         "detail": "trade-math gate rejected at this budget"}
 
-            entry_price = trade.get("entry_debit", 0)
+            # entry_debit is signed (negative for credit strategies —
+            # strategy/engine.py's own convention, e.g. IRON_CONDOR).
+            # tracked_positions.entry_price must be an unsigned magnitude
+            # like every other consumer of it already assumes (WebullConnector's
+            # original unit_cost was always positive; get_trade_history's
+            # naive (exit-entry)/entry pnl% and the tracked-positions-as-
+            # broker-shape adapter both silently produced nonsense P&L for
+            # the negative rows this line used to create) - abs() here,
+            # same as _store_options_recommendation's entry_basis right
+            # above already does for daily_recommendations. Deliberately
+            # NOT touched: dr.entry_debit itself stays signed - run_paper_
+            # trade_close()'s mark_recommendation() is specifically
+            # credit/debit-aware and depends on that sign.
+            entry_price = abs(trade.get("entry_debit", 0))
             qty         = trade.get("contracts", 0)
             if not qty:
                 return {"ok": True, "window": window, "budget": budget, "outcome": "empty",

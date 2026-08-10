@@ -42,45 +42,86 @@ from datetime import datetime, timedelta
 # item 29 removed it. The 100x options-contract multiplier applied below
 # matches confirm_execution()'s own total_cost convention exactly (see
 # its `total_cost = entry_price * qty * 100` line) - not a new number.
+#
+# Options P&L: reuses mark_recommendation() (app/recommendations/
+# mark_to_market.py) rather than treating the underlying's stock price
+# as the option's premium (a real bug this had for one session - a
+# multi-leg spread's current value has no relationship to spot price,
+# and mark_recommendation is already the proven, credit/debit-aware,
+# capital-at-risk P&L calculation this codebase uses everywhere else an
+# open option position needs marking, e.g. run_paper_trade_close()).
+# Deduped per unique (ticker, legs) within one call - many auto_paper
+# grid rows (different qty/budget, same ticker+strategy+expiry) would
+# otherwise repeat the same live UW option-chain fetch needlessly.
 
 def get_positions_from_tracked(user_id: str) -> list[dict]:
+    import json
     from sqlalchemy import text
     from app.db.session import get_session
     from app.market_data.market_price import get_market_price
+    from app.recommendations.mark_to_market import mark_recommendation
+    from app.scanner.quick_scan import _is_market_open
 
     with get_session() as s:
         rows = s.execute(text("""
             SELECT tp.symbol, tp.entry_price, tp.qty, tp.entry_date, tp.source,
-                   tp.target_pct, tp.stop_pct, dr.legs
+                   tp.target_pct, tp.stop_pct,
+                   dr.legs, dr.entry_debit, dr.entry_zone_low, dr.max_loss, dr.max_profit
             FROM tracked_positions tp
             LEFT JOIN daily_recommendations dr ON dr.id = tp.daily_rec_id
             WHERE tp.user_id = :uid AND tp.is_active = TRUE
         """), {"uid": user_id}).fetchall()
 
+    market_open = _is_market_open()
+    mark_cache: dict[tuple, dict] = {}
+
     positions = []
     for r in rows:
         is_option  = bool(r.legs)
-        multiplier = 100 if is_option else 1
         qty        = float(r.qty)
-        unit_cost  = float(r.entry_price)
+        unit_cost  = float(r.entry_price)   # unsigned magnitude (see paper_trading.py fix)
 
-        try:
-            quote      = get_market_price(r.symbol)
-            last_price = float(quote.get("price") or unit_cost)
-        except Exception:
-            last_price = unit_cost
+        if is_option:
+            cache_key = (r.symbol, json.dumps(r.legs, sort_keys=True))
+            if cache_key not in mark_cache:
+                rec = {
+                    "ticker": r.symbol, "legs": r.legs,
+                    "entry_debit":    float(r.entry_debit or 0),
+                    "entry_zone_low": float(r.entry_zone_low or 0),
+                    "max_loss":       float(r.max_loss or 0),
+                    "max_profit":     float(r.max_profit or 0),
+                }
+                mark_cache[cache_key] = mark_recommendation(rec, is_market_open=market_open)
+            mark = mark_cache[cache_key]
 
-        total_cost   = unit_cost  * qty * multiplier
-        market_value = last_price * qty * multiplier
-        pnl          = market_value - total_cost
-        pnl_pct      = (pnl / total_cost) if total_cost else 0.0
+            total_cost = unit_cost * qty * 100
+            if mark.get("pnl_dollars") is not None:
+                pnl          = round(mark["pnl_dollars"] * qty, 2)
+                pnl_pct      = round(mark["pnl_pct"] / 100, 4) if mark.get("pnl_pct") is not None else 0.0
+                last_price   = round(unit_cost + (mark["pnl_dollars"] / 100.0), 2)
+                market_value = round(total_cost + pnl, 2)
+            else:
+                # Couldn't fetch a live quote for this contract (e.g.
+                # expired, illiquid) - report at cost rather than
+                # fabricating a P&L number.
+                pnl, pnl_pct, last_price, market_value = 0.0, 0.0, unit_cost, total_cost
+        else:
+            try:
+                quote      = get_market_price(r.symbol)
+                last_price = float(quote.get("price") or unit_cost)
+            except Exception:
+                last_price = unit_cost
+            total_cost   = unit_cost * qty
+            market_value = round(last_price * qty, 2)
+            pnl          = round(market_value - total_cost, 2)
+            pnl_pct      = round(pnl / total_cost, 4) if total_cost else 0.0
 
         positions.append({
             "symbol": r.symbol, "instrument_type": "OPTION" if is_option else "STOCK",
             "qty": qty, "unit_cost": unit_cost, "last_price": last_price,
-            "total_cost": round(total_cost, 2), "market_value": round(market_value, 2),
-            "unrealized_profit_loss": round(pnl, 2),
-            "unrealized_profit_loss_rate": round(pnl_pct, 4),
+            "total_cost": round(total_cost, 2), "market_value": market_value,
+            "unrealized_profit_loss": pnl,
+            "unrealized_profit_loss_rate": pnl_pct,
             "source": r.source, "entry_date": str(r.entry_date),
             "target_pct": float(r.target_pct) if r.target_pct is not None else None,
             "stop_pct": float(r.stop_pct) if r.stop_pct is not None else None,

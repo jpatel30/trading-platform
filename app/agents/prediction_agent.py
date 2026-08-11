@@ -429,6 +429,130 @@ def finalize_debate(debate: dict, routing: dict, budget: float, user_id: str) ->
 # value is introduced; the same shared ~20/day cap applies automatically
 # because DAILY_PICK_CAP/_count_todays_unique_picks are the same functions.
 
+def _finalize_and_open(
+    debate: dict, routing: dict, budget: float, user_id: str, window: int,
+    enriched: dict, market_view: str, which_rule_conflict_triggered: str | None = None,
+) -> tuple[str, dict | None]:
+    """
+    Shared by run_main_pass() (routed candidates) and run_tie_break_batch()
+    (tie-break candidates): finalize_debate() + open through the exact
+    same confirm_execution()/DAILY_PICK_CAP path paper_trading.py's grid
+    already uses for every other pick - one open mechanism, not two
+    copies of it. Returns (outcome, trade_or_None) where outcome is one
+    of "rejected" / "duplicate" / "confirm_failed" / "opened".
+    """
+    from app.recommendations.paper_trading import (
+        _already_opened_today, _store_paper_context, _store_options_recommendation, _iv_context,
+    )
+    from app.learning.prediction_tracker import confirm_execution
+
+    trade = finalize_debate(debate, routing, budget, user_id)
+    if not trade:
+        return "rejected", None
+
+    ticker = trade["ticker"]
+    if _already_opened_today(user_id, ticker, window, budget):
+        return "duplicate", trade
+
+    rec_id = _store_options_recommendation(user_id, window, budget, trade, market_view=market_view)
+    # abs() — entry_debit is signed (negative for credit strategies);
+    # tracked_positions.entry_price must be an unsigned magnitude, same
+    # fix as paper_trading.py::run_paper_trade_open_options.
+    confirm_result = confirm_execution(
+        user_id=user_id, symbol=ticker, entry_price=abs(trade.get("entry_debit", 0)),
+        qty=trade.get("contracts", 0), recommendation_id=rec_id, source="auto_paper",
+        trading_window_days=window, budget=budget,
+    )
+    if not (confirm_result.get("confirmed") or confirm_result.get("status") == "already_tracked"):
+        return "confirm_failed", trade
+
+    tracked_position_id = confirm_result.get("tracked_position_id") or confirm_result.get("id")
+    # paper_trade_context.iv_5day_trend is NUMERIC (weekly_review.py
+    # buckets it against IV_EXPANDING_THRESHOLD_PCT=5.0) - needs the same
+    # raw_change_pct _iv_context() gives run_paper_trade_open_options for
+    # this exact field, not enriched's iv_exp_signal (a categorical
+    # string) or iv_exp_score (a different, -100..100 weighted number -
+    # comparing that against a 5.0 raw-pct threshold would silently
+    # mis-bucket almost everything as "expanding").
+    _, iv_trend = _iv_context(ticker)
+    _store_paper_context(
+        recommendation_id=rec_id, tracked_position_id=tracked_position_id,
+        ticker=ticker, rec_type="options", window=window, budget=budget,
+        flow_score=enriched.get("flow_score"), dp_score=enriched.get("dp_score"),
+        oi_score=enriched.get("oi_score"), oi_max_days=enriched.get("oi_max_days"),
+        iv_level=enriched.get("iv_current"), iv_trend=iv_trend,
+        daily_ctx={}, intraday={}, market_ctx={},
+        conviction_score=trade.get("confidence"), strategy_selected=trade.get("strategy"),
+        strategy_rule=trade.get("strategy_rule", ""),
+        which_rule_conflict_triggered=which_rule_conflict_triggered,
+    )
+    return "opened", trade
+
+
+def run_main_pass(
+    user_id: str, enriched_candidates: list[dict], market_regime: dict | None = None,
+    market_context: dict | None = None, budget: float = 2500.0,
+) -> dict:
+    """
+    The real, automatic Search Agent -> Prediction Agent -> Bull/Bear ->
+    Finalize chain (items 7-10 + 18-19), run once per enriched candidate.
+    Routes every candidate (classify_and_store); for the ones that clear
+    direction cleanly (BULL_ONLY/BEAR_ONLY) runs the real debate +
+    finalize + open immediately, in this same pass. TIE_BREAK candidates
+    are the ONLY thing this function does not act on - classify_and_store
+    already queued them, and item 20 ("held back from the main pass
+    entirely") means exactly that: this function must never call
+    run_bull_bear_debate for a TIE_BREAK candidate itself. Resolving
+    them is run_tie_break_batch()'s job alone, invoked separately, later
+    (item 21) - never from inside this function.
+    """
+    from app.agents.bull_bear_agents import run_bull_bear_debate
+    from app.agents.retrieval_library import build_retrieval_context
+    from app.recommendations.paper_trading import DAILY_PICK_CAP, _count_todays_unique_picks
+
+    window = 21   # matches this module's own fixed rough routing horizon (route_candidate)
+    routed = tie_queued = opened = rejected = errored = 0
+
+    for enriched in enriched_candidates:
+        if _count_todays_unique_picks(user_id) >= DAILY_PICK_CAP:
+            print(f"[MainPass] daily cap ({DAILY_PICK_CAP}) reached — stopping routing early, "
+                  f"{len(enriched_candidates) - routed} candidate(s) not routed this run")
+            break
+
+        ticker = enriched.get("ticker", "?")
+        try:
+            routing = classify_and_store(user_id, enriched, market_regime)
+        except Exception as e:
+            errored += 1
+            print(f"[MainPass] {ticker}: routing failed: {e}")
+            continue
+
+        routed += 1
+        classification = routing["routing_classification"]
+
+        if classification == "TIE_BREAK":
+            tie_queued += 1
+            continue
+
+        try:
+            retrieval_context = build_retrieval_context(enriched, routing, user_id)
+            debate = run_bull_bear_debate(enriched, routing, market_context=market_context,
+                                           retrieval_context=retrieval_context)
+            outcome, _trade = _finalize_and_open(
+                debate, routing, budget, user_id, window, enriched, market_view="routed",
+            )
+            if outcome == "opened":
+                opened += 1
+            elif outcome == "rejected":
+                rejected += 1
+        except Exception as e:
+            errored += 1
+            print(f"[MainPass] {ticker}: debate/finalize failed: {e}")
+
+    return {"candidates_seen": len(enriched_candidates), "routed": routed,
+            "tie_queued": tie_queued, "opened": opened, "rejected": rejected, "errored": errored}
+
+
 def run_tie_break_batch(user_id: str, budget: float = 2500.0) -> dict:
     """
     Resolves every pending tie_break_queue row for this user: re-runs the
@@ -443,11 +567,7 @@ def run_tie_break_batch(user_id: str, budget: float = 2500.0) -> dict:
     from app.db.session import get_session
     from app.agents.bull_bear_agents import run_bull_bear_debate
     from app.agents.retrieval_library import build_retrieval_context
-    from app.recommendations.paper_trading import (
-        DAILY_PICK_CAP, _count_todays_unique_picks, _already_opened_today,
-        _store_paper_context, _store_options_recommendation,
-    )
-    from app.learning.prediction_tracker import confirm_execution
+    from app.recommendations.paper_trading import DAILY_PICK_CAP, _count_todays_unique_picks
 
     window = 21   # matches this module's own fixed rough routing horizon (route_candidate)
     resolved = opened = rejected = errored = 0
@@ -490,41 +610,14 @@ def run_tie_break_batch(user_id: str, budget: float = 2500.0) -> dict:
         try:
             retrieval_context = build_retrieval_context(enriched, routing, user_id)
             debate = run_bull_bear_debate(enriched, routing, retrieval_context=retrieval_context)
-            trade  = finalize_debate(debate, routing, budget, user_id)
-
-            if trade:
-                ticker = trade["ticker"]
-                if _already_opened_today(user_id, ticker, window, budget):
-                    status = "resolved_duplicate"
-                else:
-                    rec_id = _store_options_recommendation(user_id, window, budget, trade, market_view="tie_break")
-                    # abs() — entry_debit is signed (negative for credit
-                    # strategies); tracked_positions.entry_price must be
-                    # an unsigned magnitude. See paper_trading.py's
-                    # matching fix (run_paper_trade_open_options) for the
-                    # full rationale — same bug, same call pattern.
-                    confirm_result = confirm_execution(
-                        user_id=user_id, symbol=ticker, entry_price=abs(trade.get("entry_debit", 0)),
-                        qty=trade.get("contracts", 0), recommendation_id=rec_id, source="auto_paper",
-                        trading_window_days=window, budget=budget,
-                    )
-                    if confirm_result.get("confirmed") or confirm_result.get("status") == "already_tracked":
-                        tracked_position_id = confirm_result.get("tracked_position_id") or confirm_result.get("id")
-                        _store_paper_context(
-                            recommendation_id=rec_id, tracked_position_id=tracked_position_id,
-                            ticker=ticker, rec_type="options", window=window, budget=budget,
-                            flow_score=enriched.get("flow_score"), dp_score=enriched.get("dp_score"),
-                            oi_score=enriched.get("oi_score"), oi_max_days=enriched.get("oi_max_days"),
-                            iv_level=enriched.get("iv_current"), iv_trend=enriched.get("iv_exp_signal"),
-                            daily_ctx={}, intraday={}, market_ctx={},
-                            conviction_score=trade.get("confidence"), strategy_selected=trade.get("strategy"),
-                            strategy_rule=trade.get("strategy_rule", ""),
-                            which_rule_conflict_triggered=row.which_rule_conflict_triggered,
-                        )
-                        status, opened = "resolved_opened", opened + 1
-                    else:
-                        status = "resolved_confirm_failed"
-            else:
+            outcome, _trade = _finalize_and_open(
+                debate, routing, budget, user_id, window, enriched, market_view="tie_break",
+                which_rule_conflict_triggered=row.which_rule_conflict_triggered,
+            )
+            status = f"resolved_{outcome}"
+            if outcome == "opened":
+                opened += 1
+            elif outcome == "rejected":
                 rejected += 1
         except Exception as e:
             errored += 1

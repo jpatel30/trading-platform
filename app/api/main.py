@@ -345,6 +345,53 @@ async def startup_event():
             except Exception as e:
                 print(f"[Scheduler] Velocity snapshot failed: {e}")
 
+        def _run_main_pass(user_id: str, candidates: list, trigger: str):
+            """
+            MULTIAGENT_MIGRATION.md items 7-10 + 18-19, wired live: takes
+            the admin account's own Search Agent candidates (from the
+            loop below), enriches them, and routes them through
+            Prediction Agent -> Bull/Bear -> Finalize, opening real
+            (paper) positions for whichever clear direction cleanly.
+            Admin-only, same single-platform-signal-generation principle
+            every other paper-trading job in this scheduler already
+            follows (see _get_paper_trade_admin_user_id's docstring
+            further down) - this is what OPENS real positions, so unlike
+            the scan itself (which legitimately runs per-user, below),
+            it must never fan out across every active user.
+
+            Called synchronously, same scheduled fire as the search scan
+            that produced `candidates` - item 21's "tie-break batch runs
+            only after the main pass fully completes" is satisfied by
+            this finishing before the function returns, well before the
+            separately-scheduled 8:30am PT tie_break_batch job (which
+            fires at least ~2.5h after pre_open, and the next calendar
+            day after post_close).
+            """
+            try:
+                from app.agents.search_agent import enrich_candidates
+                from app.agents.prediction_agent import run_main_pass
+                from app.rag.context_builder import _build_vix_context
+                from app.signals.market_regime import get_full_market_regime
+                from app.agents.news_agent import build_macro_context
+
+                enriched = enrich_candidates(candidates, user_id)
+                if not enriched:
+                    print(f"[Scheduler] Main pass ({trigger}): no enriched candidates, skipping")
+                    return
+
+                regime = get_full_market_regime()
+                vix    = _build_vix_context()
+                macro  = build_macro_context()
+                market_context = {
+                    "vix": vix, "regime": regime,
+                    "econ_events": macro.get("upcoming_events", "no data"),
+                }
+
+                result = run_main_pass(user_id, enriched, market_regime=regime, market_context=market_context)
+                print(f"[Scheduler] Main pass ({trigger}): {result}")
+            except Exception as e:
+                print(f"[Scheduler] Main pass ({trigger}) failed: {e}")
+
         def _run_search_agent(trigger: str):
             """
             MULTIAGENT_MIGRATION.md Phase A, item 2 — the same full
@@ -359,15 +406,22 @@ async def startup_event():
                 from app.db.session import get_session
                 from app.agents.search_agent import run_search_agent
                 with get_session() as s:
-                    users = s.execute(text("SELECT id FROM users WHERE is_active=TRUE")).fetchall()
+                    users = s.execute(text("SELECT id, is_admin FROM users WHERE is_active=TRUE")).fetchall()
+                admin_uid, admin_candidates = None, None
                 for u in users:
                     result = run_search_agent(str(u.id), trigger=trigger)
                     print(f"[Scheduler] Search agent ({trigger}): "
                           f"{result['universe_size']} tickers, "
                           f"batch={result['batch'].get('status')}, "
                           f"{len(result['candidates'])} candidates")
+                    if u.is_admin:
+                        admin_uid, admin_candidates = str(u.id), result["candidates"]
             except Exception as e:
                 print(f"[Scheduler] Search agent ({trigger}) failed: {e}")
+                return
+
+            if admin_uid and admin_candidates:
+                _run_main_pass(admin_uid, admin_candidates, trigger)
 
         def _run_news_agent(trigger: str):
             """

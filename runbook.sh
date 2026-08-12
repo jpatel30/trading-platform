@@ -69,6 +69,31 @@ start_news_agent() {
     echo $! > /tmp/news_agent_service.pid
 }
 
+# Start Prediction Agent service (MULTIAGENT_MIGRATION.md Phase B.2 —
+# own process, own scheduler: enqueues routed/tie-break candidates and
+# finalizes answered debates, no longer run in-process by start_api)
+start_prediction_agent() {
+    python3 -m app.services.prediction_agent_service &
+    echo "✅ Prediction Agent service started (PID: $!)"
+    echo $! > /tmp/prediction_agent_service.pid
+}
+
+# Start Bull Agent service (MULTIAGENT_MIGRATION.md Phase B.2 — own
+# process, own scheduler, answers pending 'bull' debate_requests)
+start_bull_agent() {
+    python3 -m app.services.bull_agent_service &
+    echo "✅ Bull Agent service started (PID: $!)"
+    echo $! > /tmp/bull_agent_service.pid
+}
+
+# Start Bear Agent service (MULTIAGENT_MIGRATION.md Phase B.2 — own
+# process, own scheduler, answers pending 'bear' debate_requests)
+start_bear_agent() {
+    python3 -m app.services.bear_agent_service &
+    echo "✅ Bear Agent service started (PID: $!)"
+    echo $! > /tmp/bear_agent_service.pid
+}
+
 # Start StockBros dashboard
 start_dashboard() {
     cd ~/Documents/Claude/Projects/stockbros
@@ -290,7 +315,7 @@ PYEOF
 # ─────────────────────────────────────────────────────────────────────────────
 
 case "${1}" in
-    start)       keep_awake; start_docker; start_ollama; start_mcp; start_api; start_search_agent; start_news_agent ;;
+    start)       keep_awake; start_docker; start_ollama; start_mcp; start_api; start_search_agent; start_news_agent; start_prediction_agent; start_bull_agent; start_bear_agent ;;
     dashboard)   start_dashboard ;;
     morning)     morning_prep ;;
     sells)       check_sells ;;
@@ -302,7 +327,7 @@ case "${1}" in
         echo "Usage: bash RUNBOOK.sh [command]"
         echo ""
         echo "Commands:"
-        echo "  start      Start all services (Docker, Ollama, MCP, API, Search Agent, News Agent)"
+        echo "  start      Start all services (Docker, Ollama, MCP, API, Search/News/Prediction/Bull/Bear Agents)"
         echo "  dashboard  Start StockBros dashboard"
         echo "  morning    Run morning scan (7-8 AM ET)"
         echo "  sells      Check sell signals"

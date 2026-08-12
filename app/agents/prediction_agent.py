@@ -403,31 +403,43 @@ def finalize_debate(debate: dict, routing: dict, budget: float, user_id: str) ->
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Tie-break sequencing (items 20-22)
+# Tie-break sequencing (items 20-22) + service split (Phase B.2)
 # ─────────────────────────────────────────────────────────────────────────────
 #
 # Item 20: classify_and_store() (above) already only ever WRITES a
 # tie_break_queue row (status='pending') - it never calls
-# run_bull_bear_debate/finalize_debate inline. A main pass that loops
+# run_bull_bear_debate/finalize_debate inline. A routing pass that loops
 # candidates through classify_and_store already runs start-to-finish with
 # the queue purely accumulating, untouched, by construction - nothing
 # further needed here to satisfy item 20 itself.
 #
-# Item 21: run_tie_break_batch() below is that separate, later process.
-# app/api/main.py only ever schedules it after the main routing pass's own
-# job (search_agent_pre_open) has fully finished - never concurrently -
-# same reasoning bull_bear_agents.py's docstring already documents for
-# tie_break mode itself (the enrichment-timeout/rate-limiter bug: threads
-# competing for the same rate-limited UW resources).
+# Item 21/39: Bull Agent and Bear Agent are now separate processes
+# (app/services/bull_agent_service.py, bear_agent_service.py) - the old
+# synchronous route -> debate -> finalize chain (run_main_pass()/
+# run_tie_break_batch(), both removed) can no longer call
+# run_bull_bear_debate() directly and get a result back in the same
+# function call. Splits into three stages instead, all mediated through
+# the debate_requests table (item 39 - no direct calls across a service
+# boundary):
 #
-# Item 22: resolved winners open through the EXACT SAME
+#   enqueue_routed_candidates() / enqueue_tie_break_candidates() (below,
+#       this module, Prediction Agent service) -> INSERT debate_requests
+#   process_pending_debate_requests() (bull_bear_agents.py, Bull/Bear
+#       services) -> UPDATE those rows with a real answer
+#   finalize_pending_debates() (below, this module, Prediction Agent
+#       service, later) -> reads answered rows, calls the SAME
+#       finalize_debate()/_finalize_and_open() as before, opens real
+#       positions
+#
+# app/services/prediction_agent_service.py schedules all three
+# Prediction-Agent-owned stages with a 10-minute buffer between each so
+# Bull/Bear have a real window to answer before Finalize looks - same
+# buffered-CronTrigger pattern Phase B.1 already established between
+# Search/News and their downstream consumer.
+#
+# Item 22: resolved winners still open through the EXACT SAME
 # confirm_execution()/DAILY_PICK_CAP path paper_trading.py's grid already
-# uses for every other pick - not a new opening mechanism - and
-# app/api/main.py schedules this batch at the (8, 30) PT slot, the first
-# of the 3 windows the doc names as eligible (6:40 excluded: not enough
-# buffer after the pre-open pass this batch depends on). No new time slot
-# value is introduced; the same shared ~20/day cap applies automatically
-# because DAILY_PICK_CAP/_count_todays_unique_picks are the same functions.
+# uses for every other pick - not a new opening mechanism.
 
 def _finalize_and_open(
     debate: dict, routing: dict, budget: float, user_id: str, window: int,
@@ -489,33 +501,30 @@ def _finalize_and_open(
     return "opened", trade
 
 
-def run_main_pass(
+def enqueue_routed_candidates(
     user_id: str, enriched_candidates: list[dict], market_regime: dict | None = None,
-    market_context: dict | None = None, budget: float = 2500.0,
+    market_context: dict | None = None,
 ) -> dict:
     """
-    The real, automatic Search Agent -> Prediction Agent -> Bull/Bear ->
-    Finalize chain (items 7-10 + 18-19), run once per enriched candidate.
-    Routes every candidate (classify_and_store); for the ones that clear
-    direction cleanly (BULL_ONLY/BEAR_ONLY) runs the real debate +
-    finalize + open immediately, in this same pass. TIE_BREAK candidates
-    are the ONLY thing this function does not act on - classify_and_store
-    already queued them, and item 20 ("held back from the main pass
-    entirely") means exactly that: this function must never call
-    run_bull_bear_debate for a TIE_BREAK candidate itself. Resolving
-    them is run_tie_break_batch()'s job alone, invoked separately, later
-    (item 21) - never from inside this function.
+    Routes every candidate (classify_and_store, unchanged) and, for the
+    ones that clear direction cleanly (BULL_ONLY/BEAR_ONLY), enqueues ONE
+    debate_requests row for whichever agent it routed to - replaces the
+    old run_main_pass()'s direct run_bull_bear_debate() call. TIE_BREAK
+    candidates: classify_and_store already queues them into
+    tie_break_queue: enqueue_tie_break_candidates() (below) is what turns
+    THOSE into debate_requests rows, on its own later schedule.
     """
-    from app.agents.bull_bear_agents import run_bull_bear_debate
+    import json
+    from sqlalchemy import text
+    from app.db.session import get_session
     from app.agents.retrieval_library import build_retrieval_context
     from app.recommendations.paper_trading import DAILY_PICK_CAP, _count_todays_unique_picks
 
-    window = 21   # matches this module's own fixed rough routing horizon (route_candidate)
-    routed = tie_queued = opened = rejected = errored = 0
+    routed = tie_queued = enqueued = errored = 0
 
     for enriched in enriched_candidates:
         if _count_todays_unique_picks(user_id) >= DAILY_PICK_CAP:
-            print(f"[MainPass] daily cap ({DAILY_PICK_CAP}) reached — stopping routing early, "
+            print(f"[Enqueue] daily cap ({DAILY_PICK_CAP}) reached — stopping routing early, "
                   f"{len(enriched_candidates) - routed} candidate(s) not routed this run")
             break
 
@@ -524,7 +533,7 @@ def run_main_pass(
             routing = classify_and_store(user_id, enriched, market_regime)
         except Exception as e:
             errored += 1
-            print(f"[MainPass] {ticker}: routing failed: {e}")
+            print(f"[Enqueue] {ticker}: routing failed: {e}")
             continue
 
         routed += 1
@@ -534,48 +543,51 @@ def run_main_pass(
             tie_queued += 1
             continue
 
+        agent = "bull" if classification == "BULL_ONLY" else "bear"
         try:
             retrieval_context = build_retrieval_context(enriched, routing, user_id)
-            debate = run_bull_bear_debate(enriched, routing, market_context=market_context,
-                                           retrieval_context=retrieval_context)
-            outcome, _trade = _finalize_and_open(
-                debate, routing, budget, user_id, window, enriched, market_view="routed",
-            )
-            if outcome == "opened":
-                opened += 1
-            elif outcome == "rejected":
-                rejected += 1
+            with get_session() as db:
+                db.execute(text("""
+                    INSERT INTO debate_requests (
+                        candidate_direction_id, user_id, ticker, agent, mode,
+                        enriched_snapshot, routing_snapshot, market_context, retrieval_context
+                    ) VALUES (
+                        :cdid, :uid, :ticker, :agent, 'routed',
+                        CAST(:enriched AS jsonb), CAST(:routing AS jsonb), CAST(:mctx AS jsonb), :retrieval
+                    )
+                """), {
+                    "cdid": routing["candidate_direction_id"], "uid": user_id, "ticker": ticker,
+                    "agent": agent, "enriched": json.dumps(enriched, default=str),
+                    "routing": json.dumps(routing, default=str),
+                    "mctx": json.dumps(market_context, default=str) if market_context else None,
+                    "retrieval": retrieval_context,
+                })
+            enqueued += 1
         except Exception as e:
             errored += 1
-            print(f"[MainPass] {ticker}: debate/finalize failed: {e}")
+            print(f"[Enqueue] {ticker}: debate_requests insert failed: {e}")
 
     return {"candidates_seen": len(enriched_candidates), "routed": routed,
-            "tie_queued": tie_queued, "opened": opened, "rejected": rejected, "errored": errored}
+            "tie_queued": tie_queued, "enqueued": enqueued, "errored": errored}
 
 
-def run_tie_break_batch(user_id: str, budget: float = 2500.0) -> dict:
+def enqueue_tie_break_candidates(user_id: str) -> dict:
     """
-    Resolves every pending tie_break_queue row for this user: re-runs the
-    debate (both agents, from the enriched_snapshot stored at routing
-    time - no re-fetch of live paid data), finalizes against the real
-    gates, and - if a real trade survives - opens it exactly like any
-    other paper-trading pick, so the Learning Agent's stats can't tell a
-    tie-break open apart from a routed one except by the
-    which_rule_conflict_triggered tag on it.
+    Turns pending tie_break_queue rows into TWO debate_requests rows each
+    (bull + bear, mode='tie_break') - replaces the enqueue half of the
+    old run_tie_break_batch(). Marks the tie_break_queue row
+    'debate_queued' so a later run of this function doesn't re-enqueue
+    it - finalize_pending_debates() (below) is what eventually moves it
+    to a resolved_* terminal status.
     """
+    import json
     from sqlalchemy import text
     from app.db.session import get_session
-    from app.agents.bull_bear_agents import run_bull_bear_debate
     from app.agents.retrieval_library import build_retrieval_context
-    from app.recommendations.paper_trading import DAILY_PICK_CAP, _count_todays_unique_picks
-
-    window = 21   # matches this module's own fixed rough routing horizon (route_candidate)
-    resolved = opened = rejected = errored = 0
 
     with get_session() as db:
         pending = db.execute(text("""
-            SELECT q.id, q.ticker,
-                   q.which_rule_conflict_triggered, q.enriched_snapshot,
+            SELECT q.id, q.candidate_direction_id, q.ticker, q.enriched_snapshot,
                    cd.direction_lean, cd.confidence_of_routing, cd.strategy_shape,
                    cd.rough_strikes, cd.expiry, cd.clears_rough_rr_gate, cd.rough_rr,
                    cd.signal_votes, cd.routing_classification
@@ -585,16 +597,12 @@ def run_tie_break_batch(user_id: str, budget: float = 2500.0) -> dict:
             ORDER BY q.created_at ASC
         """), {"uid": user_id}).fetchall()
 
+    enqueued = errored = 0
     for row in pending:
-        if _count_todays_unique_picks(user_id) >= DAILY_PICK_CAP:
-            print(f"[TieBreakBatch] daily cap ({DAILY_PICK_CAP}) reached — "
-                  f"stopping, {len(pending) - resolved} row(s) left pending for tomorrow's batch")
-            break
-
         enriched = row.enriched_snapshot or {}
         if not enriched:
             errored += 1
-            print(f"[TieBreakBatch] {row.ticker}: no enriched_snapshot stored — skipping")
+            print(f"[EnqueueTieBreak] {row.ticker}: no enriched_snapshot stored — skipping")
             continue
 
         routing = {
@@ -606,28 +614,123 @@ def run_tie_break_batch(user_id: str, budget: float = 2500.0) -> dict:
             "signal_votes": row.signal_votes or [], "routing_classification": row.routing_classification,
         }
 
-        status = "resolved_rejected"
         try:
             retrieval_context = build_retrieval_context(enriched, routing, user_id)
-            debate = run_bull_bear_debate(enriched, routing, retrieval_context=retrieval_context)
+            with get_session() as db:
+                for agent in ("bull", "bear"):
+                    db.execute(text("""
+                        INSERT INTO debate_requests (
+                            candidate_direction_id, user_id, ticker, agent, mode,
+                            enriched_snapshot, routing_snapshot, retrieval_context
+                        ) VALUES (
+                            :cdid, :uid, :ticker, :agent, 'tie_break',
+                            CAST(:enriched AS jsonb), CAST(:routing AS jsonb), :retrieval
+                        )
+                    """), {
+                        "cdid": row.candidate_direction_id, "uid": user_id, "ticker": row.ticker,
+                        "agent": agent, "enriched": json.dumps(enriched, default=str),
+                        "routing": json.dumps(routing, default=str), "retrieval": retrieval_context,
+                    })
+                db.execute(text("UPDATE tie_break_queue SET status = 'debate_queued' WHERE id = :id"),
+                           {"id": row.id})
+            enqueued += 1
+        except Exception as e:
+            errored += 1
+            print(f"[EnqueueTieBreak] {row.ticker}: enqueue failed: {e}")
+
+    return {"pending_seen": len(pending), "enqueued": enqueued, "errored": errored}
+
+
+def finalize_pending_debates(user_id: str, budget: float = 2500.0, stale_after_minutes: int = 0) -> dict:
+    """
+    Finalize pass: first times out anything still 'pending' - by the
+    time this runs, Bull/Bear's own scheduled check already had its
+    buffered window to answer (app/services/prediction_agent_service.py's
+    CronTrigger spacing is what defines "stuck", not an age check on its
+    own - stale_after_minutes=0 means "still pending at all, at finalize
+    time, is the timeout"). Then finalizes every candidate whose
+    debate_requests rows are all settled (answered/error/timed_out) and
+    not yet finalized - same real gates, same open path as before
+    (_finalize_and_open, unchanged).
+    """
+    from sqlalchemy import text
+    from app.db.session import get_session
+
+    with get_session() as db:
+        timed_out = db.execute(text("""
+            UPDATE debate_requests
+            SET status = 'timed_out', error_reason = 'no response by finalize time', answered_at = now()
+            WHERE user_id = :uid AND status = 'pending'
+              AND created_at < now() - (:mins || ' minutes')::interval
+            RETURNING id
+        """), {"uid": user_id, "mins": stale_after_minutes}).fetchall()
+        if timed_out:
+            print(f"[Finalize] {len(timed_out)} debate_requests row(s) timed out")
+
+        ready = db.execute(text("""
+            SELECT dr.candidate_direction_id
+            FROM debate_requests dr
+            JOIN candidate_directions cd ON cd.id = dr.candidate_direction_id
+            WHERE dr.user_id = :uid AND cd.finalized_at IS NULL
+            GROUP BY dr.candidate_direction_id
+            HAVING COUNT(*) = COUNT(*) FILTER (WHERE dr.status IN ('answered','error','timed_out'))
+        """), {"uid": user_id}).fetchall()
+
+    finalized = opened = rejected = errored = 0
+    for r in ready:
+        cdid = r.candidate_direction_id
+        try:
+            with get_session() as db:
+                rows = db.execute(text("""
+                    SELECT dr.agent, dr.mode, dr.result, dr.ticker, dr.enriched_snapshot,
+                           cd.direction_lean, cd.confidence_of_routing, cd.strategy_shape,
+                           cd.rough_strikes, cd.expiry, cd.clears_rough_rr_gate, cd.rough_rr,
+                           cd.signal_votes, cd.routing_classification
+                    FROM debate_requests dr
+                    JOIN candidate_directions cd ON cd.id = dr.candidate_direction_id
+                    WHERE dr.candidate_direction_id = :cdid
+                """), {"cdid": cdid}).fetchall()
+
+            first    = rows[0]
+            ticker   = first.ticker
+            mode     = first.mode
+            enriched = first.enriched_snapshot or {}
+            routing = {
+                "ticker": ticker, "direction_lean": first.direction_lean,
+                "strategy_shape": first.strategy_shape, "rough_strikes": first.rough_strikes or [],
+                "expiry": str(first.expiry) if first.expiry else None,
+                "confidence_of_routing": first.confidence_of_routing,
+                "clears_rough_rr_gate": first.clears_rough_rr_gate, "rough_rr": float(first.rough_rr or 0),
+                "signal_votes": first.signal_votes or [], "routing_classification": first.routing_classification,
+            }
+            bull = next((row.result for row in rows if row.agent == "bull" and row.result), None)
+            bear = next((row.result for row in rows if row.agent == "bear" and row.result), None)
+            debate = {"ticker": ticker, "mode": mode, "bull": bull, "bear": bear}
+
+            which_conflict = _conflict_description(routing["signal_votes"]) if mode == "tie_break" else None
             outcome, _trade = _finalize_and_open(
-                debate, routing, budget, user_id, window, enriched, market_view="tie_break",
-                which_rule_conflict_triggered=row.which_rule_conflict_triggered,
+                debate, routing, budget, user_id, window=21, enriched=enriched,
+                market_view=mode, which_rule_conflict_triggered=which_conflict,
             )
-            status = f"resolved_{outcome}"
+            finalized += 1
             if outcome == "opened":
                 opened += 1
             elif outcome == "rejected":
                 rejected += 1
+
+            with get_session() as db:
+                db.execute(text("""
+                    UPDATE candidate_directions SET finalized_at = now(), finalize_outcome = :outcome
+                    WHERE id = :cdid
+                """), {"outcome": outcome, "cdid": cdid})
+                if mode == "tie_break":
+                    db.execute(text("""
+                        UPDATE tie_break_queue SET status = :status, resolved_at = now()
+                        WHERE candidate_direction_id = :cdid
+                    """), {"status": f"resolved_{outcome}", "cdid": cdid})
         except Exception as e:
             errored += 1
-            status = "resolved_error"
-            print(f"[TieBreakBatch] {row.ticker}: {e}")
+            print(f"[Finalize] candidate_direction_id={cdid}: {e}")
 
-        with get_session() as db:
-            db.execute(text("UPDATE tie_break_queue SET status = :status, resolved_at = now() WHERE id = :id"),
-                       {"status": status, "id": row.id})
-        resolved += 1
-
-    return {"pending_seen": len(pending), "resolved": resolved, "opened": opened,
-            "rejected": rejected, "errored": errored}
+    return {"timed_out": len(timed_out), "candidates_ready": len(ready),
+            "finalized": finalized, "opened": opened, "rejected": rejected, "errored": errored}

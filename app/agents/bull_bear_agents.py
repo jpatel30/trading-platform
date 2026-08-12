@@ -206,6 +206,12 @@ def run_bull_bear_debate(
     (from prediction_agent.py::classify_and_store) and calls the
     right agent(s) - one for BULL_ONLY/BEAR_ONLY (routed mode), both
     for TIE_BREAK (tie_break mode).
+
+    Only used for direct, same-process calls (e.g. manual verification)
+    now that Bull/Bear are separate services - the real scheduled path
+    is process_pending_debate_requests() below, one agent at a time,
+    reading from the debate_requests queue instead of calling both
+    agents together in one function call.
     """
     classification = routing.get("routing_classification")
     ticker = enriched.get("ticker", routing.get("ticker", "?"))
@@ -225,3 +231,80 @@ def run_bull_bear_debate(
 
     return {"ticker": ticker, "mode": None, "bull": None, "bear": None,
             "error": f"unknown routing_classification: {classification!r}"}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Service split (Phase B.2) — process_pending_debate_requests
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Bull Agent and Bear Agent are each their own process now (app/services/
+# bull_agent_service.py, bear_agent_service.py). Each calls this same
+# function, parameterized by which agent it is - one function, not two
+# near-identical copies, matching run_bull_agent/run_bear_agent's own
+# already-parallel shape. Prediction Agent (a separate process, app/
+# agents/prediction_agent.py::enqueue_routed_candidates/
+# enqueue_tie_break_candidates) writes the pending rows this reads;
+# reading them back is the entire inter-service contract (item 39) -
+# this function never imports anything from prediction_agent.py.
+
+def process_pending_debate_requests(agent: str, limit: int = 20) -> dict:
+    """
+    Answers every pending debate_requests row for this agent
+    ('bull' | 'bear'): calls the existing run_bull_agent()/
+    run_bear_agent() (unchanged - same prompt, same LLM call) using the
+    enriched/routing/market_context/retrieval_context snapshots
+    Prediction Agent stored at enqueue time, writes the real result back.
+    """
+    import json
+    from sqlalchemy import text
+    from app.db.session import get_session
+
+    if agent not in ("bull", "bear"):
+        raise ValueError(f"agent must be 'bull' or 'bear', got {agent!r}")
+    run_agent = run_bull_agent if agent == "bull" else run_bear_agent
+
+    with get_session() as db:
+        pending = db.execute(text("""
+            SELECT id, ticker, mode, enriched_snapshot, routing_snapshot,
+                   market_context, retrieval_context
+            FROM debate_requests
+            WHERE agent = :agent AND status = 'pending'
+            ORDER BY created_at ASC
+            LIMIT :limit
+        """), {"agent": agent, "limit": limit}).fetchall()
+
+    answered = errored = 0
+    for row in pending:
+        try:
+            result = run_agent(
+                row.enriched_snapshot or {}, row.routing_snapshot or {},
+                market_context=row.market_context, mode=row.mode,
+                retrieval_context=row.retrieval_context or "",
+            )
+            with get_session() as db:
+                if result:
+                    db.execute(text("""
+                        UPDATE debate_requests
+                        SET status = 'answered', result = CAST(:result AS jsonb), answered_at = now()
+                        WHERE id = :id
+                    """), {"result": json.dumps(result, default=str), "id": row.id})
+                    answered += 1
+                else:
+                    db.execute(text("""
+                        UPDATE debate_requests
+                        SET status = 'error', error_reason = :reason, answered_at = now()
+                        WHERE id = :id
+                    """), {"reason": f"{agent} agent returned no result (LLM call failed or unparseable)",
+                           "id": row.id})
+                    errored += 1
+        except Exception as e:
+            with get_session() as db:
+                db.execute(text("""
+                    UPDATE debate_requests
+                    SET status = 'error', error_reason = :reason, answered_at = now()
+                    WHERE id = :id
+                """), {"reason": str(e)[:500], "id": row.id})
+            errored += 1
+            print(f"[{agent.title()}AgentService] {row.ticker}: {e}")
+
+    return {"pending_seen": len(pending), "answered": answered, "errored": errored}

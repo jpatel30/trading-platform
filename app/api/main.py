@@ -345,103 +345,80 @@ async def startup_event():
             except Exception as e:
                 print(f"[Scheduler] Velocity snapshot failed: {e}")
 
-        def _run_main_pass(user_id: str, candidates: list, trigger: str):
+        def _run_main_pass(trigger: str):
             """
-            MULTIAGENT_MIGRATION.md items 7-10 + 18-19, wired live: takes
-            the admin account's own Search Agent candidates (from the
-            loop below), enriches them, and routes them through
-            Prediction Agent -> Bull/Bear -> Finalize, opening real
-            (paper) positions for whichever clear direction cleanly.
-            Admin-only, same single-platform-signal-generation principle
-            every other paper-trading job in this scheduler already
-            follows (see _get_paper_trade_admin_user_id's docstring
-            further down) - this is what OPENS real positions, so unlike
-            the scan itself (which legitimately runs per-user, below),
-            it must never fan out across every active user.
+            MULTIAGENT_MIGRATION.md items 7-10 + 18-19, wired live:
+            routes Search Agent's candidates through Prediction Agent ->
+            Bull/Bear -> Finalize, opening real (paper) positions for
+            whichever clear direction cleanly. Admin-only, same
+            single-platform-signal-generation principle every other
+            paper-trading job in this scheduler already follows (see
+            _get_paper_trade_admin_user_id's docstring further down).
 
-            Called synchronously, same scheduled fire as the search scan
-            that produced `candidates` - item 21's "tie-break batch runs
-            only after the main pass fully completes" is satisfied by
-            this finishing before the function returns, well before the
-            separately-scheduled 8:30am PT tie_break_batch job (which
-            fires at least ~2.5h after pre_open, and the next calendar
-            day after post_close).
+            Phase B.1 split Search Agent and News Agent into their own
+            standalone processes (app/services/search_agent_service.py,
+            news_agent_service.py) - this function no longer imports or
+            calls either directly (that would just recreate the
+            in-process coupling Phase B exists to remove). It reads
+            today's admin snapshot from search_agent_snapshot and
+            news_agent_snapshot instead, written by those services on
+            the SAME two daily triggers. Scheduled 10 minutes after
+            their known fire times (16:25 ET, 06:10 PT below) -
+            comfortably more than the ~5 minutes a real Search Agent run
+            took in live verification - so the snapshot rows are
+            reliably there by the time this fires. Skips cleanly (not an
+            error) if the search snapshot is missing, same graceful-
+            degradation shape _get_paper_trade_admin_user_id's "no admin
+            user found" skip already uses elsewhere in this scheduler.
+
+            Item 21's "tie-break batch runs only after the main pass
+            fully completes" is satisfied the same way as before: this
+            function finishes before returning, well before the
+            separately-scheduled 8:30am PT tie_break_batch job.
             """
             try:
-                from app.agents.search_agent import enrich_candidates
+                from sqlalchemy import text
+                from app.db.session import get_session
                 from app.agents.prediction_agent import run_main_pass
                 from app.rag.context_builder import _build_vix_context
                 from app.signals.market_regime import get_full_market_regime
-                from app.agents.news_agent import build_macro_context
 
-                enriched = enrich_candidates(candidates, user_id)
-                if not enriched:
-                    print(f"[Scheduler] Main pass ({trigger}): no enriched candidates, skipping")
+                admin_uid = _get_paper_trade_admin_user_id()
+                if not admin_uid:
+                    print(f"[Scheduler] Main pass ({trigger}) skipped: no admin user found")
                     return
+
+                with get_session() as s:
+                    search_row = s.execute(text("""
+                        SELECT enriched_candidates FROM search_agent_snapshot
+                        WHERE user_id = :uid AND scan_date = CURRENT_DATE AND trigger = :trigger
+                        ORDER BY created_at DESC LIMIT 1
+                    """), {"uid": admin_uid, "trigger": trigger}).fetchone()
+                    news_row = s.execute(text("""
+                        SELECT macro FROM news_agent_snapshot
+                        WHERE snapshot_date = CURRENT_DATE AND trigger = :trigger
+                        ORDER BY created_at DESC LIMIT 1
+                    """), {"trigger": trigger}).fetchone()
+
+                if not search_row or not search_row.enriched_candidates:
+                    print(f"[Scheduler] Main pass ({trigger}) skipped: "
+                          f"no search_agent_snapshot for today yet")
+                    return
+
+                enriched = search_row.enriched_candidates
+                macro    = news_row.macro if news_row else {}
 
                 regime = get_full_market_regime()
                 vix    = _build_vix_context()
-                macro  = build_macro_context()
                 market_context = {
                     "vix": vix, "regime": regime,
                     "econ_events": macro.get("upcoming_events", "no data"),
                 }
 
-                result = run_main_pass(user_id, enriched, market_regime=regime, market_context=market_context)
+                result = run_main_pass(admin_uid, enriched, market_regime=regime, market_context=market_context)
                 print(f"[Scheduler] Main pass ({trigger}): {result}")
             except Exception as e:
                 print(f"[Scheduler] Main pass ({trigger}) failed: {e}")
-
-        def _run_search_agent(trigger: str):
-            """
-            MULTIAGENT_MIGRATION.md Phase A, item 2 — the same full
-            computation (universe resolution + after-hours-style daily
-            snapshot + quick_scan convergence scoring) fires at two
-            daily slots: post-close (was the only run before this) and
-            pre-open (new — catches overnight movement before the
-            trading day's first paper-trade-open window at 6:40am PT).
-            """
-            try:
-                from sqlalchemy import text
-                from app.db.session import get_session
-                from app.agents.search_agent import run_search_agent
-                with get_session() as s:
-                    users = s.execute(text("SELECT id, is_admin FROM users WHERE is_active=TRUE")).fetchall()
-                admin_uid, admin_candidates = None, None
-                for u in users:
-                    result = run_search_agent(str(u.id), trigger=trigger)
-                    print(f"[Scheduler] Search agent ({trigger}): "
-                          f"{result['universe_size']} tickers, "
-                          f"batch={result['batch'].get('status')}, "
-                          f"{len(result['candidates'])} candidates")
-                    if u.is_admin:
-                        admin_uid, admin_candidates = str(u.id), result["candidates"]
-            except Exception as e:
-                print(f"[Scheduler] Search agent ({trigger}) failed: {e}")
-                return
-
-            if admin_uid and admin_candidates:
-                _run_main_pass(admin_uid, admin_candidates, trigger)
-
-        def _run_news_agent(trigger: str):
-            """
-            MULTIAGENT_MIGRATION.md item 6 — same two-slot cadence as
-            the Search Agent above. Unlike Search Agent, News Agent has
-            no per-user watchlist dependency (global market news +
-            macro calendar are the same for everyone), so this runs
-            once per fire, not looped over active users - same
-            single-run principle already established for paper-trading
-            jobs elsewhere in this scheduler, for the same reason
-            (nothing here is user-specific).
-            """
-            try:
-                from app.agents.news_agent import run_news_agent
-                result = run_news_agent(trigger=trigger)
-                print(f"[Scheduler] News agent ({trigger}): "
-                      f"{len(result['news'])} headlines, "
-                      f"{result['macro'].get('high_impact_count', 0)} high-impact events")
-            except Exception as e:
-                print(f"[Scheduler] News agent ({trigger}) failed: {e}")
 
         def _run_nightly_learning():
             try:
@@ -482,28 +459,25 @@ async def startup_event():
             CronTrigger(day_of_week="mon-fri", hour=16, minute=15, timezone=et),
             id="velocity_snapshot", replace_existing=True,
         )
+        # Phase B.1: Search Agent and News Agent run as their own
+        # standalone processes now (app/services/search_agent_service.py,
+        # news_agent_service.py — started separately, see runbook.sh),
+        # firing at the exact same 16:15 ET / 6:00 PT slots this
+        # scheduler used to own directly. _run_main_pass below reads
+        # their output from search_agent_snapshot/news_agent_snapshot.
         scheduler.add_job(
-            lambda: _run_search_agent("post_close"),
-            CronTrigger(day_of_week="mon-fri", hour=16, minute=15, timezone=et),
-            id="search_agent_post_close", replace_existing=True,
+            lambda: _run_main_pass("post_close"),
+            CronTrigger(day_of_week="mon-fri", hour=16, minute=25, timezone=et),
+            id="main_pass_post_close", replace_existing=True,
         )
         scheduler.add_job(
-            lambda: _run_search_agent("pre_open"),
-            # 6am PT, ~40 min before the first paper-trade-open window
-            # (6:40am PT) - catches overnight movement before the
-            # trading day's first pick gets made.
-            CronTrigger(day_of_week="mon-fri", hour=6, minute=0, timezone=pt),
-            id="search_agent_pre_open", replace_existing=True,
-        )
-        scheduler.add_job(
-            lambda: _run_news_agent("post_close"),
-            CronTrigger(day_of_week="mon-fri", hour=16, minute=15, timezone=et),
-            id="news_agent_post_close", replace_existing=True,
-        )
-        scheduler.add_job(
-            lambda: _run_news_agent("pre_open"),
-            CronTrigger(day_of_week="mon-fri", hour=6, minute=0, timezone=pt),
-            id="news_agent_pre_open", replace_existing=True,
+            lambda: _run_main_pass("pre_open"),
+            # 10 min after search_agent_service's 6:00am PT pre_open
+            # fire - comfortably more than the ~5 min a real Search
+            # Agent run took in live verification, and still ~25 min
+            # before the first paper-trade-open window (6:40am PT).
+            CronTrigger(day_of_week="mon-fri", hour=6, minute=10, timezone=pt),
+            id="main_pass_pre_open", replace_existing=True,
         )
         scheduler.add_job(
             _run_nightly_learning,
@@ -659,11 +633,14 @@ async def startup_event():
         )
 
         scheduler.start()
-        print("[Scheduler] ✅ velocity@4:15PM ET | learning@4:30PM ET | "
+        print("[Scheduler] ✅ velocity@4:15PM ET | "
+              "main-pass@4:25PM ET,6:10AM PT (reads search/news-agent-service snapshots) | "
+              "learning@4:30PM ET | "
               "paper-trade-open@6:40/8:30/10:30AM,12:30PM PT (shared 20/day cap) | "
               "tie-break-batch@8:30AM PT | "
               "paper-trade-close@12:55PM PT (weekdays) | "
-              "learning-agent-review@6:00PM ET (daily, rolling 7-day window)")
+              "learning-agent-review@6:00PM ET (daily, rolling 7-day window) | "
+              "NOTE: search_agent_service / news_agent_service must be started separately")
     except Exception as e:
         print(f"[Startup] Scheduler failed: {e}")
 

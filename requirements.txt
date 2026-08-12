@@ -37,6 +37,10 @@ yfinance>=0.2.40        # Free fallback for basic quotes
 chromadb>=1.5             # Retrieval Library corpus (filing_embed.py)
 beautifulsoup4>=4.11.1     # SEC EDGAR filing HTML parsing (already a
                            # transitive dep via yfinance, now used directly)
+apscheduler>=3.11          # Scheduling for app/api/main.py AND the Phase B
+                           # standalone services (app/services/*.py) - was
+                           # already load-bearing everywhere it's used,
+                           # just never declared here until now
 
 # Dev tools
 pytest>=8.0

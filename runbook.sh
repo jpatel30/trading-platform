@@ -53,6 +53,22 @@ start_api() {
     echo $! > /tmp/fastapi.pid
 }
 
+# Start Search Agent service (MULTIAGENT_MIGRATION.md Phase B.1 — own
+# process, own scheduler, no longer run in-process by start_api above)
+start_search_agent() {
+    python3 -m app.services.search_agent_service &
+    echo "✅ Search Agent service started (PID: $!)"
+    echo $! > /tmp/search_agent_service.pid
+}
+
+# Start News Agent service (MULTIAGENT_MIGRATION.md Phase B.1 — own
+# process, own scheduler, no longer run in-process by start_api above)
+start_news_agent() {
+    python3 -m app.services.news_agent_service &
+    echo "✅ News Agent service started (PID: $!)"
+    echo $! > /tmp/news_agent_service.pid
+}
+
 # Start StockBros dashboard
 start_dashboard() {
     cd ~/Documents/Claude/Projects/stockbros
@@ -274,7 +290,7 @@ PYEOF
 # ─────────────────────────────────────────────────────────────────────────────
 
 case "${1}" in
-    start)       keep_awake; start_docker; start_ollama; start_mcp; start_api ;;
+    start)       keep_awake; start_docker; start_ollama; start_mcp; start_api; start_search_agent; start_news_agent ;;
     dashboard)   start_dashboard ;;
     morning)     morning_prep ;;
     sells)       check_sells ;;
@@ -286,7 +302,7 @@ case "${1}" in
         echo "Usage: bash RUNBOOK.sh [command]"
         echo ""
         echo "Commands:"
-        echo "  start      Start all services (Docker, Ollama, MCP, API)"
+        echo "  start      Start all services (Docker, Ollama, MCP, API, Search Agent, News Agent)"
         echo "  dashboard  Start StockBros dashboard"
         echo "  morning    Run morning scan (7-8 AM ET)"
         echo "  sells      Check sell signals"

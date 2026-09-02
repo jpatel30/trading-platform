@@ -1,768 +1,544 @@
-# Trading Intelligence Platform - Architecture
+# Trading Intelligence Platform — Architecture
 
-Last updated: July 2026
+Last updated: 2026-09-02. This is the single canonical architecture + remaining-work
+document for the repo, combining the old ARCHITECTURE.md, MULTIAGENT_MIGRATION.md,
+REMAINING_ITEMS.md, and the two original June 2026 design PDFs
+(`trading_intelligence_platform_design.pdf`, `trading_platform_complete_blueprint.pdf`,
+kept for historical reference only). MULTIAGENT_MIGRATION.md and REMAINING_ITEMS.md
+were deleted once merged in — update this doc going forward instead. Readme.md stays
+a separate, short quickstart/setup guide (not merged in) and points here for design
+detail.
+
+**Product focus: options prediction.** The center of gravity is the multi-agent
+options-prediction pipeline (Search → News → Prediction routing → Bull/Bear debate →
+Finalize → paper-trade open/close → Learning feedback loop). Stock-picking and the
+(now-removed) broker/portfolio feature are covered later as secondary/supporting
+context — they exist in the codebase but are not the product's focus.
+
+A note on the two source PDFs: both are the original June 2026 pre-implementation
+design docs (v1.0 "System Design" and v2.0 "Complete Blueprint"). They describe a
+different shape than what got built — Webull-centric portfolio tracking as Phase 1,
+Polygon as the primary market-data source, a 12-14 component MCP-only design, 50
+hardcoded baseline strategy rules, VPS deployment, SMS/Slack notifications. Almost
+none of that survived contact with implementation. What *did* carry through: local
+Ollama LLM (cost control), Postgres + ChromaDB, SEC-filing RAG, MCP as an access
+path, and the prediction-tracking self-learning loop — all real today, described below
+as actually built. Treat the PDFs as historical only; nothing in this document derives
+a current-state claim from them without live-code verification.
 
 ---
 
-## System Overview
+## 1. Product Overview
 
-```
-User (Claude Desktop / StockBros Browser)
-    |
-    |-- Claude Desktop --> MCP Server
-    |     stdio: local admin usage, one process per user (unchanged)
-    |     HTTP (MCP_TRANSPORT=http): hosted, one shared process serving
-    |       many customers - each request authenticated independently
-    |       via ApiKeyTokenVerifier (app/mcp_server/auth.py) against
-    |       user_api_keys, resolved fresh per call, never cached across
-    |       customers - see "Multi-User / MCP Access Notes" below
-    |
-    |-- Browser --> FastAPI :8001 --+
-                                    |
-                    +---------------v------------------+
-                    |         Core Engine               |
-                    |                                   |
-                    |  Scanner -> Rescan/Smart Engine    |
-                    |          -> LLM -> Trade Math      |
-                    |                                   |
-                    |  Data: UW + Polygon + yfinance    |
-                    +---------------+-------------------+
-                                    |
-                    +---------------v------------------+
-                    |           PostgreSQL              |
-                    |     (Docker, localhost:5432)      |
-                    +-----------------------------------+
-```
+AI-powered options (and, secondarily, stock) recommendation system. Scans a
+user-curated watchlist against real-time market data (options flow, dark pool,
+institutional positioning, VIX term structure, SEC filings) and produces specific
+options trade recommendations — strategy, strikes, expiry, entry/target/stop — via a
+6-agent pipeline, then tracks every recommendation through paper-trade open/close and
+feeds outcomes back into a nightly/weekly learning loop.
 
-Broker connection (Webull) is used only for the admin's own live
-portfolio, positions, and orders - the scanner and recommendation
-engine do not depend on it. See "Watchlist Architecture" below.
+Stack: Python 3.11, FastAPI, PostgreSQL, ChromaDB, Ollama (local LLM), FastMCP,
+Unusual Whales API, Polygon API, yfinance, Next.js dashboard (StockBros, separate repo).
 
-Full backend data-flow diagram, including the options and stock
-recommendation paths side by side and where each trade-math gate
-applies: `docs/diagrams/backend-architecture.mermaid` (rendered below).
-Frontend component/auth diagram: `docs/diagrams/frontend-architecture.mermaid`,
-rendered in "StockBros Dashboard" below.
+No broker account linking exists anywhere in the system today (removed entirely
+2026-08-10 — see §7). The scanner, recommendations, and fill-tracking are 100%
+database-driven; a user's own watchlist and their own confirmed fills are the only
+inputs, for every user including the former admin.
+
+---
+
+## 2. System Architecture — The Options-Prediction Pipeline
+
+This is the current, *live* architecture, not a future plan. Five of the six agents
+(Search, News, Prediction, Bull, Bear) each run as their own standalone OS process
+(`app/services/{search,news,prediction,bull,bear}_agent_service.py`), spawned and
+supervised directly by the FastAPI process itself — not launchd, not Docker. The sixth
+(Learning) is the one exception: it still runs inline in `app/api/main.py`'s embedded
+scheduler, not yet split out (open item, §8).
 
 ```mermaid
 graph TB
-    subgraph DataSources["Data Sources"]
-        UW["Unusual Whales<br/>flow, dark pool, OI, IV, GEX,<br/>earnings, news, congress trades,<br/>institutional ownership"]
-        POLY["Polygon<br/>daily bars + real monthly<br/>aggregates (UW has no month candle)"]
-        YF["yfinance<br/>VIX, fundamentals,<br/>ETF fund data (expense ratio,<br/>AUM, turnover)"]
-        EDGAR["SEC EDGAR<br/>Form 4 insider filings"]
+    subgraph Sources["Data Sources"]
+        UW["Unusual Whales<br/>flow, dark pool, OI, IV, GEX,<br/>earnings, news, congress trades"]
+        POLY["Polygon<br/>daily bars, monthly aggregates"]
+        YF["yfinance<br/>VIX, fundamentals"]
+        EDGAR["SEC EDGAR<br/>8-K filings"]
     end
 
-    subgraph SignalLayer["Signal Layer (predictive, not reactive)"]
-        FLOW["flow_scoring.py<br/>flow + dark-pool score"]
-        OI["oi_flow.py<br/>multi-day OI persistence"]
-        REGIME["market_regime.py<br/>VIX term structure + PCR"]
-        IVEXP["iv_expansion.py<br/>IV velocity, not just level"]
-        INTRA["intraday_entry.py<br/>5m/15m RSI/MACD, observational"]
-        AHB["after_hours_batch.py<br/>daily TA/fundamentals/insider/IV<br/>for the whole watchlist"]
-        INSIDER["edgar_insider.py<br/>Form 4 buy/sell signal"]
+    subgraph Search["Search Agent (own process)"]
+        SA["run_search_agent() + enrich_candidates()<br/>per-user loop, scored + enriched candidates"]
+        FE["filing_embed.py<br/>8-K chunk + embed, incremental"]
+    end
+
+    subgraph News["News Agent (own process)"]
+        NA["run_news_agent()<br/>global news + macro calendar<br/>single run, not per-user"]
+    end
+
+    subgraph Prediction["Prediction Agent (own process)"]
+        ROUTE["Routing: signal/math layers -><br/>direction lean, strategy shape,<br/>rough strikes -> candidate_directions"]
+        TIE["Ambiguous cases -> tie_break_queue"]
+        ENQ["enqueue_routed_candidates() /<br/>enqueue_tie_break_candidates()<br/>writes debate_requests"]
+        FIN["finalize_pending_debates()<br/>reads Bull+Bear answers,<br/>R/R + EV gates, opens paper trade"]
+    end
+
+    subgraph Bull["Bull Agent (own process)"]
+        BULL["process_pending_debate_requests('bull')<br/>answers pending debate_requests rows"]
+    end
+
+    subgraph Bear["Bear Agent (own process)"]
+        BEAR["process_pending_debate_requests('bear')<br/>answers pending debate_requests rows"]
+    end
+
+    subgraph Retrieval["Retrieval Library (shared code, not a service)"]
+        RL["retrieval_library.py<br/>similar-outcome SQL lookup +<br/>ChromaDB semantic search over<br/>the filing corpus"]
+    end
+
+    subgraph Learning["Learning Agent (inline in main.py — NOT split, open item)"]
+        NIGHT["nightly_loop.py<br/>4:30 PM ET daily"]
+        WEEK["weekly_review.py<br/>6:00 PM ET daily, rolling 7-day window"]
     end
 
     subgraph Storage["PostgreSQL"]
-        SNAP[("ticker_daily_snapshot")]
-        IVH[("iv_history")]
-        SIGH[("signal_history")]
-        DR[("daily_recommendations<br/>SINGLE source of truth:<br/>thesis + fill + P&L")]
+        SNAP[("search_agent_snapshot")]
+        NEWSNAP[("news_agent_snapshot")]
+        CD[("candidate_directions")]
+        TBQ[("tie_break_queue")]
+        DR[("debate_requests")]
+        DAILY[("daily_recommendations<br/>single source of truth")]
         TP[("tracked_positions")]
-        PTC[("paper_trade_context<br/>full signal snapshot per pick")]
-        SRP[("strategy_rule_performance<br/>weekly falsifiable stats")]
+        PTC[("paper_trade_context")]
+        SRP[("strategy_rule_performance")]
         JRL[("job_run_log")]
     end
 
-    subgraph Scan["Scan"]
-        QS["quick_scan.py<br/>6-signal convergence scorer"]
-        UNIV["scanner/universe.py<br/>watchlist-driven, zero<br/>broker dependency"]
-    end
+    UW --> SA
+    POLY --> SA
+    YF --> NA
+    EDGAR --> FE
+    SA --> SNAP
+    NA --> NEWSNAP
+    FE -.embeds into.-> RL
 
-    subgraph OptionsPath["Options Recommendation Path"]
-        RESCAN["rescan_engine.py::rescan_with_validation<br/>ONE engine, MCP + web both use it"]
-        ENRICH["_enrich_ticker() per candidate<br/>IV/expiries/earnings/news/GEX/insider/<br/>OI/IVexp/velocity/TA/flow/dp +<br/>congress trades (batched once/scan) +<br/>institutional ownership (per ticker)"]
-        COLLECT["_collect_with_timeout()<br/>concurrent.futures.wait() —<br/>never raises on timeout,<br/>always returns whatever finished"]
-        LLM["Ollama Qwen 14B<br/>thesis, strategy, tiered<br/>confidence calibration +<br/>deterministic congress/<br/>institutional adjustment"]
-        ENGINE["strategy/engine.py<br/>strike selection, position sizing"]
-        GATES["Real R/R gate (floor scales w/ DTE,<br/>flat 0.15 for credit strategies) +<br/>EV gate (debit/long-premium only —<br/>credit strategies intentionally exempt,<br/>backtest-informed) +<br/>structural-impossibility backstop +<br/>25% spot-sanity check"]
-    end
+    SNAP --> ROUTE
+    NEWSNAP --> ROUTE
+    ROUTE --> CD
+    ROUTE -.ambiguous.-> TIE
+    TIE --> TBQ
+    CD --> ENQ
+    TBQ --> ENQ
+    ENQ --> DR
+    DR --> BULL
+    DR --> BEAR
+    BULL --> DR
+    BEAR --> DR
+    RL -.queried by.-> BULL
+    RL -.queried by.-> BEAR
+    DR --> FIN
+    FIN --> DAILY
+    FIN --> TP
+    FIN --> PTC
 
-    subgraph StockPath["Stock Recommendation Path (3m/6m/1yr)"]
-        SSCAN["smart_stock_scan.py<br/>composite pre-filter:<br/>fundamentals 50% + velocity 25%<br/>+ insider 25%, ranked before<br/>the expensive per-ticker step"]
-        FUND["fundamentals.py<br/>equity: analyst target (reliability-<br/>discounted) + PEG + margins + revenue growth<br/>ETF/fund: expense ratio vs category,<br/>AUM, liquidity, turnover-based<br/>tracking-fidelity proxy"]
-        HORIZON["horizon_engine.py::get_stock_for_horizon<br/>real trading_window_days/stop/target,<br/>not horizon-bucket defaults"]
-    end
+    TP --> NIGHT
+    DAILY --> WEEK
+    PTC --> WEEK
+    WEEK --> SRP
 
-    subgraph PaperLoop["Automated Paper-Trading Loop"]
-        OPEN["paper_trade_open<br/>grid sweep, ~20 unique<br/>picks/day cap, idempotent"]
-        CLOSE["paper_trade_close<br/>real mark-to-market pricing"]
-        RETRY["retry_queue.py<br/>shared retry, used by<br/>3 separate call sites"]
-        REVIEW["weekly_review.py<br/>per-bucket win rate,<br/>plain SQL aggregation only"]
-    end
-
-    subgraph Access["Access"]
-        MCP["MCP Server<br/>stdio (admin) / HTTP<br/>(multi-tenant, ApiKeyTokenVerifier)"]
-        API["FastAPI :8001<br/>web dashboard backend"]
-    end
-
-    UW --> FLOW & OI & IVEXP & INTRA
-    POLY --> AHB
-    YF --> AHB & REGIME
-    EDGAR --> AHB & INSIDER
-
-    FLOW & OI & REGIME & IVEXP --> QS
-    UNIV --> QS
-    AHB --> SNAP & IVH
-    QS --> SIGH
-
-    QS --> RESCAN
-    UNIV --> SSCAN
-    RESCAN --> ENRICH
-    ENRICH -.bounded by.-> COLLECT
-    ENRICH --> LLM
-    LLM --> ENGINE
-    ENGINE --> GATES
-    GATES --> DR
-
-    SSCAN --> FUND
-    FUND --> HORIZON
-    HORIZON --> DR
-
-    DR --> OPEN
-    OPEN --> TP
-    OPEN --> PTC
-    OPEN --> INTRA
-    OPEN -.retry.-> RETRY
-    CLOSE -.retry.-> RETRY
-    AHB -.retry.-> RETRY
-    TP --> CLOSE
-    CLOSE --> DR
-    DR --> REVIEW
-    PTC --> REVIEW
-    REVIEW --> SRP
-
-    OPEN & CLOSE & AHB --> JRL
-
-    DR --> API
-    DR --> MCP
+    SA & NA & ROUTE & FIN --> JRL
 
     classDef source fill:#e8f0fe,stroke:#4285f4,color:#1a237e
-    classDef signal fill:#fff8e1,stroke:#f9a825,color:#5d4037
+    classDef agent fill:#fff8e1,stroke:#f9a825,color:#5d4037
     classDef storage fill:#eceff1,stroke:#546e7a,color:#263238
-    classDef decision fill:#f3e5f5,stroke:#8e24aa,color:#4a148c
-    classDef gate fill:#ffebee,stroke:#e53935,color:#b71c1c
-    classDef access fill:#e0f2f1,stroke:#00897b,color:#004d40
+    classDef openitem fill:#ffebee,stroke:#e53935,color:#b71c1c
 
     class UW,POLY,YF,EDGAR source
-    class FLOW,OI,REGIME,IVEXP,INTRA,AHB,INSIDER signal
-    class SNAP,IVH,SIGH,DR,TP,PTC,SRP,JRL storage
-    class RESCAN,ENRICH,COLLECT,LLM,SSCAN,FUND,HORIZON decision
-    class ENGINE,GATES gate
-    class MCP,API access
+    class SA,FE,NA,ROUTE,TIE,ENQ,FIN,BULL,BEAR,RL agent
+    class SNAP,NEWSNAP,CD,TBQ,DR,DAILY,TP,PTC,SRP,JRL storage
+    class NIGHT,WEEK openitem
 ```
+
+### Agent-by-agent detail
+
+**Search Agent** (`app/services/search_agent_service.py`) — per-active-user loop, two
+daily triggers: post-close 4:15 PM ET and pre-open 6:00 AM PT (the second catches
+overnight movement; unverified end-to-end with real trading-day output as of the last
+audit — see §8). Calls `run_search_agent()` + `enrich_candidates()`
+(`app/agents/search_agent.py`, logic unchanged from the old in-process version),
+persists the full enriched candidate list to `search_agent_snapshot`. Also owns the
+daily filing-embed job (5:00 PM ET, clear of the routing chain) — `filing_embed.py`
+chunks and incrementally embeds new 8-K filings into ChromaDB. The transcript half of
+this pipeline (earnings-call transcripts) is not built — blocked on Unusual Whales'
+enterprise tier (confirmed via live 403 on the transcripts endpoint).
+
+**News Agent** (`app/services/news_agent_service.py`) — single global run (not
+per-user; news/macro calendar are the same for everyone), same two fire times as
+Search Agent. Calls `run_news_agent()` (`app/agents/news_agent.py`), persists to
+`news_agent_snapshot`. Note: the *live-scan-path* callers of
+`build_global_news()`/`build_macro_context()` (the still-running legacy
+`context_builder.py`/`smart_engine.py`/`rescan_engine.py`) call those functions
+directly and synchronously on every request — that's untouched by this split; only the
+scheduled snapshot wrapper moved to its own process.
+
+**Prediction Agent** (`app/services/prediction_agent_service.py`) — the one service
+that both routes candidates *and* finalizes debates ("both phases" in one process).
+Admin-only / single-platform-signal-generation, same principle every paper-trading job
+in this codebase follows — it runs exactly once per scheduled fire, never fanned out
+per customer.
+- **Routing**: deterministic, pre-LLM pass over existing signal/math layers
+  (flow_scoring, oi_flow, market_regime, iv_expansion, technical_analysis, R/R and EV
+  gates) computes a direction lean, rough strategy shape, and rough strikes per ticker
+  → `candidate_directions`. Clear bullish/bearish shape routes to Bull-only or
+  Bear-only; genuinely mixed signals go to `tie_break_queue` (tagged with
+  `which_rule_conflict_triggered` — which specific signals disagreed).
+- **Enqueue**: writes `debate_requests` rows for Bull and/or Bear to answer — this
+  table is the *entire* inter-service contract between Prediction and Bull/Bear (no
+  direct function calls or imports across the boundary).
+- **Finalize**: reads back whatever Bull/Bear answered, re-applies the R/R gate, EV
+  gate, and structural-impossibility backstop against their combined output, and opens
+  the resulting paper-trade position via the same `confirm_execution()`/
+  `DAILY_PICK_CAP` path the old single-process pipeline used.
+- Schedule (10-minute buffers between each stage): 16:25 ET / 06:10 PT enqueue-routed
+  → 16:35/06:20 Bull/Bear answer window → 16:45/06:30 finalize. Tie-break batch runs
+  separately at 08:30 PT enqueue → 08:40 answer → 08:50 finalize — deliberately *after*
+  the main pass fully completes, not concurrently (a direct consequence of an earlier
+  enrichment-timeout bug from concurrent threads competing for the same rate-limited
+  resources). Resolved tie-break picks open at whichever of the existing intraday
+  windows comes next — no new time slot, same shared cap.
+
+**Bull Agent / Bear Agent** (`app/services/{bull,bear}_agent_service.py`) — near-
+identical: no per-user loop, no admin scoping, just
+`process_pending_debate_requests('bull'|'bear')`
+(`app/agents/bull_bear_agents.py`), each a focused LLM prompt arguing only its side for
+a routed ticker + strategy shape. Checks 10 minutes after each Prediction Agent
+enqueue slot, 10 minutes before the matching finalize slot.
+
+**Retrieval Library** (`app/agents/retrieval_library.py`, shared code, not a service)
+— two lookup modes Bull/Bear query directly: (1) plain SQL similar-outcome lookup over
+`paper_trade_context` + `daily_recommendations`, matched on the same categorical
+buckets the weekly review computes; (2) semantic search via ChromaDB against the
+filing corpus Search Agent's `filing_embed.py` builds. Bull/Bear only ever *query* an
+existing corpus, never build one live.
+
+**Learning Agent** (still inline in `main.py`, not split — open item, §8) —
+`nightly_loop.py` (4:30 PM ET daily, after mark-to-market runs first in the same job)
+and `weekly_review.py` (6:00 PM ET, **daily** now, not Sunday-only, with a genuine
+rolling 7-day window rather than "last completed Mon-Fri" — so a Tuesday run reviews
+Wed-Tue). Turns paper-trade outcomes into falsifiable per-bucket win-rate stats
+(`strategy_rule_performance`) — every statistic is a plain SQL/Python aggregation; an
+LLM call only ever phrases already-computed numbers, never produces one. The
+`task_list.md` output never populates a News Agent section — no bucket dimension in
+`weekly_review.py` maps findings back to News Agent specifically (open item, §8).
+
+### Cutover history
+
+Until 2026-09-02 (`adec414`), `app/api/main.py`'s scheduler *also* still called the OLD
+single-process pipeline (`_run_paper_trade_open_options` → `rescan_engine.
+rescan_with_validation` → `smart_engine._execute_smart_rec`) 4x/day, racing the new
+pipeline for the same `DAILY_PICK_CAP`/`confirm_execution` sink — while the 5 new
+services had never actually run on a real schedule. That old job and its scheduler
+registration have been removed entirely; Prediction Agent's finalize step is now the
+sole path that opens options positions.
 
 ---
 
-## Data Flow - Options Recommendation Run
+## 3. Supporting Systems
 
-Single engine for both channels - the MCP tool get_daily_recommendations
-and the web dashboard's "Scan" button both call
-rescan_engine.py::rescan_with_validation() directly, no separate
-MCP-only scoring path. (An earlier version of this doc described
-daily_engine.py as a "fallback path if the smart engine fails" - that
-was never true for MCP, which called it unconditionally as its only
-engine, and the one place on the web side that *did* fall back to it
-was itself dead code, always throwing before reaching rescan_engine at
-all - see REMAINING_ITEMS.md.) The two features daily_engine's old scan
-had that rescan_engine lacked - portfolio-position exclusion from new
-BUY candidates, and a pre-flight API health check - are now inside
-rescan_with_validation() itself.
+### Stock-picking (secondary, legacy-style pipeline — not migrated)
 
-```
-Trigger (dashboard "Scan" button, MCP get_daily_recommendations, or scheduled)
-    |
-    |-- Pre-fetch (shared, once):
-    |     VIX + market regime (VIX term structure, put/call ratio)
-    |     Global news, earnings calendar
-    |     Batch flow alerts + dark pool (UW, limit=500 each)
-    |
-    |-- Scanner (watchlist-sized universe, ~130 tickers):
-    |     Polygon grouped_daily (1 call) or live Webull prices
-    |     Flow/dark pool scoring (shared flow_scoring.py module)
-    |     OI buildup signal (from cached signal_history - zero
-    |       added API cost per scan)
-    |     5-signal convergence + conflict detection
-    |     -> Top 15 picks
-    |
-    |-- Enrich candidates (parallel, 6-8 threads):
-    |     IV rank, expiries, news, TA, GEX, insider activity,
-    |     OI buildup, velocity - per ticker
-    |
-    |-- Single LLM call (Ollama Qwen 14B):
-    |     Compressed ticker contexts + market regime + VIX +
-    |     news + strategy-selection rules based on conditions
-    |     LLM decides: ticker + expiry + strategy + strikes
-    |
-    |-- Deterministic trade math:
-    |     Validate strikes vs real UW contracts
-    |     Real risk/reward gate (actual max-gain/max-loss, not a
-    |       constant ratio)
-    |     Probability-adjusted EV gate (debit/long-premium
-    |       strategies only - see "Trade Math Gates" below)
-    |     Position sizing, sanity cap ($50K/contract hard ceiling)
-    |
-    +-- Store + Alert:
-          daily_recommendations table
-          Discord notification if act_now=True
+`smart_stock_scan.py` is a separate pipeline from the options multi-agent system above
+— predictive stock scanner (fundamentals 50% + velocity 25% + insider 25%, ranked
+before an expensive per-ticker step), backing both the web dashboard's stock-scan
+branch and `horizon_engine.py`'s stock horizons (6m/1yr). `analyst_target_reliability()`
+(`fundamentals.py`) discounts raw analyst-upside percent for thin coverage, wide
+analyst disagreement, or low share price — the actual mechanism behind picks
+clustering under $30 before the fix. `get_fund_data()`/`score_etf_fundamentals()` are
+the fund-appropriate equivalent for ETFs (expense ratio vs category, AUM, liquidity,
+turnover-based tracking-fidelity proxy), replacing an older technicals-only stand-in
+that silently filtered ETFs out via near-zero placeholder scoring.
 
-Total: 60-80s (LLM call is the majority; grew from an earlier ~26s
-baseline as enrichment depth increased)
-```
+Runs directly in `main.py`'s scheduler (`_run_paper_trade_open_stocks`, fires 4x
+through the trading day at the same times as the old options job used to, respecting
+the same shared `DAILY_PICK_CAP`) — untouched by the multi-agent migration, not an
+agent service.
+
+### Position monitoring
+
+`app/monitor/position_monitor.py` polls every 15 minutes, fires `STOP_LOSS` and
+`TAKE_PROFIT` alerts via `broker/sell_signals.py` (rule-based exit triggers — trailing
+stop, S/R break, RSI, MA crossover). Auto-resumes on server startup for any user with
+an active tracked position (previously required a manual restart every time the server
+restarted). Real target/stop is tracked per fill (not a hardcoded +20%/-40% default).
+
+`monitor_config` has 3 genuinely dead columns and 4 more that are write-only —
+confirmed by reading every reference in `position_monitor.py`: `alerts_muted`/
+`muted_until` are real (drive actual mute/unmute behavior). `is_active`/
+`last_check_at`/`total_checks`/`total_alerts_fired` are written via `_save_config()`
+but nothing ever reads them back — `PositionMonitor.status()` reports in-memory
+instance state instead, so this data is invisible after any process restart.
+`check_interval_seconds`/`alert_cooldown_minutes` have zero references anywhere.
+`last_error` has a column for exactly this purpose but the code tracks it in-memory
+only and never passes it to `_save_config()`, so it's permanently NULL. Low priority —
+the 2 real columns work fine on their own; this was a "confirm usage" ask, not a
+cleanup ask.
+
+### LLM
+
+All agent LLM calls — Bull/Bear debates, Prediction routing narrative, Learning weekly
+review, and the legacy `smart_engine`/`strategy/engine.py` paths — run on a **local
+Ollama model**, currently `qwen2.5:14b` (`OLLAMA_MODEL` in `.env`, default in
+`app/utils/config.py`). Embeddings (filing chunks, retrieval library) use
+`nomic-embed-text`, same Ollama host. No hosted/API LLM anywhere in the pipeline
+today — the "cloud only for conversation, local for everything else" cost-control
+principle from the original design docs is the one piece of that vision that survived
+unchanged.
 
 ---
 
-## Watchlist Architecture
+## 4. Data Layer
 
-No separate "default watchlist" table. user_watchlist is the single
-source of truth for every user, distinguished by a users.is_admin
-flag:
+Not a full DDL reference — what each table is for and who touches it. 20+ tables
+total; below are the ones load-bearing for the options-prediction pipeline plus a few
+supporting tables. `db/migrations/` currently has only 3 files, all from June 2026
+(`001_phase1_schema.sql`, `002_watchlist.sql`, `003_sell_recommendations.sql`) —
+every schema change since then (multi-agent tables, fill-tracking columns,
+`excluded_from_stats`, `users.is_admin`, the `strategy_recommendations` rename, all
+paper-trading tables) exists only as ad-hoc SQL run directly against the live DB, not
+as versioned migration files. Open item, §8.
 
-```
-get_scan_universe(user_id, watchlist_mode):
-    base = user_watchlist rows belonging to whichever user has
-           is_admin = TRUE   (the shared default universe)
-    if watchlist_mode == "default_plus_mine":
-        base |= this user's OWN user_watchlist rows
-    return base
-```
+| Table | Purpose | Written by | Read by |
+|---|---|---|---|
+| `search_agent_snapshot` | Full enriched candidate list per run | Search Agent | Prediction Agent routing |
+| `news_agent_snapshot` | Global news + macro calendar per run | News Agent | Prediction Agent routing |
+| `candidate_directions` | Routed ticker + strategy shape + rough strikes + direction lean | Prediction Agent (routing) | Prediction Agent (enqueue) |
+| `tie_break_queue` | Ambiguous candidates, tagged with which signals conflicted | Prediction Agent (routing) | Prediction Agent (enqueue, tie-break slot) |
+| `debate_requests` | The entire Prediction ↔ Bull/Bear inter-service contract | Prediction Agent (enqueue), Bull/Bear Agent (answer) | Bull/Bear Agent, Prediction Agent (finalize) |
+| `daily_recommendations` | Single source of truth for every recommendation (options + stock): thesis, entry/target/stop, legs, mark-to-market P&L, fill tracking (`user_executed`, `actual_entry_price`, `exit_price`, `was_correct`, ...) | Finalize step, `horizon_engine.py`, fill confirmation | Dashboard, MCP, weekly review |
+| `tracked_positions` | Confirmed trades, monitored every 15 min | `confirm_execution()` | Position Monitor, nightly learning |
+| `paper_trade_context` | Full signal snapshot at the moment of each pick | Paper-trade open jobs | Weekly review, retrieval library |
+| `strategy_rule_performance` | Per-bucket falsifiable win-rate stats | Weekly review | Learning feedback, dashboard |
+| `job_run_log` | Scheduled-job execution records | Every scheduled job | Ops/debugging |
+| `user_watchlist` | Single source of truth for every user's watchlist; admin's rows = shared default | Watchlist sync, dashboard | Scanner universe (`get_scan_universe`) |
+| `users` | `is_admin` flag drives shared-default-watchlist semantics — no other special meaning left now that broker linking is gone | Auth | Everywhere |
 
-For the admin, "default" and "mine" are the same rows - no
-special-casing needed anywhere. No hardcoded fallback ticker list
-exists anywhere in the scanning pipeline; if the admin's watchlist is
-ever empty, the result is an honest empty list, not a silent
-substitute.
+`strategy_recommendations` (an older parallel fill/outcome table) was fully retired in
+favor of `daily_recommendations` — renamed to `strategy_recommendations_deprecated`
+rather than dropped, to preserve the handful of historical rows.
 
-watchlist_sync.py mirrors a connected broker's live watchlist INTO
-user_watchlist as a convenience (add-only - it no longer deletes
-anything from the DB that's missing from the broker side, a real bug
-fixed this session).
-
----
-
-## Trade Math Gates
-
-Two independent checks run inside strategy/engine.py's
-_execute_trade_math(), both able to reject a candidate strike
-selection and trigger a fallback:
-
-1. Real risk/reward gate
-
-```
-real_risk_reward = credit_received / margin_required   (credit)
-                  = (max_profit * n) / premium_paid      (debit)
-```
-
-Thresholds scale by horizon (0.5 debit / 0.15 credit for 1-week,
-loosening for longer horizons). Replaced an earlier version that
-checked a constant ratio independent of actual strikes.
-
-2. Probability-adjusted EV gate (debit/long-premium strategies only:
-NAKED_CALL/PUT, DEBIT spreads, STRADDLE, STRANGLE)
-
-Uses BSM N(d2) as a probability-of-profit estimate, combined with
-max gain/loss into a simple bimodal expected value. Deliberately NOT
-applied to credit strategies (iron condor etc.) - an N(d2) estimate
-using the same IV used to price the trade is known to be
-systematically pessimistic for premium-selling strategies, since it
-can't see the volatility risk premium that's the actual source of
-edge there. pop_estimate/expected_value are computed and returned for
-every strategy for visibility, just not hard-gated for credit.
+`job_run_log` has no `user_id` column — fine today since paper-trade jobs run once
+against the admin account (not looped per user), but any *other* job that still loops
+over active users (`after_hours_batch`, `velocity_snapshot`, `nightly_learning`,
+`weekly_strategy_review`) produces indistinguishable rows per user if it ever needs the
+same kind of forensic reconstruction the paper-trading scheduler investigation
+required.
 
 ---
 
-## Component Map
+## 5. Infrastructure & Operations
+
+**Process supervision**: The 5 split-out agent services are spawned and supervised as
+separate OS processes directly by the FastAPI process itself
+(`startup_event`/`shutdown_event` in `app/api/main.py`) — not launchd. Launchd-spawned
+processes can't access this project's path under `~/Documents` (macOS TCC/Full-Disk-
+Access restriction on that folder); the interactively-launched FastAPI process already
+can, and children it spawns via `subprocess.Popen` inherit that access. A 5-minute
+supervisor job restarts any service that dies; a pre-spawn cleanup step kills stale
+orphans on every startup so a `--reload`/redeploy never leaves two sets running at
+once. `runbook.sh start`/`stop` start/stop all of it as one unit (stopping the API
+stops the 5 services with it). `health_check.sh` checks real-time process liveness
+(`ps` pattern match) plus same-day data freshness once each trigger's fire time has
+passed.
+
+None of the 5 services are containerized — `docker-compose.yml` only defines
+`postgres` and `chromadb` (verified live). They're separate OS processes (communicating
+only through Postgres) but coupled to the FastAPI process's lifecycle rather than
+independently deployable. Only worth decoupling further if independent deploys/scaling
+are actually needed.
+
+**Deployment status**: still local-only. No cloud deployment exists yet (Cloudflare
+tunnel or Railway.app — either directly unblocks the hosted MCP server, which is fully
+built and tested via `MCP_TRANSPORT=http` + `ApiKeyTokenVerifier` but has nowhere to
+run for a real customer). This is priority #1 in the remaining-work list below.
+
+**MCP server**: 59 tools (`app/mcp_server/server.py`, verified via live grep — treat
+any other tool-count figure in older docs as stale). Supports `stdio` (local admin,
+one process per user, `MCP_TRANSPORT` default) and `http` (hosted, one shared process
+serving many customers, each request authenticated independently via
+`ApiKeyTokenVerifier` against `user_api_keys`, resolved fresh per call, never cached
+across customers). `get_current_user_id()` no longer caches identity at
+process/module level under HTTP transport — safe for concurrent multi-customer use.
+
+**Quick start** (adapted from Readme.md, broker env vars removed since they no longer
+apply):
 
 ```
-app/
-  api/
-    main.py              FastAPI REST wrapper (:8001)
-                          Called by StockBros dashboard.
-                          Long-running scan endpoints wrapped in
-                          run_in_threadpool - without this, the
-                          single asyncio event loop blocks on the
-                          60-80s synchronous scan and every other
-                          request (including progress-bar polling)
-                          queues as genuinely unprocessed.
+git clone https://github.com/jpatel30/trading-platform
+cd trading-platform
+python3 -m venv venv && source venv/bin/activate
+pip install -r requirements.txt
 
-  broker/
-    webull_connector.py  Webull OpenAPI client (positions, orders, balance)
-    factory.py           Multi-broker abstraction (Webull now; via
-                          SnapTrade - Robinhood/IBKR/Tastytrade
-                          stubbed, ready for real implementation)
-    sell_signals.py      Rule-based exit signals + Discord alert routing
-                          (STOP_LOSS and TAKE_PROFIT both fire)
-    active_bets.py       Enrich positions with target/stop/status
-    watchlist_sync.py    Add-only mirror: broker watchlist -> user_watchlist
+docker compose up -d
+ollama pull qwen2.5:14b
 
-  scanner/
-    universe.py          get_scan_universe() - database-only, no
-                          broker dependency, no hardcoded fallback
-    quick_scan.py        5-signal convergence scanner (price
-                          momentum, flow, dark pool, TA, OI buildup)
-                          with conflict detection between strong
-                          signals
-
-  signals/
-    flow_scoring.py      Canonical flow/dark-pool scoring - shared
-                          module after the same scoring bug was
-                          found independently in 5 different files
-    oi_flow.py           OI buildup signal - multi-day institutional
-                          accumulation, a genuine LEADING indicator
-                          (as opposed to same-day flow, which is
-                          reactive to a move already in progress)
-    market_regime.py     VIX term structure (contango/backwardation)
-                          + put/call ratio -> overall market bias
-    velocity_tracker.py  Daily signal snapshot + 3-5 day velocity
-    edgar_insider.py     SEC EDGAR Form 4 insider activity
-    rate_limiter.py      Token bucket for UW API (110/min)
-
-  recommendations/
-    rescan_engine.py     Main options entry point - validates
-                          morning picks (INTACT/UPDATED/BROKEN),
-                          finds new picks, always includes SPY/QQQ
-    smart_engine.py      Multi-horizon engine (predecessor to
-                          rescan_engine for a fresh, no-morning-
-                          picks scan)
-    smart_stock_scan.py  Predictive stock scanner - fundamentals +
-                          velocity + insider, with a reliability
-                          discount on analyst-target upside (thin
-                          coverage / wide analyst disagreement /
-                          low share price all reduce trust in a
-                          raw upside percent - this was the actual
-                          mechanism behind picks clustering under $30).
-                          Backs both the web's stock-scan branch AND
-                          horizon_engine.py::scan_for_horizon's stock
-                          horizons (6m/1yr) - previously web-only.
-    daily_engine.py      Recommendation storage, lifecycle
-                          (invalidation), and formatting - shared by
-                          MCP and web. No longer runs its own scan
-                          (run_daily_recommendations, scored via
-                          conviction.py's older 12-factor system, was
-                          retired - see Conviction Scoring below).
-    horizon_engine.py    Per-horizon options/stock logic.
-                          get_stock_for_horizon() is the single shared
-                          recommendation builder for every stock caller
-                          (single-ticker tools AND smart_stock_scan.py's
-                          Phase 2) - includes the same analyst-target
-                          reliability discount as smart_stock_scan.py
-                          (fundamentals.py::analyst_target_reliability,
-                          shared). scan_for_horizon() delegates stock-
-                          horizon watchlist scans to smart_stock_scan.py
-                          rather than its own per-ticker loop; options
-                          horizons still call get_options_for_horizon()
-                          per ticker. Stock universe delegates to
-                          scanner.universe.get_scan_universe() rather
-                          than a second parallel implementation.
-    mark_to_market.py    P&L calculation for every stored
-                          recommendation. Credit-strategy P&L% is
-                          computed against max_loss (real capital
-                          at risk), not credit received - a
-                          denominator bug fixed this session that
-                          had been inflating iron condor returns.
-                          calculate_backtest_stats() excludes rows
-                          flagged excluded_from_stats.
-    fundamentals.py      yfinance fundamentals + analyst targets for
-                          equities. analyst_target_reliability() (moved
-                          here from smart_stock_scan.py) is the shared
-                          reliability discount used by both
-                          smart_stock_scan.py's ranking and
-                          horizon_engine.py's target_price.
-                          get_fund_data()/score_etf_fundamentals() are
-                          the fund-appropriate equivalent for ETFs
-                          (expense ratio vs category, AUM, liquidity,
-                          turnover-based tracking-fidelity proxy) -
-                          replaces an older technicals-only stand-in
-                          that scored every ETF almost identically
-                          regardless of fund quality, and fixed a real
-                          bug where ETFs were being silently filtered
-                          out of stock recommendations entirely by the
-                          equity rubric's near-zero placeholder scoring.
-
-  strategy/
-    engine.py            Trade math: strike selection, cost, R:R,
-                          probability-adjusted EV, $50K/contract
-                          sanity cap, unified strategy naming
-                          (STRATEGY_ALIASES / normalize_strategy())
-
-  options_flow/
-    unusual_whales.py    All UW API calls, including OI-change
-                          (get_oi_change) added this session
-
-  learning/
-    nightly_loop.py      Runs after mark_all_active_recommendations
-                          in the same scheduled job (4:30 PM ET) -
-                          previously mark-to-market only ran lazily
-                          when the History tab loaded, so nightly
-                          learning could run against stale/unmarked
-                          data
-    prediction_tracker.py confirm_execution()/log_outcome() write
-                          real fill data directly onto the matching
-                          daily_recommendations row (ticker + fill-
-                          price matched, not just "most recent" -
-                          options routinely have multiple live recs
-                          for the same ticker same day)
-    engine.py            Strategy win-rate analysis, weight adjustments
-
-  monitor/
-    position_monitor.py  Polls every 15 min, fires STOP_LOSS and
-                          TAKE_PROFIT alerts via broker/sell_signals.py.
-                          Auto-resumes on server startup for any
-                          user with an active tracked position -
-                          previously required manual restart every
-                          time the server restarted.
-
-  rag/
-    context_builder.py   Builds LLM context (price + IV + macro +
-                          news). Direct API calls, not vector
-                          retrieval - ChromaDB runs in
-                          docker-compose but nothing imports it.
-
-  mcp_server/
-    server.py            61 MCP tools - see MCP_TOOLS.md
-    auth.py               ApiKeyTokenVerifier - per-request bearer-token
-                          verification for HTTP transport (user_api_keys,
-                          same hash-and-lookup as the local MCP_API_KEY)
-
-  db/
-    session.py           SQLAlchemy session management
-    migrations/          Schema migrations - NOTE: several real
-                          schema changes this session (daily_recs
-                          fill-tracking columns, excluded_from_stats,
-                          users.is_admin, strategy_recommendations
-                          rename) were applied as ad-hoc SQL, not
-                          captured as versioned migration files -
-                          see REMAINING_ITEMS.md
+python3 -m app.db.migrations
 ```
+
+`.env.example` does not exist in the repo (verified live) — this is part of the
+open-source-readiness item below; for now, copy the variable names out of
+`app/utils/config.py` directly. Note the migrations gap described in §4 — several
+tables/columns exist only as ad-hoc SQL, not in `db/migrations/`.
+
+Seed a watchlist (dashboard's watchlist page, or directly into `user_watchlist`), mark
+yourself admin:
+
+```
+docker exec trading_postgres psql -U trading -d trading_platform -c "UPDATE users SET is_admin = TRUE WHERE id = (SELECT id FROM users LIMIT 1);"
+```
+
+Start the servers — `bash runbook.sh start` brings up Docker, Ollama, MCP, and the
+FastAPI process, which in turn spawns and supervises the 5 agent services itself (see
+above); `bash runbook.sh stop` tears down the API and all 5 services as one unit.
 
 ---
 
-## Database Schema (20 tables)
+## 6. Architecture Decisions Locked
 
-### Auth & Users
-
-```
-users               id, email, display_name, invited_by, is_active,
-                    is_admin (NEW - the admin's own user_watchlist rows
-                    are the shared default watchlist for every user)
-user_profiles       user_id, risk_tolerance, conviction_weights
-user_api_keys       user_id, service, encrypted_key
-invites             id, invited_by, email, invite_code, status, expires_at
-broker_connections  user_id, broker_name, auth_method, snaptrade_user_id,
-                    encrypted_tokens, is_active
-```
-
-### Watchlist & Config
-
-```
-user_watchlist      user_id, ticker, notes, sector, added_at
-                    Single source of truth for every user's watchlist.
-                    Admin's rows = shared default; each user's own
-                    rows = their personal additions.
-monitor_config      user_id, is_active, check_interval_seconds, ...
-                    (usage not fully confirmed this session)
-muted_symbols       user_id, symbol, muted_until
-notification_config user_id, discord_webhook, discord_enabled
-                    Confirmed per-user isolated - no shared/global
-                    webhook fallback anywhere.
-```
-
-### Recommendations
-
-```
-daily_recommendations  The single source of truth for every
-                       recommendation, options and stock:
-                       thesis, entry/target/stop, legs, mark-to-market
-                       P&L (current_value/pnl/mark_type), backtest
-                       exclusion flag (excluded_from_stats,
-                       exclusion_reason), and - new this session -
-                       real fill tracking: user_executed,
-                       actual_entry_price, actual_qty, executed_at,
-                       exit_price, exit_reason, closed_at, actual_pnl,
-                       actual_pnl_pct, was_correct.
-
-strategy_recommendations_deprecated  RETIRED this session. Was a
-                       separate, mostly-empty parallel table for
-                       fill/outcome tracking (dollar-based target/stop,
-                       not percentage) - every consumer (nightly loop,
-                       both backtests, learning engine) migrated to
-                       read directly from daily_recommendations
-                       instead. Renamed, not dropped, to preserve
-                       the handful of historical rows.
-
-sell_recommendations  position_id, ticker, signal_type, trigger_pct
-```
-
-### Tracking & Learning
-
-```
-tracked_positions   user_id, ticker, entry_price, qty, target_pct,
-                    stop_pct, daily_rec_id (FK to daily_recommendations
-                    - present in schema, not yet populated by the
-                    current fill-tracking flow, which instead matches
-                    by ticker + fill-price proximity; a cleaner direct
-                    link, noted as a follow-up)
-position_alerts     user_id, symbol, alert_type, urgency, message, is_read
-signal_history      ticker, date, flow_score, dp_score, oi_score,
-                    oi_signal, oi_max_days, velocity_3d, ... - the most
-                    actively written table in the system (1500+ rows)
-iv_history          ticker, date, atm_iv, avg_iv, contract_count,
-                    vix_at_time - intended to back real historical
-                    IV-rank/IV-expansion analysis; not yet read anywhere
-                    in the current codebase (see REMAINING_ITEMS.md,
-                    predictive IV-expansion signal)
-learning_log        user_id, ran_at, sell_outcomes_updated,
-                    backtest_summary, learning_summary,
-                    weights_recalibrated
-news_impact_log     ticker, headline, predicted_direction, pnl_5d/30d
-portfolio_cache     user_id, positions, balances, cached_at
-notification_log    user_id, symbol, alert_type, channel, success, sent_at
-```
-
-### Key Relationships
-
-```
-users --< broker_connections   (admin only, today)
-users --< user_watchlist       (every user; admin's rows = shared default)
-users --< daily_recommendations (all recs + fill/outcome tracking)
-users --< tracked_positions     (confirmed trades, monitored every 15 min)
-daily_recommendations --< tracked_positions (on confirm_execution)
-daily_recommendations --< learning_log (aggregate, via nightly loop)
-```
+- Unusual Whales for OHLC bars; Polygon `grouped_daily` for scanner prices; yfinance
+  for VIX; **local Ollama for every LLM call, no hosted API** (see §3)
+- Separate repos: trading-platform (backend) vs stockbros (frontend)
+- FastAPI on :8001; MCP supports `stdio` (local admin) and `http` (hosted,
+  multi-customer) via `MCP_TRANSPORT`
+- Invite code auth, no OAuth yet
+- `user_watchlist` + `is_admin` is the entire watchlist system — no broker dependency
+  for scanning, no hardcoded fallback lists anywhere
+- `daily_recommendations` is the single source of truth for recommendations AND
+  fill/outcome tracking
+- `watchlist_sync` is add-only
+- One scan engine per job, no fallback to a second implementation — a failure surfaces
+  as a real error, never a silent degrade
+- **No broker linking for anyone** (removed entirely 2026-08-10, including the former
+  admin) — `confirm_execution`/`tracked_positions` is the only way any user's
+  fills/positions are recorded, admin included. `webull_connector.py` and
+  `BrokerNotConnectedError` were deleted outright, not just gated; no `factory.py`, no
+  SnapTrade plumbing exists anywhere in the codebase. (`webull_personal_login.py`/
+  `webull_watchlist_api.py` still exist, but only for watchlist *sync* into
+  `user_watchlist` — unrelated to account linking or portfolio.)
+- Paper-trading (`source='auto_paper'`) is strictly additive to real trades — separate
+  dedup rules, separate DB unique index, closed via its own function rather than
+  `log_exit()`
+- Every weekly-review statistic is a plain SQL/Python aggregation — an LLM call only
+  ever phrases already-computed numbers, never produces one
+- The multi-agent split (Search/News/Prediction/Bull/Bear) is the current production
+  architecture for options recommendations, not a future migration target — the
+  migration shipped 2026-09-02
 
 ---
 
-## Conviction Scoring
+## 7. Remaining Work
 
-recommendations/conviction.py (a standalone 12-factor deterministic
-scorer, only ever called by the old daily_engine.py::
-run_daily_recommendations() scan path) was deleted this session - zero
-remaining importers confirmed via repo-wide grep before removal. It was
-never unified with quick_scan.py's convergence scanner, which both MCP
-and web share via rescan_engine.py/smart_engine.py.
+Merged and deduplicated from MULTIAGENT_MIGRATION.md and REMAINING_ITEMS.md.
+Organized by area, not by source file.
 
-conviction_score today IS the LLM's own confidence field from its
-single batched JSON response (see "Data Flow - Options Recommendation
-Run" and the backend diagram above) - there is no separate
-deterministic conviction step anymore. Two things now shape that
-number instead of a 12-factor formula:
-  1. A tiered calibration rubric in the LLM prompt itself (explicit
-     confidence bands tied to how many signals align, replacing an
-     earlier literal `"confidence": 72` example that was silently
-     anchoring every response to the same number regardless of real
-     signal strength).
-  2. A small deterministic +/-15 adjustment applied AFTER the LLM
-     call, based on congress trades + institutional ownership actually
-     agreeing or conflicting with the chosen direction - added because
-     prompt-only calibration reliably moved confidence for broad
-     multi-signal swings but did not reliably move it for this
-     specific signal pair in isolation, confirmed across repeated live
-     tests.
+### Multi-agent pipeline
 
----
+- **Learning Agent has no standalone service.** `run_nightly_loop` and
+  `run_weekly_strategy_review` are still scheduled directly inside `main.py`'s embedded
+  scheduler — never split out like the other 5 agents were.
+- **Transcript fetch+chunk+embed pipeline not built** — blocked on Unusual Whales'
+  enterprise tier (confirmed via live 403 on the transcripts endpoint). The filing
+  (8-K) half is done and verified live (incremental-check logic + real embedded chunks
+  in ChromaDB).
+- **Search/News Agent pre-open (6 AM PT) triggers unverified end-to-end** — coded
+  correctly and now on a real schedule (the cutover fixed the racing-pipeline bug), but
+  as of the last audit `search_agent_snapshot`/`news_agent_snapshot` had 0 rows ever
+  written by that trigger specifically. Re-check once a weekday pre-open run has
+  actually fired and produced data.
+- **News Agent section in `task_list.md` output is always empty** — no bucket
+  dimension in `weekly_review.py` maps findings back to News Agent specifically, so the
+  section is structurally possible but never populates.
+- **None of the 5 agent services are containerized** — `docker-compose.yml` only
+  defines `postgres`/`chromadb`. Coupled to the FastAPI process's lifecycle rather than
+  independently deployable. Only worth decoupling further if independent
+  deploys/scaling are actually needed.
 
-## Integration Endpoints
+### Paper-to-live transition (deferred by design, still open)
 
-### Unusual Whales (paid, 120 req/min, 20K/day)
+- No defined trigger yet for ending the paper-trading validation period (time window,
+  confidence threshold from Learning Agent's stats, or explicit manual decision) —
+  still undecided.
+- No kill-switch exists for the automated paper-trade-open/close jobs. Not urgent while
+  still in paper phase.
+- `confirm_execution` still hardcodes `source='auto_paper'` at every open site
+  (`prediction_agent.py`, `paper_trading.py`). Not yet the sole primary live-fill
+  mechanism — correctly deferred until the two items above are resolved.
 
-```
-/api/stock/{ticker}/ohlc/{size}           Daily/intraday OHLC bars
-/api/stock/{ticker}/stock-state           Live price including pre/post market
-/api/stock/{ticker}/iv-rank               Real 1-year IV rank
-/api/stock/{ticker}/expiry-breakdown      Available expiry dates
-/api/stock/{ticker}/option-contracts      Options chain with IV
-/api/stock/{ticker}/greek-exposure        GEX by strike
-/api/stock/{ticker}/greek-flow            Call vs put gamma direction
-/api/stock/{ticker}/net-prem-ticks        Call vs put net premium
-/api/stock/{ticker}/oi-change             OI buildup - multi-day
-                                          institutional accumulation
-                                          (added this session)
-/api/option-trades/flow-alerts            Unusual sweeps (batch, all tickers)
-/api/darkpool/recent                      Dark pool prints (batch, all tickers)
-/api/darkpool/{ticker}                    Per-ticker dark pool
-/api/institution/{ticker}/ownership       Institutional ownership pct
-/api/etfs/{ticker}/in-outflow             Sector ETF money flow
-/api/earnings/premarket                   Earnings today premarket
-/api/earnings/afterhours                  Earnings today after hours
-/api/earnings/{ticker}                    Historical earnings + expected move
-/api/news/headlines                       News with sentiment
-/api/congress/recent-trades               Congressional trades (tool
-                                          exists, not yet fed into
-                                          conviction scoring or LLM prompt)
-/api/insider/{ticker}/ticker-flow         Insider transactions
-/api/market/market-tide                   Aggregate market bull/bear
-/api/market/total-options-volume          Put/call ratio (market regime)
+### Paper-trading calibration (revisit once real market-hours data accumulates)
 
-Not yet used - genuine opportunities, not oversights:
-  /api/market/events                      Economic calendar (Fed/CPI/jobs)
-  /api/net-flow/expiry                    Net flow by expiration date
-```
+All of these resolve the same way — once a real week or two of trading-hours data
+exists, not before:
 
-### Polygon/Massive (free tier)
+- Phase 4 grid sizing (windows/budgets) — untuned, watch `job_run_log` yield over time
+- `STOCK_MIN_FUNDAMENTAL=60` — rejected every stock candidate on the one (after-hours)
+  night tested; revisit if it recurs on a real trading day
+- The 25% spot-sanity threshold — deliberately generous, never tuned against real data
+- `iv_trend`'s "+5%" expansion threshold — provisional; not enough `iv_history`
+  accumulated yet to populate this field for most tickers
+- RSI/MACD/EMA9 entry-timing rule thresholds — standard convention, unvalidated
+  against this system's real outcomes
+- 5-min vs 15-min comparison — mechanism is live, correctly reported "insufficient
+  data" on the first real week's small sample
+- `MIN_SAMPLE_SIZE=5`, window-length buckets, the 15-min wrong-entry tiebreak —
+  confirmed implemented exactly as specified; the open question is whether they're the
+  right numbers, not whether they were built
+- Whether paper trades actually use the discussed 40%/50% options / 15%/25% stock
+  stop/target defaults — never explicitly re-confirmed
+- The -355.6% loss from the first real paper-trading run — very likely a
+  BSM-estimate-vs-live-price artifact (pre-market synthetic entry vs a real close
+  price); mechanism proven correct, magnitude needs re-checking on a real market-hours
+  run
+- `job_run_log` has no `user_id` column (see §4 for the forensic-reconstruction
+  implication for other still-per-user-looped jobs)
 
-```
-/v2/aggs/grouped/locale/us/market/stocks/{date}  All-ticker daily OHLC (1 call)
-```
+### Frontend cleanup
 
-### Webull OpenAPI (admin only)
+- The admin-only portfolio strip is still live in
+  `stockbros/src/app/dashboard/page.tsx` (gated by `isAdmin`), with a stale comment in
+  `layout.tsx` still referencing Webull/`BrokerNotConnectedError` — neither exists on
+  the backend anymore. The dedicated `portfolio/page.tsx` route itself is already gone.
+  Remove the strip and the stale comment.
 
-```
-/v1/account/positions    Open positions
-/v1/account/balance      Account balance + net liquidation value
-/v1/account/orders       Today's orders
-/v1/user/watchlist       Watchlist mirror (add-only, into user_watchlist)
-```
+### Infrastructure / deployment
 
----
+- **Deploy somewhere real** (Cloudflare tunnel or Railway.app) — directly unblocks the
+  hosted MCP server, which is fully built and tested but has nowhere to run for a real
+  customer yet.
+- **Point the hosted MCP server at that deployment** once #1 lands.
+- **Turn ad-hoc schema changes into versioned migrations** — `db/migrations/` has 3
+  files, all from June 2026; everything built since (multi-agent tables, fill-tracking
+  columns, `excluded_from_stats`, `users.is_admin`, the `strategy_recommendations`
+  rename, all paper-trading tables) is live-DB-only.
+- **Open-source readiness sweep** — `.env.example` (confirmed missing), public README
+  setup video, a hardcoded-user-ID check across the codebase.
 
-## Performance Targets
+### Smaller / lower-priority
 
-| Operation | Target | Actual |
-|---|---|---|
-| Scanner (~130 tickers) | under 5s | 2-4s |
-| Full options rescan (enrichment + LLM + math) | under 90s | 60-80s |
-| Stock scan | under 40s | 20-35s |
-| Portfolio load (cached) | under 1s | under 1s |
-| Portfolio load (live) | under 5s | 3-5s |
-| Alert detection | 15 min | 15 min, auto-resumes on restart |
-| End-of-day learning | background, 4:30 PM ET | mark-to-market runs first, same job |
-
----
-
-## StockBros Dashboard (stockbros repo)
-
-```
-Next.js 16 + React 19 + TypeScript + Tailwind v4
-Runs on :3000, calls trading-platform FastAPI on :8001
-
-Routes: dashboard, watchlist, history, alerts, learning, portfolio
-(more than the single-page layout described in earlier versions of
-this doc)
-
-Auth: invite code -> JWT (30 days), custom implementation (no next-auth)
-
-Progress bar during scans reflects real backend stage - fixed a
-blocked-event-loop bug this session where long-running scan endpoints
-prevented the status-polling endpoint from being served at all during
-the scan.
-```
-
-```mermaid
-graph TB
-    subgraph Auth["Authentication"]
-        INVITE["Invite redemption<br/>first-time signup"]
-        LOGIN["Password login<br/>returning users<br/>(login-existing)"]
-        KEYREVEAL["MCPKeyReveal<br/>shared component,<br/>shown exactly once"]
-        JWT["JWT (30 days)"]
-    end
-
-    subgraph Layout["Root Dashboard Layout"]
-        ISADMIN["useIsAdmin() context<br/>fetched ONCE, shared down<br/>via React Context"]
-        STRIP["Portfolio strip<br/>admin-only, 5-min poll"]
-    end
-
-    subgraph Picks["Picks Tab"]
-        FORM["5-field form:<br/>trade type / amount /<br/>window (days) / stop % / target %"]
-        OPENPOS["My Open Positions<br/>everyone's non-broker<br/>'portfolio' equivalent"]
-        OPTCARD["OptCard"]
-        STOCKCARD["StockCard"]
-        FILLBTN["FillButton<br/>confirm_execution()"]
-    end
-
-    subgraph Watchlist["Watchlist Tab"]
-        DEFAULT["Default Watchlist<br/>admin-owned, shared"]
-        MINE["My Watchlist<br/>per-user additions"]
-    end
-
-    subgraph History["History Tab"]
-        MINEVIEW["Mine (default view)"]
-        ALLVIEW["All Users<br/>admin-only toggle"]
-        BYUSER["By-customer leaderboard<br/>admin-only mode"]
-    end
-
-    subgraph Portfolio["Portfolio Route"]
-        LIVEPORT["Live Webull view<br/>admin-only, gated<br/>at 3 real call sites"]
-    end
-
-    subgraph Settings["Settings Tab (any authenticated user)"]
-        MCPREGEN["Regenerate Claude Desktop key<br/>confirm-to-invalidate flow —<br/>old key stops working immediately"]
-    end
-
-    INVITE --> KEYREVEAL
-    LOGIN --> JWT
-    KEYREVEAL --> JWT
-    JWT --> ISADMIN
-    JWT --> MCPREGEN
-
-    ISADMIN --> STRIP
-    ISADMIN --> FORM
-    ISADMIN --> ALLVIEW
-    ISADMIN --> LIVEPORT
-
-    FORM --> OPTCARD & STOCKCARD
-    OPTCARD & STOCKCARD --> FILLBTN
-
-    DEFAULT -.admin edits.-> DEFAULT
-    MINE -.per-user edits.-> MINE
-
-    MINEVIEW -.toggle.-> ALLVIEW
-    ALLVIEW --> BYUSER
-
-    MCPREGEN --> KEYREVEAL
-
-    classDef auth fill:#e8f0fe,stroke:#4285f4,color:#1a237e
-    classDef layout fill:#eceff1,stroke:#546e7a,color:#263238
-    classDef picks fill:#e8f5e9,stroke:#43a047,color:#1b5e20
-    classDef watchlist fill:#fff8e1,stroke:#f9a825,color:#5d4037
-    classDef history fill:#f3e5f5,stroke:#8e24aa,color:#4a148c
-    classDef portfolio fill:#ffebee,stroke:#e53935,color:#b71c1c
-    classDef settings fill:#e0f2f1,stroke:#00897b,color:#004d40
-
-    class INVITE,LOGIN,KEYREVEAL,JWT auth
-    class ISADMIN,STRIP layout
-    class FORM,OPENPOS,OPTCARD,STOCKCARD,FILLBTN picks
-    class DEFAULT,MINE watchlist
-    class MINEVIEW,ALLVIEW,BYUSER history
-    class LIVEPORT portfolio
-    class MCPREGEN settings
-```
+- **`monitor_config`** has 3 genuinely dead columns and 4 more write-only (detail in
+  §3) — low priority, the 2 real columns work fine on their own.
+- WebSocket real-time dashboard updates
+- Mobile push notifications (PWA service worker)
+- Public invite page
+- Interview talking points (no dependencies, can happen anytime)
 
 ---
 
-## Multi-User / MCP Access Notes
+## 8. Data Quality Notes
 
-get_current_user_id() in utils/current_user.py no longer caches
-identity at process/module level. Under HTTP transport it reads the
-per-request AccessToken FastMCP resolves via ApiKeyTokenVerifier
-(mcp_server/auth.py), which independently verifies each request's
-bearer token against user_api_keys - safe for one shared server
-process serving many simultaneous customers, each seeing only their
-own data. Under stdio (local Claude Desktop) there's no HTTP request
-to read from, so it falls back to resolving the local MCP_API_KEY the
-same way it always did - still correct since stdio is one process per
-user by construction.
+Weekend/holiday scanner behavior: flow/dark-pool signals go near-zero, TA/IV rank
+still reliable, recommendation quality shifts to momentum+TA only. This is correct,
+unchanged behavior, not a bug.
 
-Customer MCP keys are minted automatically on account creation (new
-user via invite-code signup in /api/auth/login, app/api/main.py) using
-the same generate_api_key()/create_api_key() the admin's own key uses,
-returned once in plaintext for StockBros to show the customer. A
-self-serve regenerate endpoint now exists (StockBros Settings tab ->
-regenerateMcpKey()) - old key invalidated immediately, new one shown
-once via the same MCPKeyReveal component used at signup. Password-based
-login for returning users (login-existing) was added alongside it, so
-signup isn't the only way back in.
-
-Transport is chosen via the mcp_transport setting ("stdio" default,
-"http" for hosted - MCP_TRANSPORT env var). Going from HTTP-capable
-code to an actual reachable hosted server is still open - see
-REMAINING_ITEMS.md.
+Paper-trading pipeline (all phases): fully built, each piece individually verified,
+but every real run so far has happened after-hours against estimated (not live)
+prices, with only a small amount of real week-of-outcome data. Treat outcome
+*magnitudes* and every "is X predictive" question as unconfirmed until the pipeline
+runs start-to-finish across several real market-hours days — the mechanism itself
+(signs, scaling, columns, isolation from real trades, honest reporting of insufficient
+sample sizes) is already confirmed independent of that.

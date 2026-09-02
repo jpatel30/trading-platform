@@ -1,15 +1,11 @@
 # Remaining Items
 
-Last updated: July 2026
-
-Last updated: July 2026. Full technical narrative (root causes, exact fixes, line-by-line verification) for completed work lives in git log commit messages - this doc stays a scannable status/priority list, not a technical diary.
+Last updated: 2026-09-02. Full technical narrative (root causes, exact fixes, line-by-line verification) for completed work lives in git log commit messages - this doc stays a scannable status/priority list, not a technical diary.
 
 Priority Order (Remaining)
 Deploy somewhere real (Cloudflare tunnel / Railway)
 Point the hosted MCP server at that deployment
-Decide on ChromaDB (remove container, or wire into real RAG)
 Revisit paper-trading calibration assumptions once real data exists
-Build real Robinhood/IBKR/Tastytrade connections
 Turn ad-hoc schema changes into versioned migrations
 Open-source readiness sweep
 Prep interview talking points
@@ -23,9 +19,7 @@ Descriptions
 
 2. Hosted MCP server MCP_TRANSPORT=http + ApiKeyTokenVerifier exist and are wired in, purely blocked on #1.
 
-3. ChromaDB Running in docker-compose.yml, zero imports anywhere in the codebase. Either remove the container, or wire it into real RAG instead of context_builder.py's current direct-API-call approach.
-
-4. Revisit paper-trading calibration assumptions All of these resolve the same way - once the reliability fixes above land and a real week or two of trading-hours data accumulates, not before:
+3. Revisit paper-trading calibration assumptions All of these resolve the same way - once the reliability fixes above land and a real week or two of trading-hours data accumulates, not before:
 
 Phase 4 grid sizing (windows/budgets) - untuned, watch job_run_log yield over time
 STOCK_MIN_FUNDAMENTAL=60 - rejected every stock candidate on the one (after-hours) night tested; top priority to revisit ONLY if it recurs on a real trading day
@@ -38,21 +32,19 @@ Whether paper trades actually use the discussed 40%/50% options / 15%/25% stock 
 The -355.6% loss from Phase 5's first real run - very likely a BSM-estimate-vs-live-price artifact (pre-market synthetic entry price vs a real close price), mechanism proven correct, magnitude needs re-checking on a real market-hours run
 job_run_log has no user_id column - fine now that paper-trade jobs run once against the admin account (not looped per user), but any OTHER job that still loops over active users (after_hours_batch, velocity_snapshot, nightly_learning, weekly_strategy_review) produces indistinguishable rows per user if it ever needs the same kind of forensic reconstruction paper-trading's scheduler investigation required
 
-5. Real broker connections Robinhood/IBKR/Tastytrade - factory.py's abstraction and SnapTrade plumbing are ready; the actual OAuth/positions/orders code for each isn't written yet.
+4. Versioned migrations Schema changes this session (fill-tracking columns, excluded_from_stats, users.is_admin, the strategy_recommendations rename, all the paper- trading tables) only exist as commands run directly against the live DB, not as files in db/migrations/.
 
-6. Versioned migrations Schema changes this session (fill-tracking columns, excluded_from_stats, users.is_admin, the strategy_recommendations rename, all the paper- trading tables) only exist as commands run directly against the live DB, not as files in db/migrations/.
+5. Open-source readiness sweep .env.example, public README setup video, a hardcoded-user-ID check across the codebase.
 
-7. Open-source readiness sweep .env.example, public README setup video, a hardcoded-user-ID check across the codebase.
+6. Interview talking points No dependencies, can happen anytime.
 
-8. Interview talking points No dependencies, can happen anytime.
+7. WebSocket real-time updates
 
-9. WebSocket real-time updates
+8. Mobile push notifications PWA service worker.
 
-10. Mobile push notifications PWA service worker.
+9. Public invite page
 
-11. Public invite page
-
-12. monitor_config has 3 genuinely dead columns and 4 more that are write-only Confirmed by reading every reference in position_monitor.py: alerts_muted/muted_until are real (drive actual mute/unmute behavior). is_active/last_check_at/total_checks/total_alerts_fired are written via _save_config() but nothing ever reads them back from the DB - PositionMonitor.status() reports in-memory instance state instead, so this data becomes invisible on any process restart. check_interval_seconds/alert_cooldown_minutes have zero references anywhere in the codebase. last_error has a column for exactly this purpose but the code tracks it in-memory only and never actually passes it to _save_config(), so it's permanently NULL. Not fixed here - this was a "confirm usage" ask, not a cleanup ask; low priority since the 2 real columns work fine on their own.
+10. monitor_config has 3 genuinely dead columns and 4 more that are write-only Confirmed by reading every reference in position_monitor.py: alerts_muted/muted_until are real (drive actual mute/unmute behavior). is_active/last_check_at/total_checks/total_alerts_fired are written via _save_config() but nothing ever reads them back from the DB - PositionMonitor.status() reports in-memory instance state instead, so this data becomes invisible on any process restart. check_interval_seconds/alert_cooldown_minutes have zero references anywhere in the codebase. last_error has a column for exactly this purpose but the code tracks it in-memory only and never actually passes it to _save_config(), so it's permanently NULL. Not fixed here - this was a "confirm usage" ask, not a cleanup ask; low priority since the 2 real columns work fine on their own.
 
 Completed (see git log for full commit-level detail)
 Multi-user MCP access - per-request identity resolution, HTTP transport, auto-minted customer keys, StockBros key-reveal screen
@@ -82,6 +74,8 @@ Shared retry-queue mechanism built (app/utils/retry_queue.py::run_with_retry) - 
 IV-expansion signal built (app/signals/iv_expansion.py::get_iv_expansion_signal) plus a quick_scan.py anti-chasing pre-filter - real recommendation-generation inputs, not post-hoc analysis. paper_trading.py's own _iv_context already computed a 5-day IV rate-of-change inline for paper_trade_context's iv_5day_trend field - extracted into this shared module (same "build shared logic once" principle as flow_scoring.py/trade_windows.py) rather than reimplementing; _iv_context is now a thin adapter over it. Score uses the same LEVEL-vs-VELOCITY + persistence-multiplier shape as oi_flow.py's get_oi_buildup_signal (up to 2x weight for consecutive same-direction days) - directionally NEUTRAL by design (rising IV means a bigger expected move, not which way), unlike OI buildup's bull/bear signal. Wired into quick_scan.py as Signal 6 (cached DB read, zero added API cost, contributes context not a bull/bear vote) with the anti-chasing rule (|change_pct|>=5% today = pre-filtered out, before scoring) applied ahead of it, and into smart_engine.py's _compress_ticker/_enrich_ticker so it's visible in the real LLM prompt. Verified live: called directly against the real 131-ticker watchlist - honestly reported 7/131 tickers with enough real history for a score (Phase 2's after-hours batch has only been running a few days) and 124/131 correctly INSUFFICIENT_HISTORY, no fabricated scores; ran real quick_scan() and confirmed 8 real tickers that moved >=5% today were completely absent from results while 5 real tickers under 5% were present; ran a live rescan_with_validation() (real scan/enrichment, LLM call mocked to capture the prompt) and confirmed IVexp: appears in every compressed candidate block of the actual 8,945-char prompt text, both for insufficient-history and real-score cases.
 Rule-based intraday entry-timing signal (5-min/15-min) built, observational only; found/fixed a real bug where every intraday bar timestamp was computing to 0
 After-hours batch job built - real daily history for TA/ fundamentals/insider activity/IV across the whole watchlist; found and fixed 4 stacked bugs in EDGAR insider-activity fetching that had made it 100% non-functional since it was built
+ChromaDB wired into real RAG - filing_embed.py chunks+embeds 8-K filings, retrieval_library.py does semantic search over the corpus for the Bull/Bear Agent debate. Resolves this doc's old "remove or use it" item. See MULTIAGENT_MIGRATION.md item 17.
+Broker/Webull account linking removed entirely, for every user including the former admin (2026-08-10) - webull_connector.py and BrokerNotConnectedError deleted outright, not just gated. confirm_execution/tracked_positions (app/learning/prediction_tracker.py) is now the sole source of truth for fills and positions for everyone; the admin-only "live portfolio" concept below no longer exists. See MULTIAGENT_MIGRATION.md items 27, 29-31.
 Architecture Decisions Locked
 - UW for OHLC bars; Polygon grouped_daily for scanner prices;
   yfinance for VIX; Ollama local for LLM
@@ -97,8 +91,9 @@ Architecture Decisions Locked
 - watchlist_sync is add-only
 - One scan engine per job, no fallback to a second implementation - a
   failure surfaces as a real error, never a silent degrade
-- Portfolio (live Webull) is admin-only, backend and frontend; every
-  other user's equivalent is their own confirmed-filled recommendations
+- No broker linking for anyone (removed entirely 2026-08-10, including
+  the former admin) - confirm_execution/tracked_positions is the only
+  way any user's fills/positions are recorded, admin included
 - Paper-trading (source='auto_paper') is strictly additive to real
   trades - separate dedup rules, separate DB unique index, closed via
   its own function rather than log_exit()

@@ -45,10 +45,6 @@ Learning weekly review) run on a local Ollama model, currently
     `portfolio/page.tsx` route itself is already gone. Remove the strip
     and the stale comment.
 
-Cleanup (not in original numbering): `runbook.sh`'s `check_sells()` and
-`monday_checklist()` still `import webull_connector` — dead code left
-over from item 27's removal, will error if either function is invoked.
-
 ---
 
 ## Phase B — remaining

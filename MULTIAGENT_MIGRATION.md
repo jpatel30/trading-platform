@@ -7,41 +7,15 @@ fixes to the current system — this is the architecture change itself.
 
 Audited against live code + the live Postgres/ChromaDB state on 2026-08-13.
 27 of the original 42 tasks were verified DONE and removed from this file.
-The cutover gap found in that audit (below) was fixed and verified live
-on 2026-08-14. What's left below is genuinely open.
+The cutover gap found in that audit was fixed, verified live, and shipped
+on 2026-09-02 (`adec414`) — see git history for detail. What's left below
+is genuinely open.
 
----
-
-## CUTOVER — done (2026-08-14)
-
-`app/api/main.py`'s scheduler previously still called the OLD pipeline
-(`_run_paper_trade_open_options` -> `rescan_engine.rescan_with_validation`
--> `smart_engine._execute_smart_rec`) 4x/day, racing the new pipeline for
-the same `DAILY_PICK_CAP`/`confirm_execution` sink, while the 5 new
-services had never actually run on a schedule (0 rows ever in
-`search_agent_snapshot`/`news_agent_snapshot`).
-
-Fixed: `_run_paper_trade_open_options` and its scheduler registration
-removed from `main.py` (stock picks/`_run_paper_trade_open_stocks`
-untouched — unrelated to this migration). The 5 services are now spawned
-and supervised as separate OS processes directly by the FastAPI process
-itself (`startup_event`/`shutdown_event` in `main.py`), not launchd —
-launchd-spawned processes can't access this project's path under
-`~/Documents` (macOS TCC/Full-Disk-Access restriction on that folder),
-while this interactively-launched process already can. A 5-minute
-supervisor job restarts any that die; a pre-spawn cleanup step kills
-stale orphans on every startup so a `--reload`/redeploy never leaves two
-sets running at once. `runbook.sh start`/`stop` now start/stop all of
-it as one unit (stopping the API stops the 5 services with it).
-`health_check.sh` checks real-time process liveness (`ps` pattern match)
-plus same-day data freshness once each trigger's fire time has passed.
-
-Verified live: all 5 processes running as exactly one instance each,
-clean startup banners with correct schedules in
-`logs/<service>_service.log`, `health_check.sh` reports ALL SYSTEMS GO.
-Not yet verified: a full trading day's worth of real output (snapshots
-firing at 6:00AM PT / 4:15PM ET, routing, debates, opens) — this repo's
-audit ran on a weekend, so nothing was due yet.
+All agent LLM calls (Bull/Bear debates, Prediction routing narrative,
+Learning weekly review) run on a local Ollama model, currently
+`qwen2.5:14b` — set via `OLLAMA_MODEL` in `.env`, default in
+`app/utils/config.py`. Embeddings (filing chunks, retrieval library) use
+`nomic-embed-text`, same host. No hosted/API LLM in the pipeline today.
 
 ---
 
@@ -53,9 +27,10 @@ audit ran on a weekend, so nothing was due yet.
    (incremental-check logic + 6 real embedded chunks in ChromaDB).
 
 2/6. The 6am PT pre-open triggers for Search Agent and News Agent are
-   coded correctly but unverified in production — 0 rows ever in
-   `search_agent_snapshot`/`news_agent_snapshot`. Re-check once the
-   cutover above puts these services on a real schedule.
+   coded correctly and now on a real schedule (cutover above), but still
+   unverified end-to-end with a real trading day's output — 0 rows ever
+   in `search_agent_snapshot`/`news_agent_snapshot` as of last audit.
+   Re-check once a weekday run has actually fired.
 
 26. `task_list.md` generation never populates a News Agent section —
     no bucket dimension in `weekly_review.py` maps findings back to
@@ -100,8 +75,8 @@ over from item 27's removal, will error if either function is invoked.
     stats, or explicit manual decision) — still undecided.
 
 41. No kill-switch exists for the automated paper-trade-open/close
-    jobs. Not urgent while still in paper phase (still active today,
-    2026-08-13).
+    jobs. Not urgent while still in paper phase (unchanged since the
+    2026-08-13 audit).
 
 42. `confirm_execution` still hardcodes `source='auto_paper'` at every
     open site (`prediction_agent.py`, `paper_trading.py`). Not yet the

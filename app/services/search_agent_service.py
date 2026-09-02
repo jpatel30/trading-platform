@@ -58,6 +58,41 @@ def _run(trigger: str) -> None:
     print(f"[SearchAgentService] {trigger} pass done in {round(time.time() - t0, 1)}s")
 
 
+def _run_filing_embed() -> None:
+    """
+    MULTIAGENT_MIGRATION.md item 4 - daily, once/day (not pre_open too:
+    unlike price/news, filings don't need a same-day overnight-catch-up
+    pass; the incremental ChromaDB-existence check already makes re-runs
+    cheap regardless). No same-day consumer depends on this finishing by
+    any particular time - Bull/Bear only ever query whatever corpus
+    already exists (retrieval_library.py), never block waiting for a
+    fresher one - so it's scheduled well clear of the 4:15-4:45pm ET
+    routing chain rather than coordinated with it.
+    """
+    from app.scanner.universe import get_scan_universe
+    from app.agents.filing_embed import run_filing_embed
+
+    t0 = time.time()
+    admin_uid = _get_admin_user_id()
+    if not admin_uid:
+        print("[SearchAgentService] filing_embed skipped: no admin user found")
+        return
+
+    tickers = get_scan_universe(user_id=admin_uid, watchlist_mode="default_only")
+    result  = run_filing_embed(tickers)
+    print(f"[SearchAgentService] filing_embed: {result} in {round(time.time() - t0, 1)}s")
+
+
+def _get_admin_user_id() -> str | None:
+    from sqlalchemy import text
+    from app.db.session import get_session
+    with get_session() as s:
+        row = s.execute(text(
+            "SELECT id FROM users WHERE is_admin=TRUE AND is_active=TRUE LIMIT 1"
+        )).fetchone()
+    return str(row.id) if row else None
+
+
 def main() -> None:
     from apscheduler.schedulers.background import BackgroundScheduler
     from apscheduler.triggers.cron import CronTrigger
@@ -79,8 +114,17 @@ def main() -> None:
         CronTrigger(day_of_week="mon-fri", hour=6, minute=0, timezone=pt),
         id="search_agent_pre_open", replace_existing=True,
     )
+    scheduler.add_job(
+        _run_filing_embed,
+        # Clear of the 4:15-4:45pm ET Search/News/Prediction chain -
+        # nothing same-day depends on this, so no buffer coordination
+        # needed with anything else.
+        CronTrigger(day_of_week="mon-fri", hour=17, minute=0, timezone=et),
+        id="search_agent_filing_embed", replace_existing=True,
+    )
     scheduler.start()
-    print("[SearchAgentService] Started — post_close@4:15PM ET, pre_open@6:00AM PT (weekdays)")
+    print("[SearchAgentService] Started — post_close@4:15PM ET, pre_open@6:00AM PT, "
+          "filing_embed@5:00PM ET (weekdays)")
 
     try:
         while True:

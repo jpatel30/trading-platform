@@ -70,20 +70,72 @@ try:
 except Exception as e:
     print(f"  ⚠️  yfinance  — {e}"); warnings.append("yfinance")
 
-print("\n── Webull ──────────────────────────────────────────")
+print("\n── Multi-Agent Pipeline (search/news/prediction/bull/bear) ──")
 try:
-    from app.broker.webull_connector import WebullConnector
-    from app.utils.current_user import get_current_user_id
-    t0  = time.time()
-    wb  = WebullConnector(get_current_user_id())
-    pos = wb.get_positions()
-    bal = wb.get_balance()
-    acct = (bal.get("account_currency_assets") or [{}])[0]
-    net  = float(acct.get("net_liquidation_value") or 0)
-    cash = float(bal.get("total_cash_balance") or 0)
-    print(f"  ✅ Webull    — {len(pos)} positions | Net liq ${net:,.0f} | Cash ${cash:,.0f} | {time.time()-t0:.2f}s")
+    import subprocess as _sp
+    import pytz as _pytz
+    from datetime import datetime as _dt
+
+    # These run as subprocesses spawned + supervised by the FastAPI
+    # process (app/api/main.py startup_event/shutdown_event), not
+    # launchd — checked here by OS process presence, matching that.
+    SERVICE_MODULES = [
+        "app.services.search_agent_service", "app.services.news_agent_service",
+        "app.services.prediction_agent_service", "app.services.bull_agent_service",
+        "app.services.bear_agent_service",
+    ]
+    ps_out = _sp.run(["ps", "ax", "-o", "args="], capture_output=True, text=True).stdout
+    for module in SERVICE_MODULES:
+        ok = module in ps_out
+        print(f"  {'✅' if ok else '❌'} {module:38} — {'running' if ok else 'NOT RUNNING (run: bash runbook.sh start)'}")
+        if not ok: errors.append(module)
+
+    # Data freshness — this is what actually catches a service that's
+    # "loaded" but silently failing every run (bad creds, API down,
+    # etc). Only checked once its own scheduled trigger time has
+    # passed today, and only on weekdays these jobs actually fire.
+    et, pt = _pytz.timezone("America/New_York"), _pytz.timezone("America/Los_Angeles")
+    now_et, now_pt = _dt.now(et), _dt.now(pt)
+    is_weekday = now_et.weekday() < 5
+
+    def _due(now, hour, minute):
+        return is_weekday and (now.hour, now.minute) >= (hour, minute)
+
+    from sqlalchemy import text as _text
+    with get_session() as s:
+        search_ct = s.execute(_text(
+            "SELECT COUNT(*) FROM search_agent_snapshot WHERE scan_date = CURRENT_DATE")).scalar()
+        news_ct = s.execute(_text(
+            "SELECT COUNT(*) FROM news_agent_snapshot WHERE snapshot_date = CURRENT_DATE")).scalar()
+        cand_ct = s.execute(_text(
+            "SELECT COUNT(*) FROM candidate_directions WHERE scan_date = CURRENT_DATE")).scalar()
+        debate_ct = s.execute(_text(
+            "SELECT COUNT(*) FROM debate_requests WHERE created_at::date = CURRENT_DATE")).scalar()
+
+    # Earliest trigger each day is 6:00AM PT (pre_open); post_close
+    # (4:15PM ET) covers the rest of the day once it fires too.
+    if _due(now_pt, 6, 0):
+        label = '✅' if search_ct > 0 else '❌'
+        print(f"  {label} search_agent_snapshot (today) — {search_ct} row(s)")
+        if search_ct == 0: errors.append("search_agent_snapshot_stale")
+        label = '✅' if news_ct > 0 else '❌'
+        print(f"  {label} news_agent_snapshot (today)   — {news_ct} row(s)")
+        if news_ct == 0: errors.append("news_agent_snapshot_stale")
+    else:
+        print("  ⏳ search/news snapshots — not due yet today (first trigger 6:00AM PT)")
+
+    # candidate_directions/debate_requests can legitimately be empty on
+    # a slow day (no qualifying candidates) - warning, not an error.
+    if _due(now_pt, 6, 20):
+        label = '✅' if cand_ct > 0 else '⚠️ '
+        print(f"  {label} candidate_directions (today)  — {cand_ct} row(s)")
+        if cand_ct == 0: warnings.append("candidate_directions_stale")
+    if _due(now_pt, 8, 50):
+        label = '✅' if debate_ct > 0 else '⚠️ '
+        print(f"  {label} debate_requests (today)       — {debate_ct} row(s)")
+        if debate_ct == 0: warnings.append("debate_requests_stale")
 except Exception as e:
-    print(f"  ❌ Webull    — {e}"); errors.append("webull")
+    print(f"  ❌ Multi-agent pipeline — {e}"); errors.append("multiagent_pipeline")
 
 print("\n── Core Engine ─────────────────────────────────────")
 try:

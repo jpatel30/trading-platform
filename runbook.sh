@@ -53,46 +53,31 @@ start_api() {
     echo $! > /tmp/fastapi.pid
 }
 
-# Start Search Agent service (MULTIAGENT_MIGRATION.md Phase B.1 — own
-# process, own scheduler, no longer run in-process by start_api above)
-start_search_agent() {
-    python3 -m app.services.search_agent_service &
-    echo "✅ Search Agent service started (PID: $!)"
-    echo $! > /tmp/search_agent_service.pid
+# Stop FastAPI — a clean SIGTERM (not -9) so its shutdown_event handler
+# runs and terminates the 5 agent-service subprocesses it owns, rather
+# than orphaning them.
+stop_api() {
+    if [ -f /tmp/fastapi.pid ] && kill -0 "$(cat /tmp/fastapi.pid)" 2>/dev/null; then
+        kill "$(cat /tmp/fastapi.pid)"
+        echo "🛑 FastAPI stopped (search/news/prediction/bull/bear-agent services stop with it)"
+        rm -f /tmp/fastapi.pid
+    else
+        echo "⚠️  FastAPI does not appear to be running (no valid /tmp/fastapi.pid)"
+    fi
 }
 
-# Start News Agent service (MULTIAGENT_MIGRATION.md Phase B.1 — own
-# process, own scheduler, no longer run in-process by start_api above)
-start_news_agent() {
-    python3 -m app.services.news_agent_service &
-    echo "✅ News Agent service started (PID: $!)"
-    echo $! > /tmp/news_agent_service.pid
-}
-
-# Start Prediction Agent service (MULTIAGENT_MIGRATION.md Phase B.2 —
-# own process, own scheduler: enqueues routed/tie-break candidates and
-# finalizes answered debates, no longer run in-process by start_api)
-start_prediction_agent() {
-    python3 -m app.services.prediction_agent_service &
-    echo "✅ Prediction Agent service started (PID: $!)"
-    echo $! > /tmp/prediction_agent_service.pid
-}
-
-# Start Bull Agent service (MULTIAGENT_MIGRATION.md Phase B.2 — own
-# process, own scheduler, answers pending 'bull' debate_requests)
-start_bull_agent() {
-    python3 -m app.services.bull_agent_service &
-    echo "✅ Bull Agent service started (PID: $!)"
-    echo $! > /tmp/bull_agent_service.pid
-}
-
-# Start Bear Agent service (MULTIAGENT_MIGRATION.md Phase B.2 — own
-# process, own scheduler, answers pending 'bear' debate_requests)
-start_bear_agent() {
-    python3 -m app.services.bear_agent_service &
-    echo "✅ Bear Agent service started (PID: $!)"
-    echo $! > /tmp/bear_agent_service.pid
-}
+# The 5 agent services (search/news/prediction/bull/bear) are no longer
+# started here directly. start_api's FastAPI process spawns + supervises
+# all 5 itself now (app/api/main.py's startup_event/shutdown_event) —
+# they were originally meant to run under launchd instead, but launchd-
+# spawned processes can't access this project's path under ~/Documents
+# (macOS TCC/Full-Disk-Access blocks that for background/non-interactive
+# processes), while this interactively-launched process already can, so
+# children it spawns inherit that access with no new permission grant.
+# They stay genuinely separate OS processes talking only through
+# Postgres, same as the launchd design intended — just supervised by the
+# app instead of by launchd. Starting/stopping the API starts/stops all
+# 5 together; see logs/<service>_service.log for each one's own output.
 
 # Start StockBros dashboard
 start_dashboard() {
@@ -103,10 +88,25 @@ start_dashboard() {
 }
 
 # Keep Mac awake (critical — must run before trading session)
+# Runs under launchd now (~/Library/LaunchAgents/com.tradingplatform.
+# keep-awake.plist) instead of a bare `&` process — RunAtLoad+KeepAlive
+# means it survives reboots and restarts itself if killed, closing the
+# exact gap that let the Mac idle-sleep through a weekend and silently
+# cause the 5 agent services to miss every scheduled fire (no crash, no
+# error - the process just wasn't awake at the trigger instant, and
+# APScheduler doesn't catch up a missed fire by default). Manually
+# managing `caffeinate -i &` here would fight launchd's KeepAlive
+# (each would keep resurrecting the other), so this just ensures the
+# launchd job is loaded rather than owning the process itself.
 keep_awake() {
-    pkill caffeinate 2>/dev/null
-    caffeinate -i &
-    echo "✅ caffeinate active (PID: $!)"
+    local target="gui/$(id -u)/com.tradingplatform.keep-awake"
+    if launchctl print "$target" > /dev/null 2>&1; then
+        echo "✅ caffeinate already running under launchd"
+    else
+        launchctl bootstrap "gui/$(id -u)" \
+            ~/Library/LaunchAgents/com.tradingplatform.keep-awake.plist
+        echo "✅ caffeinate started under launchd"
+    fi
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -145,12 +145,12 @@ PYEOF
 check_sells() {
     echo "=== SELL SIGNALS ==="
     python3 << 'PYEOF'
-from app.broker.webull_connector import WebullConnector
+from app.learning.prediction_tracker import get_positions_from_tracked
 from app.broker.sell_signals import evaluate_sell_signals
 from app.utils.current_user import get_current_user_id
 
 user_id   = get_current_user_id()
-positions = WebullConnector(user_id).get_positions()
+positions = get_positions_from_tracked(user_id)
 signals   = evaluate_sell_signals(positions)
 
 urgent = [s for s in signals if s.get('urgency') == 'CLOSE']
@@ -247,15 +247,15 @@ try:
 except Exception as e:
     checks.append(("UW", False, str(e)))
 
-# 3. Webull
+# 3. Tracked positions (no broker linking exists anymore — item 27/31 —
+# confirm_execution/tracked_positions is the only source of truth now)
 try:
-    from app.broker.webull_connector import WebullConnector
+    from app.learning.prediction_tracker import get_positions_from_tracked
     from app.utils.current_user import get_current_user_id
-    wb  = WebullConnector(get_current_user_id())
-    pos = wb.get_positions()
-    checks.append(("Webull", True, f"{len(pos)} positions"))
+    pos = get_positions_from_tracked(get_current_user_id())
+    checks.append(("Positions", True, f"{len(pos)} tracked positions"))
 except Exception as e:
-    checks.append(("Webull", False, str(e)))
+    checks.append(("Positions", False, str(e)))
 
 # 4. LLM
 try:
@@ -303,7 +303,7 @@ if all_ok:
     print("  1. Run morning_prep() at 7-8 AM ET")
     print("  2. Review highest conviction rec (≥70/100)")
     print("  3. Check: entry trigger + VIX zone + no near earnings")
-    print("  4. Execute in Webull")
+    print("  4. Execute the trade with your broker")
     print("  5. confirm_trade TICKER QTY PRICE")
 else:
     print("❌ FIX ISSUES ABOVE before trading")
@@ -315,7 +315,7 @@ PYEOF
 # ─────────────────────────────────────────────────────────────────────────────
 
 case "${1}" in
-    start)       keep_awake; start_docker; start_ollama; start_mcp; start_api; start_search_agent; start_news_agent; start_prediction_agent; start_bull_agent; start_bear_agent ;;
+    start)       keep_awake; start_docker; start_ollama; start_mcp; start_api ;;
     dashboard)   start_dashboard ;;
     morning)     morning_prep ;;
     sells)       check_sells ;;
@@ -323,11 +323,13 @@ case "${1}" in
     clean)       clean_test_data ;;
     backup)      backup_db ;;
     status)      bash health_check.sh ;;
+    stop)        stop_api ;;
     *)
         echo "Usage: bash RUNBOOK.sh [command]"
         echo ""
         echo "Commands:"
-        echo "  start      Start all services (Docker, Ollama, MCP, API, Search/News/Prediction/Bull/Bear Agents)"
+        echo "  start      Start all services (Docker, Ollama, MCP, API — API spawns the"
+        echo "             Search/News/Prediction/Bull/Bear Agent services itself)"
         echo "  dashboard  Start StockBros dashboard"
         echo "  morning    Run morning scan (7-8 AM ET)"
         echo "  sells      Check sell signals"
@@ -335,5 +337,6 @@ case "${1}" in
         echo "  clean      Clean test data from DB"
         echo "  backup     Backup database"
         echo "  status     Health check"
+        echo "  stop       Stop the API (and the 5 agent services it owns)"
         ;;
 esac

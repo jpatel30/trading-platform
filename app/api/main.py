@@ -36,6 +36,11 @@ app = FastAPI(
     version     = "1.0.0",
 )
 
+# {name: (subprocess.Popen, log_file_handle)} for the 5 multi-agent
+# pipeline services this process spawns + supervises at startup — see
+# startup_event()/shutdown_event() below.
+_AGENT_SERVICE_PROCS: dict = {}
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins     = [
@@ -388,8 +393,16 @@ async def startup_event():
         # Bull Agent, and Bear Agent all run as their own standalone
         # processes now (app/services/*.py — started separately, see
         # runbook.sh), firing at the same times this scheduler used to
-        # own directly. See app/services/prediction_agent_service.py's
-        # docstring for the full enqueue/answer/finalize schedule.
+        # own directly. This includes OPENING options positions —
+        # prediction_agent_service.py's finalize step now owns that
+        # entirely via _finalize_and_open(), which reuses the exact same
+        # confirm_execution()/DAILY_PICK_CAP path this scheduler's old
+        # _run_paper_trade_open_options job used. That job has been
+        # removed (MULTIAGENT_MIGRATION.md cutover) rather than left
+        # running alongside the new pipeline — both wrote through the
+        # same shared daily cap, so running both risked them racing for
+        # it. See app/services/prediction_agent_service.py's docstring
+        # for the full enqueue/answer/finalize schedule.
         scheduler.add_job(
             _run_nightly_learning,
             CronTrigger(day_of_week="mon-fri", hour=16, minute=30, timezone=et),
@@ -419,20 +432,6 @@ async def startup_event():
                 )).fetchone()
             return str(row.id) if row else None
 
-        def _run_paper_trade_open_options():
-            try:
-                from app.recommendations.paper_trading import run_paper_trade_open_options
-                uid = _get_paper_trade_admin_user_id()
-                if not uid:
-                    print("[Scheduler] Paper trade open (options) skipped: no admin user found")
-                    return
-                result = run_paper_trade_open_options(uid)
-                print(f"[Scheduler] Paper trade open (options): {result.get('confirmed')} confirmed, "
-                      f"{result.get('empty')} empty, {result.get('errored')} errored, "
-                      f"status={result.get('status')}")
-            except Exception as e:
-                print(f"[Scheduler] Paper trade open (options) failed: {e}")
-
         def _run_paper_trade_open_stocks():
             try:
                 from app.recommendations.paper_trading import run_paper_trade_open_stocks
@@ -447,6 +446,10 @@ async def startup_event():
             except Exception as e:
                 print(f"[Scheduler] Paper trade open (stocks) failed: {e}")
 
+        # Stock picks (smart_stock_scan) are unrelated to the multi-agent
+        # migration and are untouched by it — options picks are the ones
+        # that moved to prediction_agent_service.py's finalize step
+        # (see the comment above nightly_learning's registration).
         # Fires 4x through the trading day (not just once at open) so
         # later runs can catch genuinely new intraday opportunities -
         # each run respects the SAME shared DAILY_PICK_CAP (paper_trading.py),
@@ -455,11 +458,6 @@ async def startup_event():
         # 12:30pm PT is the last call, ~25 min before the 12:55pm PT close.
         PAPER_TRADE_OPEN_TIMES = [(6, 40), (8, 30), (10, 30), (12, 30)]
         for _hour, _minute in PAPER_TRADE_OPEN_TIMES:
-            scheduler.add_job(
-                _run_paper_trade_open_options,
-                CronTrigger(day_of_week="mon-fri", hour=_hour, minute=_minute, timezone=pt),
-                id=f"paper_trade_open_options_{_hour:02d}{_minute:02d}", replace_existing=True,
-            )
             scheduler.add_job(
                 _run_paper_trade_open_stocks,
                 CronTrigger(day_of_week="mon-fri", hour=_hour, minute=_minute, timezone=pt),
@@ -513,13 +511,86 @@ async def startup_event():
         scheduler.start()
         print("[Scheduler] ✅ velocity@4:15PM ET | "
               "learning@4:30PM ET | "
-              "paper-trade-open@6:40/8:30/10:30AM,12:30PM PT (shared 20/day cap) | "
+              "paper-trade-open(stocks only)@6:40/8:30/10:30AM,12:30PM PT (shared 20/day cap) | "
               "paper-trade-close@12:55PM PT (weekdays) | "
               "learning-agent-review@6:00PM ET (daily, rolling 7-day window) | "
-              "NOTE: search/news/prediction/bull/bear-agent-service must all be "
-              "started separately (see runbook.sh) — this scheduler no longer runs them")
+              "NOTE: options picks now open exclusively via "
+              "search/news/prediction/bull/bear-agent-service (see below)")
     except Exception as e:
         print(f"[Startup] Scheduler failed: {e}")
+
+    # Multi-agent pipeline services (search/news/prediction/bull/bear) run
+    # as real separate OS processes (Phase B), communicating with each
+    # other only through Postgres — but are spawned + supervised HERE,
+    # by this already-running process, rather than via launchd. launchd-
+    # spawned processes can't chdir into this project's path under
+    # ~/Documents (macOS TCC/Full-Disk-Access blocks background/non-
+    # interactive processes from that folder); this process was launched
+    # interactively and already has the access, so children it spawns
+    # via subprocess.Popen inherit it. _AGENT_SERVICE_PROCS is a plain
+    # module dict (not multi-worker-safe), which is fine here since this
+    # API only ever runs as a single uvicorn worker.
+    try:
+        import subprocess, sys as _sys, time as _time
+        from apscheduler.triggers.interval import IntervalTrigger
+
+        AGENT_SERVICE_MODULES = {
+            "search_agent":     "app.services.search_agent_service",
+            "news_agent":       "app.services.news_agent_service",
+            "prediction_agent": "app.services.prediction_agent_service",
+            "bull_agent":       "app.services.bull_agent_service",
+            "bear_agent":       "app.services.bear_agent_service",
+        }
+
+        def _spawn_agent_service(name: str, module: str) -> None:
+            log_f = open(f"logs/{name}_service.log", "a")
+            proc = subprocess.Popen(
+                # -u: unbuffered stdout, so the log file reflects reality
+                # promptly instead of sitting in a pipe buffer (stdout is
+                # fully block-buffered, not line-buffered, once it's
+                # piped to a file rather than a TTY).
+                [_sys.executable, "-u", "-m", module],
+                stdout=log_f, stderr=subprocess.STDOUT, start_new_session=True,
+            )
+            _AGENT_SERVICE_PROCS[name] = (proc, log_f)
+            print(f"[Scheduler] {name} service started (PID {proc.pid})")
+
+        def _supervise_agent_services() -> None:
+            for name, module in AGENT_SERVICE_MODULES.items():
+                entry = _AGENT_SERVICE_PROCS.get(name)
+                if entry is not None and entry[0].poll() is None:
+                    continue  # still alive
+                if entry is not None:
+                    print(f"[Scheduler] {name} service exited "
+                          f"(code {entry[0].returncode}) — restarting")
+                    try:
+                        entry[1].close()
+                    except Exception:
+                        pass
+                _spawn_agent_service(name, module)
+
+        # Defense in depth against orphans from a prior run that didn't
+        # shut down cleanly (killed -9, crashed before shutdown_event
+        # ran, etc.) — without this, a second set spawns alongside the
+        # first and both fire the same cron schedule independently,
+        # double-processing every enqueue/finalize step.
+        for _module in AGENT_SERVICE_MODULES.values():
+            subprocess.run(["pkill", "-f", _module], stderr=subprocess.DEVNULL)
+        if AGENT_SERVICE_MODULES:
+            _time.sleep(1)
+
+        for _name, _module in AGENT_SERVICE_MODULES.items():
+            _spawn_agent_service(_name, _module)
+
+        # Checked, not just started-once — a crashed agent service used
+        # to sit dead with nothing noticing for weeks (that's the bug
+        # this whole supervisor exists to close).
+        scheduler.add_job(
+            _supervise_agent_services, IntervalTrigger(minutes=5),
+            id="agent_service_supervisor", replace_existing=True,
+        )
+    except Exception as e:
+        print(f"[Startup] Agent service supervisor failed: {e}")
 
     # Auto-resume position monitoring for anyone with an active
     # tracked position. Without this, any server restart (which
@@ -544,6 +615,23 @@ async def startup_event():
         print(f"[Startup] Monitor auto-resume failed: {e}")
 
 
+@app.on_event("shutdown")
+async def shutdown_event():
+    # Without this, the 5 agent-service subprocesses become orphans on
+    # every `--reload` restart (dev) or redeploy (prod) — start_new_
+    # session=True detaches them from this process's signal group, so
+    # they'd otherwise outlive it and the next startup_event() would
+    # spawn a second set running alongside them.
+    for name, (proc, log_f) in _AGENT_SERVICE_PROCS.items():
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+        try:
+            log_f.close()
+        except Exception:
+            pass
+    _AGENT_SERVICE_PROCS.clear()
 
 
 

@@ -343,9 +343,9 @@ can, and children it spawns via `subprocess.Popen` inherit that access. A 5-minu
 supervisor job restarts any service that dies; a pre-spawn cleanup step kills stale
 orphans on every startup so a `--reload`/redeploy never leaves two sets running at
 once. `runbook.sh start`/`stop` start/stop all of it as one unit (stopping the API
-stops the 5 services with it). `health_check.sh` checks real-time process liveness
-(`ps` pattern match) plus same-day data freshness once each trigger's fire time has
-passed.
+stops the 5 services with it). `runbook.sh status` (formerly a separate
+`health_check.sh`, merged in) checks real-time process liveness (`ps` pattern match)
+plus same-day data freshness once each trigger's fire time has passed.
 
 None of the 5 services are containerized — `docker-compose.yml` only defines
 `postgres` and `chromadb` (verified live). They're separate OS processes (communicating

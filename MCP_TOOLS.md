@@ -3,7 +3,12 @@
 All tools available via Claude Desktop MCP integration.
 Server: python3 -m app.mcp_server.server
 
-Total: 61 tools across 9 categories.
+Total: 59 tools across 9 categories.
+
+No broker account linking exists anywhere in the system (removed entirely
+2026-08-10) - there is no live brokerage connection to query positions,
+balances, or orders from. Everything below is 100% database-driven, sourced
+from your own confirmed fills (`confirm_execution`) and watchlist.
 
 ---
 
@@ -12,9 +17,7 @@ Total: 61 tools across 9 categories.
 | Tool | Parameters | Returns | Notes |
 |---|---|---|---|
 | ping | - | DB connection status | Health check - run first |
-| get_positions | - | list of positions | Live from Webull |
-| get_balances | - | net_liq, cash, buying_power | Live from Webull |
-| get_orders | - | today's orders | Live from Webull |
+| get_positions | - | list of positions | From confirmed fills (tracked_positions) - no broker involved |
 | get_active_bets | - | positions enriched with target/stop/status | Rule-based |
 | get_portfolio_pnl | - | total P&L, win rate, best/worst | Calculated |
 
@@ -65,7 +68,7 @@ Scan whole watchlist, routed by horizon    -> scan_for_horizon
 
 | Tool | Parameters | Returns | Notes |
 |---|---|---|---|
-| get_daily_recommendations | force_refresh=False, budget=2000.0, trading_window_days=7, stop_loss_pct=40.0, profit_target_pct=50.0 | cached or fresh recs, gated >=70/100 | Main daily entry point. Runs the exact same engine (rescan_engine.py/smart_engine.py) as the web dashboard's Scan button - no separate MCP-only scoring path |
+| get_daily_recommendations | force_refresh=False, budget=2000.0, trading_window_days=7, stop_loss_pct=40.0, profit_target_pct=50.0 | cached or fresh recs, gated >=70/100 | Main daily entry point. Runs the same on-demand engine (rescan_engine.py/smart_engine.py) as the web dashboard's manual Scan button - a single synchronous LLM call, distinct from the separately-scheduled Search/News/Prediction/Bull/Bear multi-agent pipeline (see ARCHITECTURE.md) which runs on its own cron schedule and isn't triggered by this tool |
 | invalidate_recommendation | ticker, reason | success bool | Fires Discord alert |
 | get_recommendation_history | days_back=7 | past recs with status | |
 | get_recommendation_history_detailed | days_back=30 | history grouped by date, with mark-to-market P&L | Answers "how have my recommendations performed?" |
@@ -85,9 +88,9 @@ default_only mode - they answer different questions, not the same one.
 
 | Tool | Parameters | Returns | Notes |
 |---|---|---|---|
-| get_watchlist | - | your tickers, DB source, sync status | Reads via watchlist_sync - add-only mirror from broker if connected |
-| get_scan_universe | extra_tickers=None, min_market_cap=0, sectors=None, min_price=0 | the actual universe a scan will use | Admin's shared default + your own additions, no broker dependency, no hardcoded fallback |
-| force_sync_watchlist | - | immediate broker-to-DB sync diff | Add-only - never deletes from your DB list |
+| get_watchlist | - | your tickers, DB source, sync status | DB-first, background-synced against a personal Webull watchlist if you've linked one for ticker discovery only (app/broker/webull_watchlist_api.py) - add-only, never deletes from your DB list. This is unrelated to the removed broker account/portfolio linking - no trading or position access is involved |
+| get_scan_universe | extra_tickers=None, min_market_cap=0, sectors=None, min_price=0 | the actual universe a scan will use | Admin's shared default + your own additions, no hardcoded fallback |
+| force_sync_watchlist | - | immediate Webull-ticker-list-to-DB sync diff | Add-only - never deletes from your DB list |
 | add_to_watchlist | ticker, notes="", sector="" | success | |
 | remove_from_watchlist | ticker | success | |
 | scan_watchlist | top_n=5 | raw two-tier convergence scan, NO conviction gate | Each pick includes a conflict flag (confidence capped at 58 when strong signals disagree). For filtered daily picks use get_daily_recommendations instead |
@@ -182,7 +185,7 @@ stock default.
 
 ---
 
-## Known Gaps (tracked in REMAINING_ITEMS.md)
+## Known Gaps (tracked in ARCHITECTURE.md)
 
 - Multi-user MCP identity resolution is fixed (per-request bearer-token
   auth via ApiKeyTokenVerifier, no process-level cache) and customer
